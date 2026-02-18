@@ -26,9 +26,9 @@ pub enum ClawdMuxError {
         message: String,
     },
 
-    /// A serialization error, containing a description of the failure.
-    #[error("Serialization error: {0}")]
-    Serialize(String),
+    /// A non-JSON encoding or serialization error (e.g., TOML serialization, task-file writing).
+    #[error("Encoding error: {0}")]
+    Encode(String),
 
     /// A TOML deserialization error when reading config files.
     #[error("Config error: {0}")]
@@ -109,5 +109,55 @@ mod tests {
             Ok(1)
         }
         assert_eq!(dummy().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_string_wrapping_variant_display() {
+        let cases: &[(&str, ClawdMuxError)] = &[
+            ("api msg", ClawdMuxError::Api("api msg".to_string())),
+            (
+                "encode msg",
+                ClawdMuxError::Encode("encode msg".to_string()),
+            ),
+            ("sse msg", ClawdMuxError::Sse("sse msg".to_string())),
+            (
+                "server msg",
+                ClawdMuxError::Server("server msg".to_string()),
+            ),
+            (
+                "workflow msg",
+                ClawdMuxError::Workflow("workflow msg".to_string()),
+            ),
+            (
+                "internal msg",
+                ClawdMuxError::Internal("internal msg".to_string()),
+            ),
+        ];
+        for (input, err) in cases {
+            let display = err.to_string();
+            assert!(
+                display.contains(input),
+                "display for {input:?} should contain input string, got: {display}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_error_from_conversion() {
+        let toml_err =
+            toml::from_str::<toml::Value>("invalid = [unclosed").expect_err("should fail to parse");
+        let err: ClawdMuxError = toml_err.into();
+        assert!(matches!(err, ClawdMuxError::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn test_http_error_from_conversion() {
+        // reqwest rejects an invalid URL scheme before making any network request,
+        // so this exercises the `#[from]` impl without I/O.
+        let reqwest_err = reqwest::get("not-a-valid-url")
+            .await
+            .expect_err("should fail with invalid URL");
+        let err: ClawdMuxError = reqwest_err.into();
+        assert!(matches!(err, ClawdMuxError::Http(_)));
     }
 }
