@@ -1,0 +1,58 @@
+[package]
+name = "clawdmux"
+version = "0.1.0"
+edition = "2021"
+description = "GenAI coding assistance multiplexer and task orchestrator"
+license = "MIT"
+
+[[bin]]
+name = "clawdmux"
+path = "src/main.rs"
+
+[dependencies]
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tui-textarea = { version = "0.7", features = ["crossterm"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest-eventsource = "0.6"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Config file format
+toml = "0.8"
+
+# Code diffing
+similar = "2"
+
+# File watching
+notify = "6"
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI parsing
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+# Error handling
+thiserror = "1"
+
+# Init command utilities
+which = "6"
+rpassword = "7"
+
+[dev-dependencies]
+tempfile = "3"
+mockito = "1"
