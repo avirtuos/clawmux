@@ -234,7 +234,7 @@ clawdmux/
 // src/tasks/models.rs
 
 /// Unique identifier for a task, derived from its file path.
-pub struct TaskId(pub PathBuf);
+pub struct TaskId(PathBuf);  // inner field is private; use as_path() accessor
 
 /// A story groups related tasks.
 pub struct Story {
@@ -274,7 +274,7 @@ pub struct Question {
 
 pub struct WorkLogEntry {
     pub sequence: u32,
-    pub timestamp: chrono::DateTime<chrono::Local>,
+    pub timestamp: chrono::DateTime<chrono::Utc>,  // UTC; convert to local time at render
     pub agent: AgentKind,
     pub description: String,
 }
