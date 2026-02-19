@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::error::ClawdMuxError;
+use crate::workflow::agents::AgentKind;
 
 /// Unique identifier for a task, derived from its file path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -86,8 +87,8 @@ impl FromStr for TaskStatus {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Question {
-    /// The agent that asked this question (agent name string).
-    pub agent: String,
+    /// The pipeline agent that asked this question.
+    pub agent: AgentKind,
     /// The question text.
     pub text: String,
     /// The human-provided answer, if one has been given.
@@ -102,8 +103,8 @@ pub struct WorkLogEntry {
     pub sequence: u32,
     /// When this entry was recorded (UTC).
     pub timestamp: chrono::DateTime<chrono::Utc>,
-    /// The agent that produced this entry (agent name string).
-    pub agent: String,
+    /// The pipeline agent that produced this entry.
+    pub agent: AgentKind,
     /// A short description of the work performed.
     pub description: String,
 }
