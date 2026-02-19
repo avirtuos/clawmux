@@ -18,7 +18,7 @@ use crate::error::ClawdMuxError;
 ///
 /// Review-stage agents (`CodeQuality`, `SecurityReview`, `CodeReview`) may kick
 /// tasks back to earlier stages when issues are found.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     /// Gathers initial context and clarifies requirements.
     Intake,

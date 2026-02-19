@@ -1,12 +1,11 @@
 //! Rust types mirroring the opencode OpenAPI schema.
 //!
 //! Covers sessions, messages, message parts, SSE events, and file diffs.
-//! All types derive serde traits for JSON serialization/deserialization.
-//! Task 2.2 implements the full type set; this file contains minimal stubs
-//! needed for `AppMessage` to compile.
+//! This file contains minimal stubs needed for `AppMessage` to compile.
+//! Serde derives will be added alongside full implementations in a future task.
 
 //TODO: Task 5.1 -- replace stubs with full opencode API types (OpenCodeSession,
-//TODO:             OpenCodeMessage, OpenCodeEvent, MessageRole, etc.)
+//TODO:             OpenCodeMessage, OpenCodeEvent, MessageRole, etc.) and add serde derives
 
 /// A part of an opencode agent message.
 ///

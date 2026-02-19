@@ -15,6 +15,10 @@ use crate::workflow::agents::AgentKind;
 /// Every inter-subsystem interaction -- terminal input, workflow state changes,
 /// opencode session lifecycle, diffs, task file updates, and shutdown -- is
 /// represented as a variant of this enum and passed through async `mpsc` channels.
+///
+/// `AppMessage` intentionally does not implement `Clone`. Messages are consumed
+/// by a single mpsc receiver; cloning would imply shared ownership that the
+/// channel design does not support.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum AppMessage {
