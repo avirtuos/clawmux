@@ -25,7 +25,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Initialize the project for use with ClawdMux.
-    Init,
+    Init(config::init::InitArgs),
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,9 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("ClawdMux starting");
 
     match cli.command {
-        Some(Commands::Init) => {
+        Some(Commands::Init(args)) => {
             tracing::info!("ClawdMux init command invoked");
-            //TODO: Task 2.1 -- implement init command via config::init
+            let project_root = std::env::current_dir()?;
+            config::init::run_init(&project_root, &args)?;
         }
         None => {
             //TODO: Task 4.1 -- launch TUI event loop with tokio::main
