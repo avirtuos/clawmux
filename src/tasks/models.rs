@@ -84,7 +84,7 @@ impl FromStr for TaskStatus {
 }
 
 /// A question posed by an agent, with an optional human-provided answer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct Question {
     /// The pipeline agent that asked this question.
@@ -96,7 +96,7 @@ pub struct Question {
 }
 
 /// A single entry in the task's work log.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct WorkLogEntry {
     /// Sequence number of this entry (1-based).
@@ -110,7 +110,7 @@ pub struct WorkLogEntry {
 }
 
 /// A single task loaded from a markdown file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct Task {
     /// Unique identifier derived from the task file path.
@@ -122,7 +122,7 @@ pub struct Task {
     /// Current lifecycle status.
     pub status: TaskStatus,
     /// The agent currently assigned to this task, if any.
-    pub assigned_to: Option<String>,
+    pub assigned_to: Option<AgentKind>,
     /// Full description of what needs to be done.
     pub description: String,
     /// Optional initial prompt to seed the Intake agent.
@@ -137,6 +137,10 @@ pub struct Task {
     pub work_log: Vec<WorkLogEntry>,
     /// Path to the markdown file this task was loaded from.
     pub file_path: PathBuf,
+    /// Sections not recognized by the parser, preserved verbatim for round-trip fidelity.
+    ///
+    /// Each entry is `(heading_text, body_content)` where `heading_text` excludes the `## ` prefix.
+    pub extra_sections: Vec<(String, String)>,
 }
 
 #[allow(dead_code)]
@@ -206,6 +210,7 @@ mod tests {
             implementation_plan: None,
             work_log: Vec::new(),
             file_path: PathBuf::from(format!("tasks/{name}.md")),
+            extra_sections: Vec::new(),
         }
     }
 
