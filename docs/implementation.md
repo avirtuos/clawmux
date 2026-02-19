@@ -441,6 +441,8 @@ A1: {answer}
 
 ### Task 2.3 — TaskStore
 
+**Status**: COMPLETED
+
 **Objective**: Implement `TaskStore` in `src/tasks/mod.rs`, providing in-memory task cache management, file discovery at startup, and the ability to load, update, and retrieve tasks and stories.
 
 **Files to Read**:
