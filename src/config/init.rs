@@ -4,9 +4,9 @@
 //! 1. Checks for (and optionally installs) the opencode binary.
 //! 2. Configures LLM provider credentials in `~/.config/clawdmux/config.toml`.
 //! 3. Scaffolds `.clawdmux/config.toml`, `.opencode/agents/clawdmux/`, and `tasks/`.
-//! 4. Prints a success message.
+//! 4. Logs a success message.
 
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::Path;
 
 use crate::config::providers::{GlobalConfig, ProviderConfig, ProviderSection};
@@ -249,7 +249,7 @@ pub struct InitArgs {
 /// 2. Checks for provider credentials in the global config; prompts if absent.
 /// 3. Scaffolds project-local files (`.clawdmux/config.toml`,
 ///    `.opencode/agents/clawdmux/`, `tasks/`).
-/// 4. Prints a success summary.
+/// 4. Logs a success summary via `tracing::info!`.
 ///
 /// # Errors
 ///
@@ -283,11 +283,17 @@ pub(crate) fn run_init_with_paths(
 ) -> Result<()> {
     configure_provider(global_config_path)?;
     scaffold_project(project_root, args)?;
-    println!("clawdmux is ready. Run clawdmux to open the TUI.");
+    tracing::info!("clawdmux init complete, run clawdmux to open the TUI");
     Ok(())
 }
 
 /// Step 1: verify opencode is on `PATH`; offer to install if missing.
+///
+/// Uses `--no-modify-path` so the installer does not alter shell config files.
+/// Because the binary directory is therefore not added to `PATH` automatically,
+/// a post-install `opencode --version` check would always fail. Instead, after
+/// a successful install the user is instructed to add the binary directory to
+/// their `PATH` and re-run `clawdmux init`.
 fn check_or_install_opencode() -> Result<()> {
     match which::which("opencode") {
         Ok(path) => {
@@ -325,19 +331,11 @@ fn check_or_install_opencode() -> Result<()> {
                 ));
             }
 
-            let verify = std::process::Command::new("opencode")
-                .arg("--version")
-                .output()
-                .map_err(ClawdMuxError::Io)?;
-
-            if !verify.status.success() {
-                return Err(ClawdMuxError::Internal(
-                    "opencode installed but failed to run".to_string(),
-                ));
-            }
-
-            let version = String::from_utf8_lossy(&verify.stdout);
-            tracing::info!(version = %version.trim(), "opencode installed successfully");
+            tracing::info!("opencode installed, PATH update required before use");
+            println!(
+                "opencode installed. Add the opencode binary directory to your PATH, \
+                 then re-run clawdmux init."
+            );
             Ok(())
         }
     }
@@ -345,9 +343,30 @@ fn check_or_install_opencode() -> Result<()> {
 
 /// Step 2: ensure the global config has a configured LLM provider.
 ///
-/// If `provider.default` is already set, this is a no-op. Otherwise the user
-/// is prompted to choose a provider and enter credentials.
+/// Thin wrapper around [`configure_provider_from_reader`] that supplies the
+/// real stdin and stdout.
 fn configure_provider(global_config_path: &Path) -> Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    configure_provider_from_reader(global_config_path, &mut stdin.lock(), &mut stdout.lock())
+}
+
+/// Core provider-configuration logic, accepting injected I/O for testability.
+///
+/// If `provider.default` is already set in the global config this is a no-op.
+/// Otherwise the user is prompted to choose a provider, enter a default model,
+/// and enter an API key. All inputs are read from `reader`; all prompts are
+/// written to `writer`.
+///
+/// Note: because all input (including the API key) is read via `reader`, the
+/// production wrapper [`configure_provider`] passes the real stdin, which means
+/// the API key is visible while being typed. If hidden entry is needed, wire a
+/// `rpassword`-backed reader at the call site.
+pub(crate) fn configure_provider_from_reader<R: BufRead, W: Write>(
+    global_config_path: &Path,
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<()> {
     let mut config = match GlobalConfig::load(global_config_path) {
         Ok(cfg) => cfg,
         Err(ClawdMuxError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -364,15 +383,15 @@ fn configure_provider(global_config_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    println!("No LLM provider configured. Let us set one up.");
-    println!("Provider: [1] Anthropic  [2] OpenAI  [3] Google");
-    print!("> ");
-    std::io::stdout().flush().map_err(ClawdMuxError::Io)?;
+    writeln!(writer, "No LLM provider configured. Let us set one up.")
+        .map_err(ClawdMuxError::Io)?;
+    writeln!(writer, "Provider: [1] Anthropic  [2] OpenAI  [3] Google")
+        .map_err(ClawdMuxError::Io)?;
+    write!(writer, "> ").map_err(ClawdMuxError::Io)?;
+    writer.flush().map_err(ClawdMuxError::Io)?;
 
     let mut choice = String::new();
-    std::io::stdin()
-        .read_line(&mut choice)
-        .map_err(ClawdMuxError::Io)?;
+    reader.read_line(&mut choice).map_err(ClawdMuxError::Io)?;
 
     let (provider_name, default_model_hint) = match choice.trim() {
         "1" => ("anthropic", "claude-sonnet-4-5"),
@@ -386,11 +405,11 @@ fn configure_provider(global_config_path: &Path) -> Result<()> {
         }
     };
 
-    print!("Default model [{}]: ", default_model_hint);
-    std::io::stdout().flush().map_err(ClawdMuxError::Io)?;
+    write!(writer, "Default model [{}]: ", default_model_hint).map_err(ClawdMuxError::Io)?;
+    writer.flush().map_err(ClawdMuxError::Io)?;
 
     let mut model_input = String::new();
-    std::io::stdin()
+    reader
         .read_line(&mut model_input)
         .map_err(ClawdMuxError::Io)?;
     let model = {
@@ -402,7 +421,20 @@ fn configure_provider(global_config_path: &Path) -> Result<()> {
         }
     };
 
-    let api_key = rpassword::prompt_password("API key: ").map_err(ClawdMuxError::Io)?;
+    write!(writer, "API key: ").map_err(ClawdMuxError::Io)?;
+    writer.flush().map_err(ClawdMuxError::Io)?;
+
+    let mut api_key_input = String::new();
+    reader
+        .read_line(&mut api_key_input)
+        .map_err(ClawdMuxError::Io)?;
+    let api_key = api_key_input.trim().to_string();
+
+    if api_key.is_empty() {
+        return Err(ClawdMuxError::Internal(
+            "API key must not be empty".to_string(),
+        ));
+    }
 
     let provider_config = ProviderConfig {
         api_key,
@@ -429,7 +461,6 @@ fn configure_provider(global_config_path: &Path) -> Result<()> {
     };
 
     config.save(global_config_path)?;
-    println!("Credentials saved to {}", global_config_path.display());
     tracing::info!(path = %global_config_path.display(), "global config saved");
     Ok(())
 }
@@ -439,7 +470,7 @@ fn configure_provider(global_config_path: &Path) -> Result<()> {
 /// All paths are created only if absent, except agent definition files which
 /// are also overwritten when `args.reset_agents` is `true`.
 fn scaffold_project(project_root: &Path, args: &InitArgs) -> Result<()> {
-    println!("Scaffolding project...");
+    tracing::info!("scaffolding project");
 
     // .clawdmux/config.toml
     let clawdmux_dir = project_root.join(".clawdmux");
@@ -448,14 +479,12 @@ fn scaffold_project(project_root: &Path, args: &InitArgs) -> Result<()> {
         std::fs::create_dir_all(&clawdmux_dir).map_err(ClawdMuxError::Io)?;
         std::fs::write(&project_config_path, DEFAULT_PROJECT_CONFIG).map_err(ClawdMuxError::Io)?;
         tracing::info!(path = %project_config_path.display(), "created project config");
-        println!("  created .clawdmux/config.toml");
     }
 
     // tasks/
     let tasks_dir = project_root.join("tasks");
     std::fs::create_dir_all(&tasks_dir).map_err(ClawdMuxError::Io)?;
     tracing::info!(path = %tasks_dir.display(), "created tasks directory");
-    println!("  created tasks/  (task file directory)");
 
     // .opencode/agents/clawdmux/
     let agents_dir = project_root
@@ -465,44 +494,48 @@ fn scaffold_project(project_root: &Path, args: &InitArgs) -> Result<()> {
     std::fs::create_dir_all(&agents_dir).map_err(ClawdMuxError::Io)?;
 
     for agent in AgentKind::all() {
-        let file_name = agent_file_name(agent);
+        let (Some(file_name), Some(content)) =
+            (agent_file_name(agent), agent_definition_content(agent))
+        else {
+            continue;
+        };
         let file_path = agents_dir.join(file_name);
         if !file_path.exists() || args.reset_agents {
-            std::fs::write(&file_path, agent_definition_content(agent))
-                .map_err(ClawdMuxError::Io)?;
+            std::fs::write(&file_path, content).map_err(ClawdMuxError::Io)?;
             tracing::info!(path = %file_path.display(), "created agent definition");
-            println!("  created .opencode/agents/clawdmux/{}", file_name);
         }
     }
 
     Ok(())
 }
 
-/// Returns the filename (e.g. `"code-quality.md"`) for an agent definition.
-fn agent_file_name(agent: &AgentKind) -> &'static str {
+/// Returns the filename (e.g. `"code-quality.md"`) for an agent definition,
+/// or `None` for [`AgentKind::Human`] which has no definition file.
+fn agent_file_name(agent: &AgentKind) -> Option<&'static str> {
     match agent {
-        AgentKind::Intake => "intake.md",
-        AgentKind::Design => "design.md",
-        AgentKind::Planning => "planning.md",
-        AgentKind::Implementation => "implementation.md",
-        AgentKind::CodeQuality => "code-quality.md",
-        AgentKind::SecurityReview => "security-review.md",
-        AgentKind::CodeReview => "code-review.md",
-        AgentKind::Human => unreachable!("Human is not a pipeline agent"),
+        AgentKind::Intake => Some("intake.md"),
+        AgentKind::Design => Some("design.md"),
+        AgentKind::Planning => Some("planning.md"),
+        AgentKind::Implementation => Some("implementation.md"),
+        AgentKind::CodeQuality => Some("code-quality.md"),
+        AgentKind::SecurityReview => Some("security-review.md"),
+        AgentKind::CodeReview => Some("code-review.md"),
+        AgentKind::Human => None,
     }
 }
 
-/// Returns the default YAML-frontmatter + system-prompt content for an agent.
-fn agent_definition_content(agent: &AgentKind) -> &'static str {
+/// Returns the default YAML-frontmatter + system-prompt content for an agent,
+/// or `None` for [`AgentKind::Human`] which has no definition file.
+fn agent_definition_content(agent: &AgentKind) -> Option<&'static str> {
     match agent {
-        AgentKind::Intake => INTAKE_AGENT,
-        AgentKind::Design => DESIGN_AGENT,
-        AgentKind::Planning => PLANNING_AGENT,
-        AgentKind::Implementation => IMPLEMENTATION_AGENT,
-        AgentKind::CodeQuality => CODE_QUALITY_AGENT,
-        AgentKind::SecurityReview => SECURITY_REVIEW_AGENT,
-        AgentKind::CodeReview => CODE_REVIEW_AGENT,
-        AgentKind::Human => unreachable!("Human is not a pipeline agent"),
+        AgentKind::Intake => Some(INTAKE_AGENT),
+        AgentKind::Design => Some(DESIGN_AGENT),
+        AgentKind::Planning => Some(PLANNING_AGENT),
+        AgentKind::Implementation => Some(IMPLEMENTATION_AGENT),
+        AgentKind::CodeQuality => Some(CODE_QUALITY_AGENT),
+        AgentKind::SecurityReview => Some(SECURITY_REVIEW_AGENT),
+        AgentKind::CodeReview => Some(CODE_REVIEW_AGENT),
+        AgentKind::Human => None,
     }
 }
 
@@ -519,17 +552,19 @@ port = 4096
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use super::*;
-    use crate::config::providers::ProviderConfig;
+    use crate::config::providers::{ProviderConfig, ProviderSection};
     use tempfile::TempDir;
 
     /// Write a minimal pre-configured global config to `path` so that
-    /// `configure_provider` returns immediately (no interactive prompt).
+    /// `configure_provider_from_reader` returns immediately (no prompts).
     fn write_global_config(path: &Path) {
         let dir = path.parent().unwrap();
         std::fs::create_dir_all(dir).unwrap();
         let config = GlobalConfig {
-            provider: crate::config::providers::ProviderSection {
+            provider: ProviderSection {
                 default: "anthropic".to_string(),
                 anthropic: Some(ProviderConfig {
                     api_key: "sk-ant-test".to_string(),
@@ -541,6 +576,95 @@ mod tests {
         };
         config.save(path).unwrap();
     }
+
+    // --- configure_provider_from_reader tests ---
+
+    #[test]
+    fn test_configure_provider_invalid_choice() {
+        let dir = TempDir::new().unwrap();
+        let global_path = dir.path().join("config.toml");
+        // No existing config; provider.default is empty.
+        let mut reader = io::Cursor::new(b"5\n".as_ref());
+        let mut writer = io::Cursor::new(Vec::new());
+
+        let result = configure_provider_from_reader(&global_path, &mut reader, &mut writer);
+        assert!(
+            matches!(result, Err(ClawdMuxError::Internal(_))),
+            "expected Internal error for invalid choice, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_configure_provider_empty_api_key() {
+        let dir = TempDir::new().unwrap();
+        let global_path = dir.path().join("config.toml");
+        // provider=1 (anthropic), model=empty (accept default), api_key=empty
+        let mut reader = io::Cursor::new(b"1\n\n\n".as_ref());
+        let mut writer = io::Cursor::new(Vec::new());
+
+        let result = configure_provider_from_reader(&global_path, &mut reader, &mut writer);
+        assert!(
+            matches!(result, Err(ClawdMuxError::Internal(_))),
+            "expected Internal error for empty API key, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_configure_provider_happy_path_anthropic() {
+        let dir = TempDir::new().unwrap();
+        let global_path = dir.path().join("config.toml");
+        // provider=1, model override, api_key set
+        let mut reader = io::Cursor::new(b"1\nclaude-opus-4-6\nsk-ant-test-key\n".as_ref());
+        let mut writer = io::Cursor::new(Vec::new());
+
+        configure_provider_from_reader(&global_path, &mut reader, &mut writer).unwrap();
+
+        let config = GlobalConfig::load(&global_path).unwrap();
+        assert_eq!(config.provider.default, "anthropic");
+        let ant = config.provider.anthropic.unwrap();
+        assert_eq!(ant.api_key, "sk-ant-test-key");
+        assert_eq!(ant.default_model, "claude-opus-4-6");
+        assert!(config.provider.openai.is_none());
+        assert!(config.provider.google.is_none());
+    }
+
+    #[test]
+    fn test_configure_provider_happy_path_uses_default_model() {
+        let dir = TempDir::new().unwrap();
+        let global_path = dir.path().join("config.toml");
+        // provider=2 (openai), empty model line -> should use "gpt-4o"
+        let mut reader = io::Cursor::new(b"2\n\nsk-openai-key\n".as_ref());
+        let mut writer = io::Cursor::new(Vec::new());
+
+        configure_provider_from_reader(&global_path, &mut reader, &mut writer).unwrap();
+
+        let config = GlobalConfig::load(&global_path).unwrap();
+        assert_eq!(config.provider.default, "openai");
+        let oai = config.provider.openai.unwrap();
+        assert_eq!(oai.default_model, "gpt-4o");
+        assert_eq!(oai.api_key, "sk-openai-key");
+    }
+
+    #[test]
+    fn test_configure_provider_already_configured() {
+        let dir = TempDir::new().unwrap();
+        let global_path = dir.path().join("config.toml");
+        write_global_config(&global_path);
+
+        // Empty reader: the function must return without reading anything.
+        let mut reader = io::Cursor::new(b"".as_ref());
+        let mut writer = io::Cursor::new(Vec::new());
+
+        configure_provider_from_reader(&global_path, &mut reader, &mut writer).unwrap();
+
+        // Config must be unchanged.
+        let config = GlobalConfig::load(&global_path).unwrap();
+        assert_eq!(config.provider.default, "anthropic");
+    }
+
+    // --- scaffold tests ---
 
     #[test]
     fn test_scaffold_creates_config() {
@@ -605,7 +729,8 @@ mod tests {
         let agents_dir = project_dir.path().join(".opencode/agents/clawdmux");
 
         for agent in AgentKind::all() {
-            let file_path = agents_dir.join(agent_file_name(agent));
+            let file_name = agent_file_name(agent).expect("all() never yields Human");
+            let file_path = agents_dir.join(file_name);
             assert!(
                 file_path.exists(),
                 "agent file {} should exist",
@@ -630,13 +755,11 @@ mod tests {
             reset_agents: false,
         };
         run_init_with_paths(&global_path, project_dir.path(), &args).unwrap();
-        // Second call must succeed without errors or duplicate files.
         run_init_with_paths(&global_path, project_dir.path(), &args).unwrap();
 
-        // Verify no duplication: each agent file is a regular file, not a dir.
         let agents_dir = project_dir.path().join(".opencode/agents/clawdmux");
         for agent in AgentKind::all() {
-            let file_path = agents_dir.join(agent_file_name(agent));
+            let file_path = agents_dir.join(agent_file_name(agent).unwrap());
             assert!(
                 file_path.is_file(),
                 "{} should remain a regular file",
@@ -652,7 +775,6 @@ mod tests {
         let global_path = global_dir.path().join("config.toml");
         write_global_config(&global_path);
 
-        // Initial scaffold
         run_init_with_paths(
             &global_path,
             project_dir.path(),
@@ -662,7 +784,6 @@ mod tests {
         )
         .unwrap();
 
-        // Corrupt the intake agent file
         let intake_path = project_dir
             .path()
             .join(".opencode/agents/clawdmux/intake.md");
@@ -672,7 +793,6 @@ mod tests {
             "corrupted content"
         );
 
-        // Re-run with reset_agents = true
         run_init_with_paths(
             &global_path,
             project_dir.path(),
