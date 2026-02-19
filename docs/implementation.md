@@ -64,6 +64,8 @@ Tasks that must complete before a given task can begin:
 
 ### Task 1.1 — Module Scaffold
 
+**Status**: COMPLETED
+
 **Objective**: Create the full directory and file skeleton for every module defined in the design doc so that subsequent tasks can fill them in without restructuring. All files contain the module declaration, a top-level doc comment, and placeholder `todo!()` items where needed.
 
 **Files to Read**:
@@ -117,6 +119,8 @@ Tasks that must complete before a given task can begin:
 ---
 
 ### Task 1.2 — Centralized Error Type
+
+**Status**: COMPLETED
 
 **Objective**: Implement `ClawdMuxError`, a single `thiserror`-derived error enum that covers every error category the application will encounter. This becomes the `Err` side of every `Result` in the codebase.
 
@@ -194,6 +198,8 @@ pub type Result<T> = std::result::Result<T, ClawdMuxError>;
 ---
 
 ### Task 1.3 — Core Task Models
+
+**Status**: COMPLETED
 
 **Objective**: Implement all data model structs and enums in `src/tasks/models.rs` that represent stories, tasks, questions, work log entries, and their statuses. These are plain data structures with no I/O logic.
 

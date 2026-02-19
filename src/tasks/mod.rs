@@ -8,3 +8,6 @@
 pub mod models;
 pub mod parser;
 pub mod writer;
+
+#[allow(unused_imports)]
+pub use models::{Question, Story, Task, TaskId, TaskStatus, WorkLogEntry};
