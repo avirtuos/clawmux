@@ -669,6 +669,8 @@ Print `"clawdmux is ready. Run clawdmux to open the TUI."` on success. Use `trac
 
 **Verification**: Standard suite. Note: tests that invoke curl should be behind a `#[cfg(not(feature = "offline_tests"))]` gate or skip the network step by using a mock.
 
+**Status**: COMPLETED
+
 ---
 
 ## Story 4: TUI Shell & Layout (Phase 1)

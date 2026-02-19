@@ -159,6 +159,8 @@ Scaffolding project...
 
 The agent definition files contain sensible defaults. Users may edit them to customize agent behaviour. Running `clawdmux init --reset-agents` regenerates them from built-in defaults.
 
+Implementation note: `run_init` delegates to an internal `run_init_with_paths(global_config_path, project_root, args)` that accepts an explicit global config path. This mirrors the `AppConfig::load_from` pattern and allows tests to supply a `TempDir`-based path without touching `~/.config/clawdmux/config.toml`. The opencode binary check lives only in the public `run_init` entry point and is intentionally excluded from `run_init_with_paths`.
+
 **Step 4 -- Summary**
 
 ```
