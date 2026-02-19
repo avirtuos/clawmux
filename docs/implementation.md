@@ -604,6 +604,8 @@ Add `dirs = "5"` to `Cargo.toml` `[dependencies]` if not already present.
 
 **Verification**: Standard suite.
 
+**Status**: COMPLETED
+
 ---
 
 ### Task 3.2 — `clawdmux init` Command
