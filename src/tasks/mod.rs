@@ -19,11 +19,23 @@ pub use writer::write_task;
 
 use crate::error::ClawdMuxError;
 
+/// Parses a leading integer from a story name like `"10. Big Story"` → `Some(10)`.
+/// Returns `None` if the name does not start with a decimal number followed by `'.'`.
+fn parse_story_number(name: &str) -> Option<u32> {
+    let dot = name.find('.')?;
+    name[..dot].trim().parse().ok()
+}
+
 /// In-memory store for all loaded stories and tasks.
 ///
 /// Discovers task files from `./tasks/` or `./docs/tasks/` on startup.
 /// Caches parsed tasks and provides CRUD-style access by [`TaskId`].
+///
+/// Calling [`load_from_disk`][TaskStore::load_from_disk] multiple times is
+/// additive: tasks from later calls overwrite any existing entry with the same
+/// [`TaskId`], while tasks unique to earlier calls are retained.
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct TaskStore {
     tasks: HashMap<TaskId, Task>,
 }
@@ -94,33 +106,44 @@ impl TaskStore {
 
     /// Returns all stories, each containing their tasks sorted by task name.
     ///
-    /// Stories are sorted by story name. Tasks within each story are sorted using
-    /// the numeric `<story>.<task>` ordering defined by [`Story::sorted_tasks`].
+    /// Stories are sorted numerically by their leading story number (e.g. `"10. Baz"`
+    /// sorts after `"2. Bar"`). Tasks within each story use the numeric
+    /// `<story>.<task>` ordering defined by [`Story::sorted_tasks`].
     pub fn stories(&self) -> Vec<Story> {
-        let mut by_story: HashMap<&str, Vec<&Task>> = HashMap::new();
+        let mut by_story: HashMap<&str, Vec<Task>> = HashMap::new();
         for task in self.tasks.values() {
             by_story
                 .entry(task.story_name.as_str())
                 .or_default()
-                .push(task);
+                .push(task.clone());
         }
 
         let mut story_names: Vec<&str> = by_story.keys().copied().collect();
-        story_names.sort();
+        story_names.sort_by(
+            |a, b| match (parse_story_number(a), parse_story_number(b)) {
+                (Some(na), Some(nb)) => na.cmp(&nb),
+                _ => a.cmp(b),
+            },
+        );
 
         story_names
             .into_iter()
             .map(|name| {
-                let tasks: Vec<Task> = by_story[name].iter().map(|t| (*t).clone()).collect();
-                let story = Story {
-                    name: name.to_string(),
-                    tasks,
-                };
-                // Re-order tasks using the story's own numeric sort.
-                let sorted_tasks: Vec<Task> = story.sorted_tasks().into_iter().cloned().collect();
+                let mut tasks = by_story.remove(name).unwrap_or_default();
+                // Sort tasks by numeric <story>.<task> parts, falling back to lexicographic.
+                tasks.sort_by(|a, b| {
+                    fn task_num(s: &str) -> Option<(u32, u32)> {
+                        let mut p = s.splitn(2, '.');
+                        Some((p.next()?.parse().ok()?, p.next()?.trim().parse().ok()?))
+                    }
+                    match (task_num(&a.name), task_num(&b.name)) {
+                        (Some(x), Some(y)) => x.cmp(&y),
+                        _ => a.name.cmp(&b.name),
+                    }
+                });
                 Story {
                     name: name.to_string(),
-                    tasks: sorted_tasks,
+                    tasks,
                 }
             })
             .collect()
@@ -258,8 +281,41 @@ mod tests {
         assert_eq!(stories.len(), 2);
         assert_eq!(stories[0].name, "1. Foo");
         assert_eq!(stories[0].tasks.len(), 2);
+        // Tasks within the story must be in numeric order.
+        assert_eq!(stories[0].tasks[0].name, "1.1");
+        assert_eq!(stories[0].tasks[1].name, "1.2");
         assert_eq!(stories[1].name, "2. Bar");
         assert_eq!(stories[1].tasks.len(), 1);
+    }
+
+    #[test]
+    fn test_stories_numeric_sort_double_digit() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        std::fs::create_dir(&tasks_dir).unwrap();
+
+        write_file(&tasks_dir, "1.1.md", &minimal_md("1. Foo", "1.1"));
+        write_file(&tasks_dir, "2.1.md", &minimal_md("2. Bar", "2.1"));
+        write_file(&tasks_dir, "10.1.md", &minimal_md("10. Baz", "10.1"));
+
+        let mut store = TaskStore::new();
+        store.load_from_disk(tmp.path()).unwrap();
+
+        let stories = store.stories();
+        assert_eq!(stories.len(), 3);
+        assert_eq!(stories[0].name, "1. Foo");
+        assert_eq!(stories[1].name, "2. Bar");
+        // "10. Baz" must sort after "2. Bar" numerically, not before it lexicographically.
+        assert_eq!(stories[2].name, "10. Baz");
+    }
+
+    #[test]
+    fn test_load_from_disk_missing_directory() {
+        let tmp = TempDir::new().unwrap();
+        // Neither tasks/ nor docs/tasks/ exists.
+        let mut store = TaskStore::new();
+        let err = store.load_from_disk(tmp.path()).unwrap_err();
+        assert!(matches!(err, crate::error::ClawdMuxError::Io(_)));
     }
 
     #[test]
