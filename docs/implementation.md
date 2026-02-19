@@ -363,7 +363,7 @@ Metadata parsing:
 
 ### Task 2.2 — Task File Writer
 
-**Objective**: Implement the serializer that writes a `Task` struct back to a markdown string, preserving unknown sections and producing output that round-trips cleanly through the parser.
+**Objective**: Implement the serializer that writes a `Task` struct back to a markdown string, preserving unknown sections and producing output that round-trips cleanly through the parser. The round-trip must also preserve "unknown" sections but it is ok if unknown sections end up at the end of the document.
 
 **Files to Read**:
 - `src/tasks/writer.rs` (created in 1.1)
