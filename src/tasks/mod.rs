@@ -11,3 +11,5 @@ pub mod writer;
 
 #[allow(unused_imports)]
 pub use models::{Question, Story, Task, TaskId, TaskStatus, WorkLogEntry};
+#[allow(unused_imports)]
+pub use writer::write_task;

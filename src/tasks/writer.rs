@@ -15,6 +15,11 @@ use crate::tasks::models::Task;
 /// Optional sections are omitted when their corresponding field is `None` or empty.
 /// The output round-trips cleanly through [`crate::tasks::parser::parse_task`].
 ///
+/// **Timestamp normalization**: work log timestamps are always written in RFC 3339
+/// format with a `+00:00` suffix (e.g. `2026-02-10T10:00:01+00:00`), even if the
+/// original file used a bare timestamp (`2026-02-10T10:00:01`). The first
+/// `parse -> write` cycle normalizes timestamps; subsequent cycles are idempotent.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::ClawdMuxError::Encode`] if serialization fails (currently
@@ -78,13 +83,17 @@ pub fn write_task(task: &Task) -> crate::error::Result<String> {
     if !task.work_log.is_empty() {
         out.push_str("## Work Log\n\n");
         for entry in &task.work_log {
-            out.push_str(&format!(
-                "{} {} [{}] {}\n",
-                entry.sequence,
-                entry.timestamp.to_rfc3339(),
-                entry.agent.display_name(),
-                entry.description
-            ));
+            out.push_str(
+                format!(
+                    "{} {} [{}] {}",
+                    entry.sequence,
+                    entry.timestamp.to_rfc3339(),
+                    entry.agent.display_name(),
+                    entry.description
+                )
+                .trim_end(),
+            );
+            out.push('\n');
         }
         out.push('\n'); // blank line to close section
     }
