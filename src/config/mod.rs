@@ -89,17 +89,24 @@ impl AppConfig {
     /// cannot be resolved. Returns [`ClawdMuxError::Io`] for unexpected IO
     /// failures and [`ClawdMuxError::Config`] for malformed TOML.
     pub fn load(project_root: &Path) -> Result<Self> {
-        // --- Global config ---
         let global_config_dir = dirs::config_dir().ok_or_else(|| {
             ClawdMuxError::Internal("could not determine platform config directory".to_string())
         })?;
         let global_path = global_config_dir.join("clawdmux").join("config.toml");
+        Self::load_from(&global_path, project_root)
+    }
 
-        let global = match GlobalConfig::load(&global_path) {
+    /// Internal loader that accepts an explicit global config path.
+    ///
+    /// Separated from [`Self::load`] so tests can supply a temporary directory
+    /// path without touching the real `~/.config/clawdmux/config.toml`.
+    fn load_from(global_config_path: &Path, project_root: &Path) -> Result<Self> {
+        // --- Global config ---
+        let global = match GlobalConfig::load(global_config_path) {
             Ok(cfg) => cfg,
             Err(ClawdMuxError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::info!(
-                    path = %global_path.display(),
+                    path = %global_config_path.display(),
                     "global config not found, using defaults"
                 );
                 GlobalConfig::default()
@@ -184,9 +191,11 @@ password = "s3cr3t"
 
     #[test]
     fn test_app_config_load_missing_project() {
-        let dir = TempDir::new().unwrap();
-        // No .clawdmux/config.toml exists; global config also absent.
-        let config = AppConfig::load(dir.path()).unwrap();
+        let global_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        // Neither global nor project config exists; both should use defaults.
+        let global_path = global_dir.path().join("config.toml");
+        let config = AppConfig::load_from(&global_path, project_dir.path()).unwrap();
         assert_eq!(config.opencode.hostname, "127.0.0.1");
         assert_eq!(config.opencode.port, 4096);
         assert_eq!(config.opencode.mode, ServerMode::Auto);
@@ -195,8 +204,9 @@ password = "s3cr3t"
 
     #[test]
     fn test_app_config_load_with_project_config() {
-        let dir = TempDir::new().unwrap();
-        let clawdmux_dir = dir.path().join(".clawdmux");
+        let global_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let clawdmux_dir = project_dir.path().join(".clawdmux");
         std::fs::create_dir_all(&clawdmux_dir).unwrap();
         let config_path = clawdmux_dir.join("config.toml");
         std::fs::write(
@@ -211,10 +221,25 @@ password = "mypassword"
         )
         .unwrap();
 
-        let config = AppConfig::load(dir.path()).unwrap();
+        let global_path = global_dir.path().join("config.toml");
+        let config = AppConfig::load_from(&global_path, project_dir.path()).unwrap();
         assert_eq!(config.opencode.mode, ServerMode::External);
         assert_eq!(config.opencode.hostname, "192.168.1.50");
         assert_eq!(config.opencode.port, 9000);
         assert_eq!(config.opencode.password.as_deref(), Some("mypassword"));
+    }
+
+    #[test]
+    fn test_server_mode_invalid() {
+        let toml = r#"mode = "bogus""#;
+        let result: std::result::Result<OpenCodeConfig, _> = toml::from_str(toml);
+        // toml::from_str returns a toml::de::Error; map through ClawdMuxError::Config
+        // by mimicking what AppConfig::load_from does with the project config.
+        let err = result.map_err(ClawdMuxError::from);
+        assert!(
+            matches!(err, Err(ClawdMuxError::Config(_))),
+            "expected Config error for unknown server mode, got: {:?}",
+            err
+        );
     }
 }

@@ -4,6 +4,7 @@
 //! injected into the opencode server process as environment variables.
 //! Credentials are never written to opencode's own config files.
 
+use std::fmt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -14,12 +15,21 @@ use crate::error::{ClawdMuxError, Result};
 ///
 /// Always wrapped in `Option` -- a provider with no API key would be invalid.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ProviderConfig {
     /// The API key for this provider.
     pub api_key: String,
     /// The default model to use for this provider (e.g., `"claude-opus-4-6"`).
     pub default_model: String,
+}
+
+impl fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("api_key", &"<redacted>")
+            .field("default_model", &self.default_model)
+            .finish()
+    }
 }
 
 /// Provider selection and per-provider credentials.
@@ -86,34 +96,16 @@ impl GlobalConfig {
         let Some(provider) = self.active_provider() else {
             return Vec::new();
         };
-
-        match self.provider.default.as_str() {
-            "anthropic" => vec![
-                ("ANTHROPIC_API_KEY".to_string(), provider.api_key.clone()),
-                (
-                    "ANTHROPIC_DEFAULT_MODEL".to_string(),
-                    provider.default_model.clone(),
-                ),
-            ],
-            "openai" => vec![
-                ("OPENAI_API_KEY".to_string(), provider.api_key.clone()),
-                (
-                    "OPENAI_DEFAULT_MODEL".to_string(),
-                    provider.default_model.clone(),
-                ),
-            ],
-            "google" => vec![
-                (
-                    "GOOGLE_GENERATIVE_AI_API_KEY".to_string(),
-                    provider.api_key.clone(),
-                ),
-                (
-                    "GOOGLE_DEFAULT_MODEL".to_string(),
-                    provider.default_model.clone(),
-                ),
-            ],
-            _ => Vec::new(),
-        }
+        let (key_var, model_var) = match self.provider.default.as_str() {
+            "anthropic" => ("ANTHROPIC_API_KEY", "ANTHROPIC_DEFAULT_MODEL"),
+            "openai" => ("OPENAI_API_KEY", "OPENAI_DEFAULT_MODEL"),
+            "google" => ("GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_DEFAULT_MODEL"),
+            _ => unreachable!("active_provider() only returns Some for known providers"),
+        };
+        vec![
+            (key_var.to_string(), provider.api_key.clone()),
+            (model_var.to_string(), provider.default_model.clone()),
+        ]
     }
 
     /// Return a reference to the [`ProviderConfig`] for the currently active provider.
@@ -227,6 +219,68 @@ default_model = "claude-opus-4-6"
             "ANTHROPIC_DEFAULT_MODEL".to_string(),
             "claude-opus-4-6".to_string()
         )));
+    }
+
+    #[test]
+    fn test_provider_config_debug_redacts_key() {
+        let provider = ProviderConfig {
+            api_key: "sk-secret-key".to_string(),
+            default_model: "claude-opus-4-6".to_string(),
+        };
+        let debug = format!("{:?}", provider);
+        assert!(
+            debug.contains("<redacted>"),
+            "debug should contain <redacted>"
+        );
+        assert!(
+            !debug.contains("sk-secret-key"),
+            "debug must not expose api_key"
+        );
+        assert!(
+            debug.contains("claude-opus-4-6"),
+            "debug should include default_model"
+        );
+    }
+
+    #[test]
+    fn test_env_vars_openai() {
+        let config = GlobalConfig {
+            provider: ProviderSection {
+                default: "openai".to_string(),
+                anthropic: None,
+                openai: Some(ProviderConfig {
+                    api_key: "sk-openai-test".to_string(),
+                    default_model: "gpt-4o".to_string(),
+                }),
+                google: None,
+            },
+        };
+        let vars = config.env_vars_for_opencode();
+        assert_eq!(vars.len(), 2);
+        assert!(vars.contains(&("OPENAI_API_KEY".to_string(), "sk-openai-test".to_string())));
+        assert!(vars.contains(&("OPENAI_DEFAULT_MODEL".to_string(), "gpt-4o".to_string())));
+    }
+
+    #[test]
+    fn test_env_vars_google() {
+        let config = GlobalConfig {
+            provider: ProviderSection {
+                default: "google".to_string(),
+                anthropic: None,
+                openai: None,
+                google: Some(ProviderConfig {
+                    api_key: "google-api-key".to_string(),
+                    default_model: "gemini-pro".to_string(),
+                }),
+            },
+        };
+        let vars = config.env_vars_for_opencode();
+        assert_eq!(vars.len(), 2);
+        assert!(vars.contains(&(
+            "GOOGLE_GENERATIVE_AI_API_KEY".to_string(),
+            "google-api-key".to_string()
+        )));
+        assert!(vars.contains(&("GOOGLE_DEFAULT_MODEL".to_string(), "gemini-pro".to_string())));
     }
 
     #[test]
