@@ -1,8 +1,252 @@
-//! ProviderConfig: reads `~/.config/clawdmux/config.toml` and resolves credentials.
+//! LLM provider configuration loaded from `~/.config/clawdmux/config.toml`.
 //!
-//! Provides LLM provider API keys and model defaults to inject into the opencode
-//! server process as environment variables (e.g., `ANTHROPIC_API_KEY`).
+//! Provides API keys and model defaults for the active LLM provider, which are
+//! injected into the opencode server process as environment variables.
 //! Credentials are never written to opencode's own config files.
-//! Task 2.1 implements the full provider config.
 
-//TODO: Task 2.1 -- implement ProviderConfig with load() and env_vars_for_opencode() -> HashMap<String, String>
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{ClawdMuxError, Result};
+
+/// Configuration for a single LLM provider (API key and default model).
+///
+/// Always wrapped in `Option` -- a provider with no API key would be invalid.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProviderConfig {
+    /// The API key for this provider.
+    pub api_key: String,
+    /// The default model to use for this provider (e.g., `"claude-opus-4-6"`).
+    pub default_model: String,
+}
+
+/// Provider selection and per-provider credentials.
+///
+/// The `default` field names the active provider; the remaining fields hold
+/// optional credentials for each supported provider.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ProviderSection {
+    /// Name of the active provider (e.g., `"anthropic"`, `"openai"`, `"google"`).
+    #[serde(default)]
+    pub default: String,
+    /// Anthropic provider credentials.
+    pub anthropic: Option<ProviderConfig>,
+    /// OpenAI provider credentials.
+    pub openai: Option<ProviderConfig>,
+    /// Google provider credentials.
+    pub google: Option<ProviderConfig>,
+}
+
+/// Global ClawdMux configuration stored in `~/.config/clawdmux/config.toml`.
+///
+/// Contains LLM provider credentials used to configure opencode server processes.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct GlobalConfig {
+    /// LLM provider section.
+    #[serde(default)]
+    pub provider: ProviderSection,
+}
+
+#[allow(dead_code)]
+impl GlobalConfig {
+    /// Load a [`GlobalConfig`] from a TOML file at `path`.
+    ///
+    /// Returns `Err(ClawdMuxError::Io)` if the file cannot be read (including
+    /// `NotFound`) and `Err(ClawdMuxError::Config)` if the TOML is malformed.
+    pub fn load(path: &Path) -> Result<Self> {
+        let contents = std::fs::read_to_string(path)?;
+        let config: GlobalConfig = toml::from_str(&contents)?;
+        Ok(config)
+    }
+
+    /// Serialize this config to TOML and write it to `path`.
+    ///
+    /// Creates any missing parent directories. Maps TOML serialization errors
+    /// to [`ClawdMuxError::Encode`].
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let contents =
+            toml::to_string_pretty(self).map_err(|e| ClawdMuxError::Encode(e.to_string()))?;
+        std::fs::write(path, contents)?;
+        Ok(())
+    }
+
+    /// Return environment variable pairs for the active LLM provider.
+    ///
+    /// The pairs are suitable for injecting into the opencode server process
+    /// (e.g., `("ANTHROPIC_API_KEY", "<key>")`). Returns an empty `Vec` if no
+    /// provider is configured or the default name is unrecognized.
+    pub fn env_vars_for_opencode(&self) -> Vec<(String, String)> {
+        let Some(provider) = self.active_provider() else {
+            return Vec::new();
+        };
+
+        match self.provider.default.as_str() {
+            "anthropic" => vec![
+                ("ANTHROPIC_API_KEY".to_string(), provider.api_key.clone()),
+                (
+                    "ANTHROPIC_DEFAULT_MODEL".to_string(),
+                    provider.default_model.clone(),
+                ),
+            ],
+            "openai" => vec![
+                ("OPENAI_API_KEY".to_string(), provider.api_key.clone()),
+                (
+                    "OPENAI_DEFAULT_MODEL".to_string(),
+                    provider.default_model.clone(),
+                ),
+            ],
+            "google" => vec![
+                (
+                    "GOOGLE_GENERATIVE_AI_API_KEY".to_string(),
+                    provider.api_key.clone(),
+                ),
+                (
+                    "GOOGLE_DEFAULT_MODEL".to_string(),
+                    provider.default_model.clone(),
+                ),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Return a reference to the [`ProviderConfig`] for the currently active provider.
+    ///
+    /// Returns `None` if `provider.default` is empty, unrecognized, or the
+    /// corresponding provider block is not set.
+    fn active_provider(&self) -> Option<&ProviderConfig> {
+        match self.provider.default.as_str() {
+            "anthropic" => self.provider.anthropic.as_ref(),
+            "openai" => self.provider.openai.as_ref(),
+            "google" => self.provider.google.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tempfile::TempDir;
+
+    fn anthropic_config() -> GlobalConfig {
+        GlobalConfig {
+            provider: ProviderSection {
+                default: "anthropic".to_string(),
+                anthropic: Some(ProviderConfig {
+                    api_key: "sk-ant-test".to_string(),
+                    default_model: "claude-opus-4-6".to_string(),
+                }),
+                openai: None,
+                google: None,
+            },
+        }
+    }
+
+    #[test]
+    fn test_global_config_load() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let toml = r#"
+[provider]
+default = "anthropic"
+
+[provider.anthropic]
+api_key = "sk-ant-test"
+default_model = "claude-opus-4-6"
+"#;
+        std::fs::write(&path, toml).unwrap();
+
+        let config = GlobalConfig::load(&path).unwrap();
+        assert_eq!(config.provider.default, "anthropic");
+        let anthropic = config.provider.anthropic.unwrap();
+        assert_eq!(anthropic.api_key, "sk-ant-test");
+        assert_eq!(anthropic.default_model, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn test_global_config_load_nonexistent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("does_not_exist.toml");
+
+        let result = GlobalConfig::load(&path);
+        assert!(matches!(result, Err(ClawdMuxError::Io(_))));
+    }
+
+    #[test]
+    fn test_global_config_save_and_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = anthropic_config();
+
+        original.save(&path).unwrap();
+        let loaded = GlobalConfig::load(&path).unwrap();
+
+        assert_eq!(loaded.provider.default, original.provider.default);
+        let orig_ant = original.provider.anthropic.unwrap();
+        let loaded_ant = loaded.provider.anthropic.unwrap();
+        assert_eq!(loaded_ant.api_key, orig_ant.api_key);
+        assert_eq!(loaded_ant.default_model, orig_ant.default_model);
+    }
+
+    #[test]
+    fn test_global_config_save_creates_parents() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a").join("b").join("config.toml");
+        let config = anthropic_config();
+
+        config.save(&path).unwrap();
+        assert!(path.exists(), "config file should have been created");
+    }
+
+    #[test]
+    fn test_global_config_invalid_toml() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "not valid toml ][[[").unwrap();
+
+        let result = GlobalConfig::load(&path);
+        assert!(matches!(result, Err(ClawdMuxError::Config(_))));
+    }
+
+    #[test]
+    fn test_env_vars_anthropic() {
+        let config = anthropic_config();
+        let vars = config.env_vars_for_opencode();
+
+        assert_eq!(vars.len(), 2);
+        assert!(vars.contains(&("ANTHROPIC_API_KEY".to_string(), "sk-ant-test".to_string())));
+        assert!(vars.contains(&(
+            "ANTHROPIC_DEFAULT_MODEL".to_string(),
+            "claude-opus-4-6".to_string()
+        )));
+    }
+
+    #[test]
+    fn test_env_vars_no_provider() {
+        let config = GlobalConfig::default();
+        let vars = config.env_vars_for_opencode();
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn test_env_vars_unknown_provider() {
+        let config = GlobalConfig {
+            provider: ProviderSection {
+                default: "unknown_provider".to_string(),
+                anthropic: None,
+                openai: None,
+                google: None,
+            },
+        };
+        let vars = config.env_vars_for_opencode();
+        assert!(vars.is_empty());
+    }
+}
