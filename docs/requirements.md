@@ -19,7 +19,7 @@ The persona of each agent is configured via the agent's personality file under t
 
 Story: 1. Big Story
 Task: 1.1 First Task
-Status: INPROGRESS
+Status: IN_PROGRESS
 Assigned To: [Planning Agent]
 
 ## Description

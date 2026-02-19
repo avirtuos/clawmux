@@ -64,6 +64,8 @@ Tasks that must complete before a given task can begin:
 
 ### Task 1.1 — Module Scaffold
 
+**Status**: COMPLETED
+
 **Objective**: Create the full directory and file skeleton for every module defined in the design doc so that subsequent tasks can fill them in without restructuring. All files contain the module declaration, a top-level doc comment, and placeholder `todo!()` items where needed.
 
 **Files to Read**:
@@ -117,6 +119,8 @@ Tasks that must complete before a given task can begin:
 ---
 
 ### Task 1.2 — Centralized Error Type
+
+**Status**: COMPLETED
 
 **Objective**: Implement `ClawdMuxError`, a single `thiserror`-derived error enum that covers every error category the application will encounter. This becomes the `Err` side of every `Result` in the codebase.
 
@@ -195,6 +199,8 @@ pub type Result<T> = std::result::Result<T, ClawdMuxError>;
 
 ### Task 1.3 — Core Task Models
 
+**Status**: COMPLETED
+
 **Objective**: Implement all data model structs and enums in `src/tasks/models.rs` that represent stories, tasks, questions, work log entries, and their statuses. These are plain data structures with no I/O logic.
 
 **Files to Read**:
@@ -211,17 +217,18 @@ pub type Result<T> = std::result::Result<T, ClawdMuxError>;
 Implement all types exactly as specified in `docs/design.md` under "Key Data Structures", with these additions:
 
 - `TaskId`: Derive `Debug`, `Clone`, `PartialEq`, `Eq`, `Hash`. Add `impl TaskId { pub fn from_path(p: impl Into<PathBuf>) -> Self }` and `impl Display for TaskId` (shows the file name stem).
-- `TaskStatus`: Derive `Debug`, `Clone`, `PartialEq`, `Eq`. Implement `Display` (e.g., `"OPEN"`, `"INPROGRESS"`, `"PENDINGREVIEW"`, `"COMPLETED"`, `"ABANDONED"`). Implement `FromStr` mapping the same strings (case-insensitive).
-- `Story`: Derive `Debug`, `Clone`. Add `impl Story { pub fn sorted_tasks(&self) -> Vec<&Task> }` returning tasks sorted by `task.name`.
+- `TaskStatus`: Derive `Debug`, `Clone`, `PartialEq`, `Eq`. Implement `Display` (e.g., `"OPEN"`, `"IN_PROGRESS"`, `"PENDING_REVIEW"`, `"COMPLETED"`, `"ABANDONED"`). Implement `FromStr` mapping these strings case-insensitively; underscores are stripped before matching so `"INPROGRESS"` and `"IN_PROGRESS"` both parse correctly.
+- `Story`: Derive `Debug`, `Clone`. Add `impl Story { pub fn sorted_tasks(&self) -> Vec<&Task> }` returning tasks sorted numerically by `task.name` (e.g., `"1.9"` before `"1.10"`).
 - `Task`: Derive `Debug`, `Clone`. Add `impl Task { pub fn is_active(&self) -> bool }` returning true when status is `InProgress`.
 - `Question`: Derive `Debug`, `Clone`. The `agent` field is `String` at this stage (will be `AgentKind` after Task 1.4 — use a `String` here and convert later, or use `AgentKind` if you complete 1.4 first).
 - `WorkLogEntry`: Derive `Debug`, `Clone`. The `agent` field is `String` at this stage for the same reason.
 
 **Tests to Write**:
-- `test_task_status_display`: Assert `TaskStatus::InProgress.to_string() == "INPROGRESS"`.
-- `test_task_status_from_str`: Assert `"inprogress".parse::<TaskStatus>().unwrap() == TaskStatus::InProgress`. Test all 5 variants.
+- `test_task_status_display`: Assert `TaskStatus::InProgress.to_string() == "IN_PROGRESS"` and `TaskStatus::PendingReview.to_string() == "PENDING_REVIEW"`.
+- `test_task_status_from_str`: Assert both `"IN_PROGRESS"` and `"inprogress"` parse to `TaskStatus::InProgress`. Test all 5 variants. Assert that an invalid string produces `ClawdMuxError::Parse { file: "<task status>", .. }`.
 - `test_task_id_from_path`: Create a `TaskId` from `PathBuf::from("tasks/1.1-first.md")`, assert `Display` output is `"1.1-first"`.
 - `test_story_sorted_tasks`: Build a `Story` with two tasks (names "1.2" and "1.1"), assert `sorted_tasks()` returns them in order "1.1" then "1.2".
+- `test_story_sorted_tasks_double_digit`: Build a `Story` with tasks "1.10", "1.9", "1.2" and assert they sort as "1.2", "1.9", "1.10".
 - `test_task_is_active`: Assert `is_active()` is true for `InProgress`, false for `Open`.
 
 **Verification**: Standard suite.
