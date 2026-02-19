@@ -237,6 +237,8 @@ Implement all types exactly as specified in `docs/design.md` under "Key Data Str
 
 ### Task 1.4 — AgentKind Enum & AppMessage Bus
 
+**Status**: COMPLETED
+
 **Objective**: Implement `AgentKind` in `src/workflow/agents.rs` and the `AppMessage` enum in `src/messages.rs`. These are the central coordination types that all subsystems speak.
 
 **Files to Read**:
@@ -303,6 +305,8 @@ Implement:
 ---
 
 ### Task 2.1 — Task File Parser
+
+**Status**: COMPLETED
 
 **Objective**: Implement the two-phase line-oriented markdown parser that reads task files into `Task` structs, exactly as specified in the design doc.
 
