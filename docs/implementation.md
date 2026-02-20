@@ -683,6 +683,8 @@ Print `"clawdmux is ready. Run clawdmux to open the TUI."` on success. Use `trac
 
 ### Task 4.1 — TUI Bootstrap & Event Loop
 
+**Status**: COMPLETED
+
 **Objective**: Implement `main.rs` event loop, `App` state, and the `tui/mod.rs` draw/input dispatch scaffold. The application must initialize the terminal, render a placeholder frame, handle `q`/`Ctrl-C` to quit, and restore the terminal on exit.
 
 **Files to Read**:
