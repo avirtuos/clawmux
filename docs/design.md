@@ -707,6 +707,7 @@ File discovery at startup: scan `./tasks/` then `./docs/tasks/` for `*.md` files
 ### Implementation Status
 
 - Task 4.1 (TUI Bootstrap & Event Loop): COMPLETED. `cargo run` opens a full-screen ratatui terminal with a placeholder layout (header, left/right panes, footer). Pressing `q` or `Ctrl-C` exits cleanly and restores the terminal. Logging redirected to `clawdmux.log` to avoid corrupting the TUI display. `App` struct, `tui::draw()`, `tui::handle_input()`, and `tui::layout::render_layout()` are all implemented with unit tests.
+- Task 4.2 (Task List Widget): COMPLETED. Left pane now renders a real collapsible story/task tree via `tui::task_list`. `TaskListState` tracks expansion, selection index, and the flattened item list. Arrow keys (`Up`/`Down`/`j`/`k`) navigate the list; `Enter`/`Space` toggles story expansion or selects a task; `Tab` cycles the active right-pane tab. Status icons use distinct ratatui colors (`[ ]` Open, `[*]` InProgress, `[x]` Completed, `[!]` Abandoned, `[?]` PendingReview). `handle_input` now takes `&mut App` to mutate navigation state directly. `App` gains `task_list_state: TaskListState`, initialized via `refresh()` in `App::new()`. 103 tests passing.
 
 ---
 
