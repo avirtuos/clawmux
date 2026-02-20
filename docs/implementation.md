@@ -756,6 +756,8 @@ Use `tracing_appender` to write logs to a file (e.g., `clawdmux.log`) since the 
 
 ### Task 4.2 — Task List Widget
 
+**Status**: COMPLETED
+
 **Objective**: Implement the left pane task list widget showing collapsible stories and selectable tasks with status indicators.
 
 **Files to Read**:
