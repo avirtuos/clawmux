@@ -14,7 +14,7 @@ mod workflow;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use tokio::time::MissedTickBehavior;
 
 use crate::app::App;
@@ -39,7 +39,22 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Log to a file so that log output does not corrupt the TUI display.
-    let file_appender = tracing_appender::rolling::never(".", "clawdmux.log");
+    // Prefer `.clawdmux/` (created by `clawdmux init`); fall back to the
+    // platform data-local directory so we never pollute the project root.
+    let log_dir = {
+        let cwd = std::env::current_dir()?;
+        let local_dir = cwd.join(".clawdmux");
+        if local_dir.exists() {
+            local_dir
+        } else {
+            let fallback = dirs::data_local_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("clawdmux");
+            std::fs::create_dir_all(&fallback)?;
+            fallback
+        }
+    };
+    let file_appender = tracing_appender::rolling::never(log_dir, "clawdmux.log");
     tracing_subscriber::fmt().with_writer(file_appender).init();
 
     let cli = Cli::parse();
@@ -102,11 +117,16 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
             _ = tick_interval.tick() => {
                 app.handle_message(AppMessage::Tick)
             }
+            _ = tokio::signal::ctrl_c() => {
+                app.handle_message(AppMessage::Shutdown)
+            }
         };
 
-        // Dispatch any follow-up messages produced by the handler.
-        for msg in messages {
-            app.handle_message(msg);
+        // Dispatch any follow-up messages produced by the handler,
+        // including messages produced by follow-up handlers themselves.
+        let mut queue = std::collections::VecDeque::from(messages);
+        while let Some(msg) = queue.pop_front() {
+            queue.extend(app.handle_message(msg));
         }
 
         if app.should_quit {
