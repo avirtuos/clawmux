@@ -15,6 +15,32 @@ pub mod layout;
 pub mod tabs;
 pub mod task_list;
 
+/// Resets Tab 1 state when the selected task changes after navigation.
+///
+/// Compares the newly selected task against `tab1_state.current_task_id`.
+/// If different, calls [`Tab1State::reset_for_task`] to rebuild answer inputs
+/// and clear per-task focus state.
+fn sync_tab1_on_nav(app: &mut App) {
+    let new_id = app.task_list_state.selected_task_id().cloned();
+    if new_id != app.tab1_state.current_task_id {
+        match new_id {
+            Some(ref id) => {
+                if let Some(task) = app.task_store.get(id) {
+                    // SAFETY: We clone task to avoid holding an immutable borrow
+                    // while mutating tab1_state.
+                    let task = task.clone();
+                    app.tab1_state.reset_for_task(&task);
+                } else {
+                    app.tab1_state.current_task_id = new_id;
+                }
+            }
+            None => {
+                app.tab1_state.current_task_id = None;
+            }
+        }
+    }
+}
+
 /// Draws the full TUI frame with layout and task list widget.
 ///
 /// Renders header, left pane (task list), right pane, and footer using the computed layout regions.
@@ -61,6 +87,11 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             if let Some(idx) = app.tab1_state.focused_answer {
                 if key.code == KeyCode::Esc {
                     app.tab1_state.focused_answer = None;
+                } else if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
+                    let len = app.tab1_state.answer_inputs.len();
+                    if len > 0 {
+                        app.tab1_state.focused_answer = Some((idx + 1) % len);
+                    }
                 } else if let Some(ta) = app.tab1_state.answer_inputs.get_mut(idx) {
                     ta.input(Input::from(key));
                 }
@@ -73,6 +104,18 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             }
         }
 
+        // Enter focus on the first answer textarea with 'a' (Tab 1, no focus, task selected).
+        if app.active_tab == 0
+            && app.tab1_state.focused_answer.is_none()
+            && !app.tab1_state.prompt_focused
+            && key.code == KeyCode::Char('a')
+            && key.modifiers == KeyModifiers::NONE
+            && !app.tab1_state.answer_inputs.is_empty()
+        {
+            app.tab1_state.focused_answer = Some(0);
+            return None;
+        }
+
         match key.code {
             KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => {
                 return Some(AppMessage::Shutdown);
@@ -82,9 +125,11 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.task_list_state.move_up();
+                sync_tab1_on_nav(app);
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 app.task_list_state.move_down();
+                sync_tab1_on_nav(app);
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if app.task_list_state.selected_task_id().is_none() {
@@ -270,5 +315,71 @@ mod tests {
 
         handle_input(tab.clone(), &mut app);
         assert_eq!(app.active_tab, 0);
+    }
+
+    /// Builds a minimal App with one story containing one task that has one unanswered question.
+    fn app_with_task_and_question() -> App {
+        use crate::tasks::models::{Question, Task, TaskId, TaskStatus};
+        use crate::workflow::agents::AgentKind;
+
+        let mut app = App::new(crate::tasks::TaskStore::new());
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Alpha".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::Open,
+            assigned_to: None,
+            description: String::new(),
+            starting_prompt: None,
+            questions: vec![Question {
+                agent: AgentKind::Intake,
+                text: "Clarify scope?".to_string(),
+                answer: None,
+            }],
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+        };
+        app.task_store.insert(task);
+        app.refresh_stories();
+        // Expand the story and navigate to the task row.
+        app.task_list_state
+            .expanded_stories
+            .insert("1. Alpha".to_string());
+        app.task_list_state.refresh(&app.cached_stories);
+        // items: [0] Story "1. Alpha", [1] Task "1.1" — navigate down to select the task.
+        let down = key_event(KeyCode::Down, KeyModifiers::NONE);
+        handle_input(down, &mut app);
+        app
+    }
+
+    #[test]
+    fn test_handle_input_i_focuses_prompt() {
+        let mut app = App::new(crate::tasks::TaskStore::new());
+        assert_eq!(app.active_tab, 0);
+        assert!(!app.tab1_state.prompt_focused);
+
+        let event = key_event(KeyCode::Char('i'), KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+
+        assert!(result.is_none());
+        assert!(app.tab1_state.prompt_focused);
+    }
+
+    #[test]
+    fn test_handle_input_a_focuses_answer() {
+        let mut app = app_with_task_and_question();
+        assert_eq!(app.active_tab, 0);
+        // After navigating to the task, answer_inputs should be populated.
+        assert_eq!(app.tab1_state.answer_inputs.len(), 1);
+        assert!(app.tab1_state.focused_answer.is_none());
+
+        let event = key_event(KeyCode::Char('a'), KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+
+        assert!(result.is_none());
+        assert_eq!(app.tab1_state.focused_answer, Some(0));
     }
 }

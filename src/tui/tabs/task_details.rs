@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use tui_textarea::TextArea;
 
-use crate::tasks::Task;
+use crate::tasks::{Task, TaskId};
 
 /// UI state for Tab 1 (Task Details).
 pub struct Tab1State {
@@ -22,6 +22,8 @@ pub struct Tab1State {
     pub focused_answer: Option<usize>,
     /// Whether the supplemental prompt input has keyboard focus.
     pub prompt_focused: bool,
+    /// The ID of the task currently displayed, used to detect task changes.
+    pub current_task_id: Option<TaskId>,
 }
 
 impl Tab1State {
@@ -38,13 +40,13 @@ impl Tab1State {
             answer_inputs: Vec::new(),
             focused_answer: None,
             prompt_focused: false,
+            current_task_id: None,
         }
     }
 
     /// Rebuilds `answer_inputs` to match the number of unanswered questions in `task`.
     ///
     /// Preserves existing textareas up to the new count; appends new empty ones as needed.
-    #[allow(dead_code)]
     pub fn sync_answer_inputs(&mut self, task: &Task) {
         let unanswered_count = task.questions.iter().filter(|q| q.answer.is_none()).count();
         self.answer_inputs.truncate(unanswered_count);
@@ -59,6 +61,27 @@ impl Tab1State {
                 self.focused_answer = None;
             }
         }
+    }
+
+    /// Resets all per-task UI state and rebuilds answer inputs for `task`.
+    ///
+    /// Clears prompt text, removes focus, rebuilds answer textareas, and
+    /// records `task.id` as the current task so subsequent navigations can
+    /// detect when the task changes.
+    pub fn reset_for_task(&mut self, task: &Task) {
+        self.prompt_input = {
+            let mut ta = TextArea::default();
+            ta.set_block(
+                Block::default()
+                    .title("Supplemental Prompt")
+                    .borders(Borders::ALL),
+            );
+            ta
+        };
+        self.prompt_focused = false;
+        self.focused_answer = None;
+        self.sync_answer_inputs(task);
+        self.current_task_id = Some(task.id.clone());
     }
 }
 
@@ -95,14 +118,14 @@ pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1St
         .collect();
 
     // Each unanswered question gets ~5 rows (label + textarea), answered ~3 rows.
-    let questions_height = (answered.len() * 3 + unanswered.len() * 5).max(0) as u16;
+    let questions_height = (answered.len() * 3 + unanswered.len() * 5) as u16;
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),                       // metadata
-            Constraint::Min(4),                          // description
-            Constraint::Length(5),                       // supplemental prompt
+            Constraint::Length(6), // metadata (4 lines + 2 border rows)
+            Constraint::Min(4),    // description
+            Constraint::Length(5), // supplemental prompt
             Constraint::Length(questions_height.max(1)), // questions (at least 1 row)
         ])
         .split(area);
@@ -111,7 +134,7 @@ pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1St
     let assigned_str = task
         .assigned_to
         .as_ref()
-        .map(|a| format!("{a:?}"))
+        .map(|a| a.display_name().to_string())
         .unwrap_or_else(|| "None".to_string());
 
     let meta_lines = vec![
@@ -178,7 +201,7 @@ pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1St
             break;
         }
         let answer_text = q.answer.as_deref().unwrap_or("");
-        let agent_label = format!("Q ({:?}): ", q.agent);
+        let agent_label = format!("Q ({}): ", q.agent.display_name());
         let lines = vec![
             Line::from(vec![
                 Span::styled(agent_label, Style::default().add_modifier(Modifier::BOLD)),
@@ -198,7 +221,7 @@ pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1St
         if row_idx >= q_rows.len() {
             break;
         }
-        let label = format!("Q ({:?}): {}", q.agent, q.text);
+        let label = format!("Q ({}): {}", q.agent.display_name(), q.text);
         let area = q_rows[row_idx];
 
         // Split into label row (1) + textarea (4).
@@ -253,6 +276,43 @@ mod tests {
         assert!(state.answer_inputs.is_empty());
         assert!(state.focused_answer.is_none());
         assert!(!state.prompt_focused);
+        assert!(state.current_task_id.is_none());
+    }
+
+    #[test]
+    fn test_tab1_state_reset_for_task() {
+        use crate::tasks::models::{Question, TaskStatus};
+        use crate::workflow::agents::AgentKind;
+
+        let mut state = Tab1State::new();
+        // Set some pre-existing state that should be cleared.
+        state.prompt_focused = true;
+        state.focused_answer = Some(0);
+
+        let mut task = make_task("desc");
+        task.questions.push(Question {
+            agent: AgentKind::Intake,
+            text: "What is the scope?".to_string(),
+            answer: None,
+        });
+        task.questions.push(Question {
+            agent: AgentKind::Design,
+            text: "Answered already?".to_string(),
+            answer: Some("Yes".to_string()),
+        });
+
+        state.reset_for_task(&task);
+
+        // prompt cleared.
+        assert!(!state.prompt_focused);
+        // focus cleared.
+        assert!(state.focused_answer.is_none());
+        // One unanswered question -> one answer textarea.
+        assert_eq!(state.answer_inputs.len(), 1);
+        // current_task_id set to the task's id.
+        assert_eq!(state.current_task_id, Some(task.id.clone()));
+        // Status field is not relevant to this test.
+        let _ = TaskStatus::Open;
     }
 
     #[test]
