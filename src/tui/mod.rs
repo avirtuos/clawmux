@@ -23,8 +23,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let header = Paragraph::new("ClawdMux v0.1.0").block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, areas.header);
 
-    let stories = app.task_store.stories();
-    task_list::render(frame, areas.left_pane, &app.task_list_state, &stories);
+    task_list::render(
+        frame,
+        areas.left_pane,
+        &app.task_list_state,
+        &app.cached_stories,
+    );
 
     let right_pane = Block::default().title("Details").borders(Borders::ALL);
     frame.render_widget(right_pane, areas.right_pane);
@@ -35,9 +39,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 /// Converts a crossterm event into an optional [`AppMessage`], mutating `app` for navigation.
 ///
-/// - `Up` / `k` -> move task list selection up, sync `app.selected_task`
-/// - `Down` / `j` -> move task list selection down, sync `app.selected_task`
-/// - `Enter` / `Space` -> toggle story expansion or select task, sync `app.selected_task`
+/// - `Up` / `k` -> move task list selection up
+/// - `Down` / `j` -> move task list selection down
+/// - `Enter` / `Space` -> toggle story expansion (no-op if a task is selected)
 /// - `Tab` -> cycle `app.active_tab` (0-3)
 /// - `q` (no modifiers) -> [`AppMessage::Shutdown`]
 /// - `Ctrl-C` -> [`AppMessage::Shutdown`]
@@ -53,20 +57,14 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.task_list_state.move_up();
-                app.selected_task = app.task_list_state.selected_task_id().cloned();
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 app.task_list_state.move_down();
-                app.selected_task = app.task_list_state.selected_task_id().cloned();
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                if app.task_list_state.selected_task_id().is_some() {
-                    app.selected_task = app.task_list_state.selected_task_id().cloned();
-                } else {
-                    app.task_list_state.toggle_story();
-                    let stories = app.task_store.stories();
-                    app.task_list_state.refresh(&stories);
-                    app.selected_task = app.task_list_state.selected_task_id().cloned();
+                if app.task_list_state.selected_task_id().is_none() {
+                    let stories = app.cached_stories.clone();
+                    app.task_list_state.toggle_story(&stories);
                 }
             }
             KeyCode::Tab => {
@@ -159,7 +157,7 @@ mod tests {
         handle_input(event, &mut app);
         assert_eq!(app.task_list_state.selected_index, 0);
         // Now on a story — selected_task should be None.
-        assert!(app.selected_task.is_none());
+        assert!(app.selected_task().is_none());
     }
 
     #[test]
@@ -195,63 +193,38 @@ mod tests {
         assert_eq!(app.task_list_state.selected_index, 1);
         // Now on a task.
         assert_eq!(
-            app.selected_task,
-            Some(crate::tasks::TaskId::from_path("tasks/1.1.md"))
+            app.selected_task(),
+            Some(&crate::tasks::TaskId::from_path("tasks/1.1.md"))
         );
     }
 
     #[test]
     fn test_handle_input_enter_toggles_story() {
         let mut app = App::new(crate::tasks::TaskStore::new());
-        // task_store is empty; task_list_state has no items yet.
-        // Manually build state with a collapsed story at index 0.
-        let stories = vec![crate::tasks::Story {
-            name: "1. Alpha".to_string(),
-            tasks: vec![crate::tasks::models::Task {
-                id: crate::tasks::TaskId::from_path("tasks/1.1.md"),
-                story_name: "1. Alpha".to_string(),
-                name: "1.1".to_string(),
-                status: crate::tasks::TaskStatus::Open,
-                assigned_to: None,
-                description: String::new(),
-                starting_prompt: None,
-                questions: Vec::new(),
-                design: None,
-                implementation_plan: None,
-                work_log: Vec::new(),
-                file_path: std::path::PathBuf::from("tasks/1.1.md"),
-                extra_sections: Vec::new(),
-            }],
-        }];
-        // Insert the task into the store so task_store.stories() returns it.
-        app.task_store.insert(
-            app.task_store
-                .get(&crate::tasks::TaskId::from_path("tasks/1.1.md"))
-                .cloned()
-                .unwrap_or(crate::tasks::models::Task {
-                    id: crate::tasks::TaskId::from_path("tasks/1.1.md"),
-                    story_name: "1. Alpha".to_string(),
-                    name: "1.1".to_string(),
-                    status: crate::tasks::TaskStatus::Open,
-                    assigned_to: None,
-                    description: String::new(),
-                    starting_prompt: None,
-                    questions: Vec::new(),
-                    design: None,
-                    implementation_plan: None,
-                    work_log: Vec::new(),
-                    file_path: std::path::PathBuf::from("tasks/1.1.md"),
-                    extra_sections: Vec::new(),
-                }),
-        );
-        app.task_list_state.refresh(&stories);
+        // Insert a task so the store has a story to display.
+        app.task_store.insert(crate::tasks::models::Task {
+            id: crate::tasks::TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Alpha".to_string(),
+            name: "1.1".to_string(),
+            status: crate::tasks::TaskStatus::Open,
+            assigned_to: None,
+            description: String::new(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+        });
+        // Refresh cached stories and task list from the store.
+        app.refresh_stories();
         // Before toggle: story is collapsed, selected_index = 0.
         assert!(!app.task_list_state.expanded_stories.contains("1. Alpha"));
 
         let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
         handle_input(event, &mut app);
-        // After toggling, task_store.stories() is called. Since we inserted the task,
-        // the story should be expanded in the state.
+        // After pressing Enter on story header, it should be expanded.
         assert!(app.task_list_state.expanded_stories.contains("1. Alpha"));
     }
 
