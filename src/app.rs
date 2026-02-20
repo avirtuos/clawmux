@@ -5,6 +5,7 @@
 
 use crate::messages::AppMessage;
 use crate::tasks::{TaskId, TaskStore};
+use crate::tui::task_list::TaskListState;
 
 /// Top-level application state.
 ///
@@ -20,16 +21,24 @@ pub struct App {
     pub active_tab: usize,
     /// When `true`, the event loop should exit and the TUI should shut down.
     pub should_quit: bool,
+    /// Navigation and expansion state for the left-pane task list widget.
+    pub task_list_state: TaskListState,
 }
 
 impl App {
     /// Creates a new `App` with the given task store and default UI state.
+    ///
+    /// Initializes the task list widget by loading stories from the store.
     pub fn new(task_store: TaskStore) -> Self {
+        let stories = task_store.stories();
+        let mut task_list_state = TaskListState::new();
+        task_list_state.refresh(&stories);
         App {
             task_store,
             selected_task: None,
             active_tab: 0,
             should_quit: false,
+            task_list_state,
         }
     }
 
@@ -67,6 +76,8 @@ mod tests {
         assert!(app.selected_task.is_none());
         assert_eq!(app.active_tab, 0);
         assert!(!app.should_quit);
+        assert_eq!(app.task_list_state.selected_index, 0);
+        assert!(app.task_list_state.expanded_stories.is_empty());
     }
 
     #[test]
