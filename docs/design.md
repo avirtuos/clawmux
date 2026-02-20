@@ -704,6 +704,10 @@ File discovery at startup: scan `./tasks/` then `./docs/tasks/` for `*.md` files
 - **Phase 3**: Agent workflow engine with structured output parsing, Tab 3 (team status)
 - **Phase 4**: Tab 4 (code review) with diffs from opencode API
 
+### Implementation Status
+
+- Task 4.1 (TUI Bootstrap & Event Loop): COMPLETED. `cargo run` opens a full-screen ratatui terminal with a placeholder layout (header, left/right panes, footer). Pressing `q` or `Ctrl-C` exits cleanly and restores the terminal. Logging redirected to `clawdmux.log` to avoid corrupting the TUI display. `App` struct, `tui::draw()`, `tui::handle_input()`, and `tui::layout::render_layout()` are all implemented with unit tests.
+
 ---
 
 ## Appendix: OpenCode Research (Feb 2026)
