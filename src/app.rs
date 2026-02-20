@@ -5,6 +5,7 @@
 
 use crate::messages::AppMessage;
 use crate::tasks::{Story, TaskId, TaskStore};
+use crate::tui::tabs::task_details::Tab1State;
 use crate::tui::task_list::TaskListState;
 
 /// Top-level application state.
@@ -23,6 +24,8 @@ pub struct App {
     pub should_quit: bool,
     /// Navigation and expansion state for the left-pane task list widget.
     pub task_list_state: TaskListState,
+    /// UI state for Tab 1 (Task Details): prompt input, answer inputs, focus flags.
+    pub tab1_state: Tab1State,
 }
 
 impl App {
@@ -39,6 +42,7 @@ impl App {
             active_tab: 0,
             should_quit: false,
             task_list_state,
+            tab1_state: Tab1State::new(),
         }
     }
 

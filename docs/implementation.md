@@ -831,6 +831,8 @@ Handle keyboard input in `tui/mod.rs` `handle_input`: `Up`/`k` → `move_up`, `D
 
 ### Task 4.3 — Tab 1: Task Details
 
+**Status**: COMPLETED
+
 **Objective**: Implement the right pane tab bar and Tab 1, which displays the task markdown, a supplemental prompt input field, and the Q&A section.
 
 **Files to Read**:
