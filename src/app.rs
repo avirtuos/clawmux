@@ -49,7 +49,10 @@ impl App {
                 }
             }
             AppMessage::Tick => vec![],
-            _ => vec![],
+            other => {
+                tracing::debug!(?other, "unhandled message");
+                vec![]
+            }
         }
     }
 }
