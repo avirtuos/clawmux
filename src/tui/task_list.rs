@@ -79,12 +79,12 @@ impl TaskListState {
         }
     }
 
-    /// Toggles expansion of the currently selected story.
+    /// Toggles expansion of the currently selected story and rebuilds the item list.
     ///
-    /// If the current item is a `Story`, toggles its name in `expanded_stories`.
+    /// If the current item is a `Story`, toggles its name in `expanded_stories` and
+    /// calls [`refresh`](TaskListState::refresh) with `stories` to rebuild the flat list.
     /// If the current item is a `Task`, this is a no-op.
-    /// Does NOT call `refresh()` internally — the caller must do so after toggling.
-    pub fn toggle_story(&mut self) {
+    pub fn toggle_story(&mut self, stories: &[Story]) {
         if let Some(TaskListItem::Story { name }) = self.items.get(self.selected_index) {
             let name = name.clone();
             if self.expanded_stories.contains(&name) {
@@ -93,6 +93,7 @@ impl TaskListState {
                 self.expanded_stories.insert(name);
             }
         }
+        self.refresh(stories);
     }
 
     /// Returns the `TaskId` of the currently selected task, or `None` if on a story or empty.
@@ -137,8 +138,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &TaskListState, stories: &[S
         .iter()
         .map(|item| match item {
             TaskListItem::Story { name } => {
+                let arrow = if state.expanded_stories.contains(name) {
+                    "v "
+                } else {
+                    "> "
+                };
                 let line = Line::from(vec![
-                    Span::styled("> ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(arrow, Style::default().add_modifier(Modifier::BOLD)),
                     Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
                 ]);
                 ListItem::new(line)
@@ -255,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_move_up_down_wraps() {
+    fn test_move_up_down_clamps_at_bounds() {
         let stories = make_stories();
         let mut state = TaskListState::new();
         state.expanded_stories.insert("1. Alpha".to_string());
@@ -289,22 +295,18 @@ mod tests {
         // Select the first story header (index 0 = "1. Alpha").
         state.selected_index = 0;
 
-        // Toggle once to expand.
-        state.toggle_story();
+        // Toggle once to expand — refresh is called internally.
+        state.toggle_story(&stories);
         assert!(state.expanded_stories.contains("1. Alpha"));
-
-        // Rebuild and verify tasks now visible.
-        state.refresh(&stories);
+        // Items now include tasks for Alpha.
         assert_eq!(state.items.len(), 4); // 2 headers + 2 tasks for Alpha
 
         // Toggle again to collapse.
         state.selected_index = 0;
-        state.toggle_story();
+        state.toggle_story(&stories);
         assert!(!state.expanded_stories.contains("1. Alpha"));
-
-        // Rebuild and verify collapsed.
-        state.refresh(&stories);
-        assert_eq!(state.items.len(), 2); // back to 2 headers only
+        // Items back to headers only.
+        assert_eq!(state.items.len(), 2);
     }
 
     #[test]

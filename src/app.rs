@@ -4,7 +4,7 @@
 //! the TUI layer, workflow engine, task store, and opencode client.
 
 use crate::messages::AppMessage;
-use crate::tasks::{TaskId, TaskStore};
+use crate::tasks::{Story, TaskId, TaskStore};
 use crate::tui::task_list::TaskListState;
 
 /// Top-level application state.
@@ -15,8 +15,8 @@ use crate::tui::task_list::TaskListState;
 pub struct App {
     /// In-memory store for all loaded stories and tasks.
     pub task_store: TaskStore,
-    /// The task currently selected in the left pane, if any.
-    pub selected_task: Option<TaskId>,
+    /// Cached snapshot of stories from `task_store`, rebuilt by [`App::refresh_stories`].
+    pub cached_stories: Vec<Story>,
     /// Index of the active tab in the right pane (0-based).
     pub active_tab: usize,
     /// When `true`, the event loop should exit and the TUI should shut down.
@@ -30,16 +30,34 @@ impl App {
     ///
     /// Initializes the task list widget by loading stories from the store.
     pub fn new(task_store: TaskStore) -> Self {
-        let stories = task_store.stories();
+        let cached_stories = task_store.stories();
         let mut task_list_state = TaskListState::new();
-        task_list_state.refresh(&stories);
+        task_list_state.refresh(&cached_stories);
         App {
             task_store,
-            selected_task: None,
+            cached_stories,
             active_tab: 0,
             should_quit: false,
             task_list_state,
         }
+    }
+
+    /// Refreshes [`cached_stories`](App::cached_stories) from the task store and rebuilds
+    /// the task list widget state.
+    ///
+    /// Call this after any mutation to `task_store` to keep the TUI in sync.
+    #[allow(dead_code)]
+    pub fn refresh_stories(&mut self) {
+        self.cached_stories = self.task_store.stories();
+        self.task_list_state.refresh(&self.cached_stories);
+    }
+
+    /// Returns the [`TaskId`] of the currently selected task, or `None` if on a story.
+    ///
+    /// Derived from [`TaskListState::selected_task_id`].
+    #[allow(dead_code)]
+    pub fn selected_task(&self) -> Option<&TaskId> {
+        self.task_list_state.selected_task_id()
     }
 
     /// Processes a single [`AppMessage`], mutating state and returning
@@ -73,7 +91,7 @@ mod tests {
     #[test]
     fn test_app_new() {
         let app = App::new(TaskStore::new());
-        assert!(app.selected_task.is_none());
+        assert!(app.selected_task().is_none());
         assert_eq!(app.active_tab, 0);
         assert!(!app.should_quit);
         assert_eq!(app.task_list_state.selected_index, 0);
@@ -94,7 +112,7 @@ mod tests {
         let responses = app.handle_message(AppMessage::Tick);
         assert!(!app.should_quit);
         assert_eq!(app.active_tab, 0);
-        assert!(app.selected_task.is_none());
+        assert!(app.selected_task().is_none());
         assert!(responses.is_empty());
     }
 }
