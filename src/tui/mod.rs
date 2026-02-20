@@ -6,6 +6,7 @@
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
+use tui_textarea::Input;
 
 use crate::app::App;
 use crate::messages::AppMessage;
@@ -30,8 +31,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         &app.cached_stories,
     );
 
-    let right_pane = Block::default().title("Details").borders(Borders::ALL);
-    frame.render_widget(right_pane, areas.right_pane);
+    tabs::render(frame, areas.right_pane, app);
 
     let footer = Paragraph::new("Mode: Normal").block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, areas.footer);
@@ -48,6 +48,31 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// - Any other key -> `None`
 pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
     if let Event::Key(key) = event {
+        // When Tab 1 is active and a textarea has focus, forward input to it.
+        if app.active_tab == 0 {
+            if app.tab1_state.prompt_focused {
+                if key.code == KeyCode::Esc {
+                    app.tab1_state.prompt_focused = false;
+                } else {
+                    app.tab1_state.prompt_input.input(Input::from(key));
+                }
+                return None;
+            }
+            if let Some(idx) = app.tab1_state.focused_answer {
+                if key.code == KeyCode::Esc {
+                    app.tab1_state.focused_answer = None;
+                } else if let Some(ta) = app.tab1_state.answer_inputs.get_mut(idx) {
+                    ta.input(Input::from(key));
+                }
+                return None;
+            }
+            // Enter focus on the supplemental prompt with 'i'.
+            if key.code == KeyCode::Char('i') && key.modifiers == KeyModifiers::NONE {
+                app.tab1_state.prompt_focused = true;
+                return None;
+            }
+        }
+
         match key.code {
             KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => {
                 return Some(AppMessage::Shutdown);
