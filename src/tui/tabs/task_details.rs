@@ -177,9 +177,9 @@ pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1St
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(6), // metadata (4 lines + 2 border rows)
-            Constraint::Min(4),    // description
+            Constraint::Min(2),    // description (scrollable via PgUp/PgDn)
             Constraint::Length(5), // supplemental prompt
-            Constraint::Length(questions_height.max(1)), // questions (at least 1 row)
+            Constraint::Length(questions_height.max(3)), // questions (at least 3 rows for border)
         ])
         .split(area);
 
@@ -422,6 +422,33 @@ mod tests {
         assert!(
             content.contains("Select a task from the list"),
             "Buffer should contain placeholder text, got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn test_task_details_questions_section_visible_24_rows() {
+        // In a 24-row terminal the questions section must be allocated at least 3 rows
+        // (enough for a bordered block) even when the task has no questions.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let task = make_task("desc");
+        let state = Tab1State::new();
+
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), Some(&task), &state);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect();
+        assert!(
+            content.contains("Questions") || content.contains("No questions"),
+            "Questions section should be visible in a 24-row terminal, got: {content:?}"
         );
     }
 
