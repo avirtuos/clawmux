@@ -24,6 +24,8 @@ pub struct Tab1State {
     pub prompt_focused: bool,
     /// The ID of the task currently displayed, used to detect task changes.
     pub current_task_id: Option<TaskId>,
+    /// Vertical scroll offset for the description paragraph.
+    pub desc_scroll: u16,
 }
 
 impl Tab1State {
@@ -41,6 +43,7 @@ impl Tab1State {
             focused_answer: None,
             prompt_focused: false,
             current_task_id: None,
+            desc_scroll: 0,
         }
     }
 
@@ -80,8 +83,58 @@ impl Tab1State {
         };
         self.prompt_focused = false;
         self.focused_answer = None;
+        self.desc_scroll = 0;
         self.sync_answer_inputs(task);
         self.current_task_id = Some(task.id.clone());
+    }
+
+    /// Scrolls the description up by one line (clamped at 0).
+    pub fn scroll_desc_up(&mut self) {
+        self.desc_scroll = self.desc_scroll.saturating_sub(1);
+    }
+
+    /// Scrolls the description down by one line.
+    pub fn scroll_desc_down(&mut self) {
+        self.desc_scroll = self.desc_scroll.saturating_add(1);
+    }
+
+    /// Returns a [`Block`] with a yellow border for focused widgets.
+    fn focused_block(title: &'static str) -> Block<'static> {
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+    }
+
+    /// Returns a [`Block`] with the default border style for unfocused widgets.
+    fn unfocused_block(title: &'static str) -> Block<'static> {
+        Block::default().title(title).borders(Borders::ALL)
+    }
+
+    /// Sets the supplemental prompt textarea to the focused (yellow border) style.
+    pub fn set_prompt_focused_style(&mut self) {
+        self.prompt_input
+            .set_block(Self::focused_block("Supplemental Prompt"));
+    }
+
+    /// Sets the supplemental prompt textarea to the unfocused (default border) style.
+    pub fn set_prompt_unfocused_style(&mut self) {
+        self.prompt_input
+            .set_block(Self::unfocused_block("Supplemental Prompt"));
+    }
+
+    /// Sets the answer textarea at `idx` to the focused (yellow border) style.
+    pub fn set_answer_focused_style(&mut self, idx: usize) {
+        if let Some(ta) = self.answer_inputs.get_mut(idx) {
+            ta.set_block(Self::focused_block("Your Answer"));
+        }
+    }
+
+    /// Sets the answer textarea at `idx` to the unfocused (default border) style.
+    pub fn set_answer_unfocused_style(&mut self, idx: usize) {
+        if let Some(ta) = self.answer_inputs.get_mut(idx) {
+            ta.set_block(Self::unfocused_block("Your Answer"));
+        }
     }
 }
 
@@ -162,7 +215,8 @@ pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1St
     // --- Description ---
     let desc_para = Paragraph::new(task.description.clone())
         .block(Block::default().title("Description").borders(Borders::ALL))
-        .wrap(ratatui::widgets::Wrap { trim: false });
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .scroll((state.desc_scroll, 0));
     frame.render_widget(desc_para, sections[1]);
 
     // --- Supplemental Prompt ---
@@ -277,6 +331,38 @@ mod tests {
         assert!(state.focused_answer.is_none());
         assert!(!state.prompt_focused);
         assert!(state.current_task_id.is_none());
+        assert_eq!(state.desc_scroll, 0);
+    }
+
+    #[test]
+    fn test_tab1_state_desc_scroll_initial() {
+        let state = Tab1State::new();
+        assert_eq!(state.desc_scroll, 0);
+    }
+
+    #[test]
+    fn test_tab1_state_desc_scroll_down() {
+        let mut state = Tab1State::new();
+        state.scroll_desc_down();
+        assert_eq!(state.desc_scroll, 1);
+    }
+
+    #[test]
+    fn test_tab1_state_desc_scroll_up_clamps_at_zero() {
+        let mut state = Tab1State::new();
+        state.scroll_desc_up();
+        assert_eq!(state.desc_scroll, 0);
+    }
+
+    #[test]
+    fn test_tab1_state_reset_clears_desc_scroll() {
+        let mut state = Tab1State::new();
+        state.scroll_desc_down();
+        state.scroll_desc_down();
+        assert_eq!(state.desc_scroll, 2);
+        let task = make_task("desc");
+        state.reset_for_task(&task);
+        assert_eq!(state.desc_scroll, 0);
     }
 
     #[test]
