@@ -1,12 +1,25 @@
 //! Rust types mirroring the opencode OpenAPI schema.
 //!
 //! Covers sessions, messages, message parts, SSE events, and file diffs.
+//!
+//! **Note on serialization conventions**: `rename_all = "camelCase"` is applied uniformly
+//! throughout this module as it is typical for JS-origin APIs. This convention was inferred
+//! from the API's JavaScript origin and has not been confirmed against an OpenAPI spec.
+//! Validate field and variant names against the actual spec before the HTTP client is wired up.
+//!
+//! **Important serde behavior**: `rename_all = "camelCase"` on an enum renames variant
+//! *discriminator* values (e.g. `SessionCreated` -> `"sessionCreated"`) but does **not**
+//! rename fields *within* struct variants. Fields in struct variants (e.g. `session_id`)
+//! remain in Rust snake_case in JSON unless individually annotated with `#[serde(rename)]`.
+//! If the API uses camelCase for these fields, explicit rename attributes will be needed.
 
 use serde::{Deserialize, Serialize};
 
 /// A part of an opencode agent message.
 ///
 /// Agents can produce text, tool calls, reasoning traces, and file content.
+/// Unknown part types received from the server are silently ignored via the
+/// [`MessagePart::Unknown`] catch-all variant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum MessagePart {
@@ -22,6 +35,9 @@ pub enum MessagePart {
     Reasoning { text: String },
     /// A file path and its content.
     File { path: String, content: String },
+    /// An unrecognized message part type; ignored gracefully for forward compatibility.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The modification status of a file in a session diff.
@@ -120,6 +136,9 @@ pub struct OpenCodeMessage {
 }
 
 /// An SSE event emitted by the opencode server during a session.
+///
+/// Unknown event types received from the server are silently ignored via the
+/// [`OpenCodeEvent::Unknown`] catch-all variant.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -149,9 +168,16 @@ pub enum OpenCodeEvent {
     SessionCompleted { session_id: String },
     /// A session encountered an error.
     SessionError { session_id: String, error: String },
+    /// An unrecognized event type; ignored gracefully for forward compatibility.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A single content part in a user request message.
+///
+/// Modelled as an enum rather than a plain struct to accommodate future API variants
+/// (e.g. `Image`, `File`) without a breaking type change, matching the pattern used
+/// by [`MessagePart`].
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -192,18 +218,143 @@ pub struct HealthResponse {
 mod tests {
     use super::*;
 
+    // --- MessagePart ---
+
     #[test]
-    fn test_message_part_text_serde() {
-        let part = MessagePart::Text {
-            text: "hello world".to_string(),
-        };
-        let json = serde_json::to_string(&part).expect("serialize");
-        let round_tripped: MessagePart = serde_json::from_str(&json).expect("deserialize");
-        match round_tripped {
-            MessagePart::Text { text } => assert_eq!(text, "hello world"),
-            other => panic!("unexpected variant: {:?}", other),
-        }
+    fn test_message_part_text_deserialize() {
+        // JSON matching the expected API wire format: tag "text", field "text".
+        let json = r#"{"type":"text","text":"hello"}"#;
+        let part: MessagePart = serde_json::from_str(json).expect("deserialize");
+        assert!(
+            matches!(part, MessagePart::Text { ref text } if text == "hello"),
+            "unexpected variant: {part:?}"
+        );
     }
+
+    #[test]
+    fn test_message_part_unknown_variant() {
+        // An unrecognized type tag should produce Unknown rather than an error.
+        let json = r#"{"type":"image","url":"https://example.com/img.png"}"#;
+        let part: MessagePart = serde_json::from_str(json).expect("deserialize");
+        assert!(
+            matches!(part, MessagePart::Unknown),
+            "expected Unknown, got: {part:?}"
+        );
+    }
+
+    // --- DiffStatus ---
+
+    #[test]
+    fn test_file_diff_status_deserialize() {
+        // Verify the camelCase rename produces lowercase single-word variants.
+        let added: DiffStatus = serde_json::from_str(r#""added""#).expect("deserialize");
+        assert_eq!(added, DiffStatus::Added);
+        let modified: DiffStatus = serde_json::from_str(r#""modified""#).expect("deserialize");
+        assert_eq!(modified, DiffStatus::Modified);
+        let deleted: DiffStatus = serde_json::from_str(r#""deleted""#).expect("deserialize");
+        assert_eq!(deleted, DiffStatus::Deleted);
+    }
+
+    // --- OpenCodeEvent ---
+
+    #[test]
+    fn test_opencode_event_session_created_deserialize() {
+        // The tag value is camelCase ("sessionCreated") because rename_all on the enum
+        // renames variant discriminators. However, rename_all does NOT rename fields within
+        // struct variants, so the field key remains snake_case ("session_id").
+        // NOTE: If the real opencode API sends "sessionId" (camelCase) for this field,
+        // explicit #[serde(rename = "sessionId")] attributes will be needed on each field.
+        let json = r#"{"type":"sessionCreated","session_id":"s1"}"#;
+        let event: OpenCodeEvent = serde_json::from_str(json).expect("deserialize");
+        assert!(
+            matches!(event, OpenCodeEvent::SessionCreated { ref session_id } if session_id == "s1"),
+            "unexpected variant: {event:?}"
+        );
+    }
+
+    #[test]
+    fn test_opencode_event_unknown_variant() {
+        // An unrecognized event type should produce Unknown rather than an error.
+        let json = r#"{"type":"sessionPaused","sessionId":"s1"}"#;
+        let event: OpenCodeEvent = serde_json::from_str(json).expect("deserialize");
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "expected Unknown, got: {event:?}"
+        );
+    }
+
+    // --- OpenCodeMessage ---
+
+    #[test]
+    fn test_opencode_message_deserialize() {
+        // Verifies nested MessagePart deserialization and the "user" role discriminator.
+        let json = r#"{"id":"m1","role":"user","parts":[{"type":"text","text":"hi"}]}"#;
+        let msg: OpenCodeMessage = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(msg.id, "m1");
+        assert_eq!(msg.role, MessageRole::User);
+        assert_eq!(msg.parts.len(), 1);
+        assert!(
+            matches!(msg.parts[0], MessagePart::Text { ref text } if text == "hi"),
+            "unexpected part: {:?}",
+            msg.parts[0]
+        );
+    }
+
+    // --- SendMessageRequest ---
+
+    #[test]
+    fn test_send_message_request_agent_omitted() {
+        // When agent is None the "agent" key must be absent from the serialized JSON.
+        let req = SendMessageRequest {
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+            agent: None,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(
+            !json.contains("\"agent\""),
+            "\"agent\" key should be absent when None, got: {json}"
+        );
+        assert!(
+            json.contains("\"content\""),
+            "\"content\" key should be present, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_send_message_request_agent_present() {
+        // When agent is Some the "agent" key must appear in the serialized JSON.
+        let req = SendMessageRequest {
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+            agent: Some("claude".to_string()),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(
+            json.contains("\"agent\""),
+            "\"agent\" key should be present when Some, got: {json}"
+        );
+        assert!(
+            json.contains("\"claude\""),
+            "agent value should be present, got: {json}"
+        );
+    }
+
+    // --- ContentPart ---
+
+    #[test]
+    fn test_content_part_text_deserialize() {
+        let json = r#"{"type":"text","text":"hello"}"#;
+        let part: ContentPart = serde_json::from_str(json).expect("deserialize");
+        assert!(
+            matches!(part, ContentPart::Text { ref text } if text == "hello"),
+            "unexpected variant: {part:?}"
+        );
+    }
+
+    // --- Health / CreateSession (existing literal-JSON tests) ---
 
     #[test]
     fn test_create_session_response_deserialize() {
@@ -218,27 +369,5 @@ mod tests {
         let resp: HealthResponse = serde_json::from_str(json).expect("deserialize");
         assert!(resp.ok);
         assert_eq!(resp.version, "1.0");
-    }
-
-    #[test]
-    fn test_file_diff_status_serde() {
-        for status in [DiffStatus::Added, DiffStatus::Modified, DiffStatus::Deleted] {
-            let json = serde_json::to_string(&status).expect("serialize");
-            let round_tripped: DiffStatus = serde_json::from_str(&json).expect("deserialize");
-            assert_eq!(round_tripped, status);
-        }
-    }
-
-    #[test]
-    fn test_opencode_event_serde() {
-        let event = OpenCodeEvent::SessionCreated {
-            session_id: "s1".to_string(),
-        };
-        let json = serde_json::to_string(&event).expect("serialize");
-        let round_tripped: OpenCodeEvent = serde_json::from_str(&json).expect("deserialize");
-        match round_tripped {
-            OpenCodeEvent::SessionCreated { session_id } => assert_eq!(session_id, "s1"),
-            other => panic!("unexpected variant: {:?}", other),
-        }
     }
 }
