@@ -905,6 +905,8 @@ When no task is selected, render a centered `"Select a task from the list"` plac
 
 ### Task 5.1 — OpenCode API Types
 
+**Status**: COMPLETED
+
 **Objective**: Implement all Rust types in `src/opencode/types.rs` that mirror the opencode OpenAPI schema, plus `FileDiff` types used by the code review flow.
 
 **Files to Read**:
@@ -965,6 +967,8 @@ All types: derive `Debug`, `Clone`. Serialization types derive `serde::Serialize
 ---
 
 ### Task 5.2 — HTTP Client
+
+**Status**: COMPLETED
 
 **Objective**: Implement `OpenCodeClient` in `src/opencode/mod.rs` and `src/opencode/session.rs` with all methods for session management and prompt sending.
 
