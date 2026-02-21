@@ -41,6 +41,27 @@ fn sync_tab1_on_nav(app: &mut App) {
     }
 }
 
+/// Returns a context-sensitive keybinding hint string for the footer.
+///
+/// - When a textarea is focused: shows Esc / editing hint.
+/// - On Tab 1 with no focus: shows all available bindings.
+/// - On other tabs: shows minimal bindings.
+pub fn footer_hint_text(
+    active_tab: usize,
+    prompt_focused: bool,
+    focused_answer: Option<usize>,
+) -> &'static str {
+    if prompt_focused {
+        "[Esc] exit | Editing prompt"
+    } else if focused_answer.is_some() {
+        "[Esc] exit | [Tab] next answer | Editing answer"
+    } else if active_tab == 0 {
+        "[i] prompt | [a] answer | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
+    } else {
+        "[Tab] next tab | [q] quit"
+    }
+}
+
 /// Draws the full TUI frame with layout and task list widget.
 ///
 /// Renders header, left pane (task list), right pane, and footer using the computed layout regions.
@@ -59,7 +80,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     tabs::render(frame, areas.right_pane, app);
 
-    let footer = Paragraph::new("Mode: Normal").block(Block::default().borders(Borders::TOP));
+    let hint = footer_hint_text(
+        app.active_tab,
+        app.tab1_state.prompt_focused,
+        app.tab1_state.focused_answer,
+    );
+    let footer = Paragraph::new(hint).block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, areas.footer);
 }
 
@@ -79,6 +105,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             if app.tab1_state.prompt_focused {
                 if key.code == KeyCode::Esc {
                     app.tab1_state.prompt_focused = false;
+                    app.tab1_state.set_prompt_unfocused_style();
                 } else {
                     app.tab1_state.prompt_input.input(Input::from(key));
                 }
@@ -86,11 +113,15 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             }
             if let Some(idx) = app.tab1_state.focused_answer {
                 if key.code == KeyCode::Esc {
+                    app.tab1_state.set_answer_unfocused_style(idx);
                     app.tab1_state.focused_answer = None;
                 } else if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
                     let len = app.tab1_state.answer_inputs.len();
                     if len > 0 {
-                        app.tab1_state.focused_answer = Some((idx + 1) % len);
+                        let new_idx = (idx + 1) % len;
+                        app.tab1_state.set_answer_unfocused_style(idx);
+                        app.tab1_state.focused_answer = Some(new_idx);
+                        app.tab1_state.set_answer_focused_style(new_idx);
                     }
                 } else if let Some(ta) = app.tab1_state.answer_inputs.get_mut(idx) {
                     ta.input(Input::from(key));
@@ -100,7 +131,20 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             // Enter focus on the supplemental prompt with 'i'.
             if key.code == KeyCode::Char('i') && key.modifiers == KeyModifiers::NONE {
                 app.tab1_state.prompt_focused = true;
+                app.tab1_state.set_prompt_focused_style();
                 return None;
+            }
+            // Scroll the description paragraph with PgUp/PgDn (no textarea focused).
+            match key.code {
+                KeyCode::PageUp => {
+                    app.tab1_state.scroll_desc_up();
+                    return None;
+                }
+                KeyCode::PageDown => {
+                    app.tab1_state.scroll_desc_down();
+                    return None;
+                }
+                _ => {}
             }
         }
 
@@ -113,6 +157,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             && !app.tab1_state.answer_inputs.is_empty()
         {
             app.tab1_state.focused_answer = Some(0);
+            app.tab1_state.set_answer_focused_style(0);
             return None;
         }
 
@@ -381,5 +426,76 @@ mod tests {
 
         assert!(result.is_none());
         assert_eq!(app.tab1_state.focused_answer, Some(0));
+    }
+
+    #[test]
+    fn test_handle_input_pgdn_scrolls_description() {
+        let mut app = App::new(crate::tasks::TaskStore::new());
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.tab1_state.desc_scroll, 0);
+
+        let event = key_event(KeyCode::PageDown, KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+
+        assert!(result.is_none());
+        assert_eq!(app.tab1_state.desc_scroll, 1);
+    }
+
+    #[test]
+    fn test_handle_input_pgup_scrolls_description() {
+        let mut app = App::new(crate::tasks::TaskStore::new());
+        app.tab1_state.desc_scroll = 2;
+
+        let event = key_event(KeyCode::PageUp, KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+
+        assert!(result.is_none());
+        assert_eq!(app.tab1_state.desc_scroll, 1);
+    }
+
+    #[test]
+    fn test_handle_input_pgdn_no_scroll_when_prompt_focused() {
+        let mut app = App::new(crate::tasks::TaskStore::new());
+        app.tab1_state.prompt_focused = true;
+
+        let event = key_event(KeyCode::PageDown, KeyModifiers::NONE);
+        handle_input(event, &mut app);
+
+        // PgDn was forwarded to the textarea, not the scroll handler.
+        assert_eq!(app.tab1_state.desc_scroll, 0);
+    }
+
+    #[test]
+    fn test_handle_input_pgdn_no_scroll_on_other_tab() {
+        let mut app = App::new(crate::tasks::TaskStore::new());
+        app.active_tab = 1;
+
+        let event = key_event(KeyCode::PageDown, KeyModifiers::NONE);
+        handle_input(event, &mut app);
+
+        assert_eq!(app.tab1_state.desc_scroll, 0);
+    }
+
+    #[test]
+    fn test_footer_hints_normal_tab1() {
+        let text = footer_hint_text(0, false, None);
+        assert!(text.contains("[i] prompt"), "got: {text}");
+        assert!(text.contains("[a] answer"), "got: {text}");
+        assert!(text.contains("PgUp/PgDn"), "got: {text}");
+    }
+
+    #[test]
+    fn test_footer_hints_prompt_focused() {
+        let text = footer_hint_text(0, true, None);
+        assert!(text.contains("[Esc]"), "got: {text}");
+        assert!(text.contains("Editing prompt"), "got: {text}");
+    }
+
+    #[test]
+    fn test_footer_hints_other_tab() {
+        let text = footer_hint_text(1, false, None);
+        assert!(text.contains("[Tab] next tab"), "got: {text}");
+        assert!(text.contains("[q] quit"), "got: {text}");
+        assert!(!text.contains("[i]"), "got: {text}");
     }
 }
