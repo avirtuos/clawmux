@@ -234,6 +234,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "futures-util",
+ "libc",
  "mockito",
  "notify",
  "ratatui",
