@@ -18,7 +18,9 @@ use futures_util::StreamExt;
 use tokio::time::MissedTickBehavior;
 
 use crate::app::App;
+use crate::config::AppConfig;
 use crate::messages::AppMessage;
+use crate::opencode::server::OpenCodeServer;
 use crate::tasks::TaskStore;
 
 /// ClawdMux: GenAI coding assistance multiplexer and task orchestrator.
@@ -89,6 +91,10 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => tracing::warn!("Could not load tasks from disk: {}", e),
     }
 
+    let config = AppConfig::load(&project_root)?;
+    let mut server = OpenCodeServer::ensure_running(&config).await?;
+    tracing::info!("OpenCode server at {}", server.base_url());
+
     let mut app = App::new(task_store);
 
     // Install a panic hook that restores the terminal before printing.
@@ -135,6 +141,11 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     ratatui::restore();
+
+    if let Err(e) = server.shutdown().await {
+        tracing::warn!("OpenCode server shutdown error: {}", e);
+    }
+
     Ok(())
 }
 

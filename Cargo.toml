@@ -59,6 +59,9 @@ rpassword = "7"
 # Platform directories
 dirs = "5"
 
+# Unix process signalling (SIGTERM for graceful shutdown)
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 mockito = "1"
