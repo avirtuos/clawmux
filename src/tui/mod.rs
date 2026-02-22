@@ -4,6 +4,8 @@
 //! 4-tab right pane. Dispatches keyboard events to the focused widget.
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
+use ratatui::layout::Rect;
+use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use tui_textarea::Input;
@@ -14,6 +16,22 @@ use crate::messages::AppMessage;
 pub mod layout;
 pub mod tabs;
 pub mod task_list;
+
+/// Draws a full-screen loading status indicator.
+///
+/// Shows the app name centered above a status message. Used during
+/// startup before the main `App` state is available.
+pub fn draw_loading_screen(frame: &mut Frame, status: &str) {
+    let area = frame.area();
+    let text = Text::from(vec![
+        Line::from("ClawdMux v0.1.0").centered(),
+        Line::from(""),
+        Line::from(status).centered(),
+    ]);
+    let y = area.y + area.height.saturating_sub(3) / 2;
+    let content_area = Rect::new(area.x, y, area.width, 3);
+    frame.render_widget(Paragraph::new(text), content_area);
+}
 
 /// Resets Tab 1 state when the selected task changes after navigation.
 ///

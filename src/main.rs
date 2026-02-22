@@ -79,11 +79,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Runs the full-screen TUI event loop.
 ///
-/// Loads tasks from disk, initializes the ratatui terminal, installs a panic
-/// hook that restores the terminal before printing, then drives the event loop
-/// until the user quits.
+/// Initializes the terminal first so a loading screen can be displayed while
+/// the opencode server starts up. Installs a panic hook after `ratatui::init()`
+/// so it wraps ratatui's own hook. Drives the event loop until the user quits.
 async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
-    // Load tasks from the current working directory.
+    // 1. Init terminal first so we can draw a loading screen during startup.
+    let mut terminal = ratatui::init();
+
+    // 2. Install panic hook AFTER ratatui::init() so it wraps ratatui's hook.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        original_hook(info);
+    }));
+
+    // 3. Loading phase: tasks
+    terminal.draw(|f| tui::draw_loading_screen(f, "Loading tasks..."))?;
     let mut task_store = TaskStore::new();
     let project_root = std::env::current_dir()?;
     match task_store.load_from_disk(&project_root) {
@@ -91,28 +102,30 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => tracing::warn!("Could not load tasks from disk: {}", e),
     }
 
+    // 4. Loading phase: config
+    terminal.draw(|f| tui::draw_loading_screen(f, "Loading configuration..."))?;
     let config = AppConfig::load(&project_root)?;
-    let mut server = match OpenCodeServer::ensure_running(&config).await {
+
+    // 5. Loading phase: server (callback redraws loading screen on each status change)
+    let mut server = match OpenCodeServer::ensure_running(&config, |status| {
+        let _ = terminal.draw(|f| tui::draw_loading_screen(f, status));
+    })
+    .await
+    {
         Ok(s) => {
             tracing::info!("OpenCode server at {}", s.base_url());
             Some(s)
         }
         Err(e) => {
             tracing::warn!("OpenCode server unavailable, continuing without it: {}", e);
+            let _ = terminal.draw(|f| {
+                tui::draw_loading_screen(f, "OpenCode server unavailable, starting without it");
+            });
             None
         }
     };
 
     let mut app = App::new(task_store);
-
-    // Install a panic hook that restores the terminal before printing.
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        ratatui::restore();
-        original_hook(info);
-    }));
-
-    let mut terminal = ratatui::init();
     let mut event_stream = crossterm::event::EventStream::new();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(250));
     tick_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
