@@ -182,7 +182,7 @@ mod tests {
             .mock("GET", "/global/health")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"ok":true,"version":"1.0"}"#)
+            .with_body(r#"{"healthy":true,"version":"1.0"}"#)
             .create_async()
             .await;
 
@@ -199,7 +199,7 @@ mod tests {
             .mock("GET", "/global/health")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"ok":false,"version":"1.0"}"#)
+            .with_body(r#"{"healthy":false,"version":"1.0"}"#)
             .create_async()
             .await;
 
@@ -260,6 +260,25 @@ mod tests {
             .send_prompt_async("abc", &AgentKind::Implementation, "do the thing")
             .await
             .expect("should succeed");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_health_unparseable_body_returns_true() {
+        // A 200 response whose body is not valid HealthResponse JSON should still
+        // return Ok(true), since the server is clearly reachable and alive.
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/global/health")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body("ok")
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        let result = client.health().await.expect("should succeed");
+        assert!(result, "200 with non-JSON body should return Ok(true)");
         mock.assert_async().await;
     }
 
