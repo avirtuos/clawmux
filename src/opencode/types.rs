@@ -209,9 +209,10 @@ pub struct CreateSessionResponse(pub OpenCodeSession);
 #[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
     /// Whether the server is healthy.
-    pub ok: bool,
-    /// The server version string.
-    pub version: String,
+    #[serde(alias = "ok")]
+    pub healthy: bool,
+    /// The server version string, if provided by the server.
+    pub version: Option<String>,
 }
 
 #[cfg(test)]
@@ -365,9 +366,26 @@ mod tests {
 
     #[test]
     fn test_health_response_ok() {
+        let json = r#"{"healthy":true,"version":"1.0"}"#;
+        let resp: HealthResponse = serde_json::from_str(json).expect("deserialize");
+        assert!(resp.healthy);
+        assert_eq!(resp.version, Some("1.0".to_string()));
+    }
+
+    #[test]
+    fn test_health_response_ok_alias() {
+        // Older servers that send "ok" instead of "healthy" should still deserialize.
         let json = r#"{"ok":true,"version":"1.0"}"#;
         let resp: HealthResponse = serde_json::from_str(json).expect("deserialize");
-        assert!(resp.ok);
-        assert_eq!(resp.version, "1.0");
+        assert!(resp.healthy);
+    }
+
+    #[test]
+    fn test_health_response_no_version() {
+        // Servers that omit the "version" field should still deserialize cleanly.
+        let json = r#"{"healthy":true}"#;
+        let resp: HealthResponse = serde_json::from_str(json).expect("deserialize");
+        assert!(resp.healthy);
+        assert_eq!(resp.version, None);
     }
 }

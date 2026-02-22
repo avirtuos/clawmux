@@ -16,6 +16,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use tokio::time::MissedTickBehavior;
+use tracing_subscriber::EnvFilter;
 
 use crate::app::App;
 use crate::config::AppConfig;
@@ -57,7 +58,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let file_appender = tracing_appender::rolling::never(log_dir, "clawdmux.log");
-    tracing_subscriber::fmt().with_writer(file_appender).init();
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(file_appender)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
 
     let cli = Cli::parse();
 
@@ -106,24 +113,47 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     terminal.draw(|f| tui::draw_loading_screen(f, "Loading configuration..."))?;
     let config = AppConfig::load(&project_root)?;
 
-    // 5. Loading phase: server (callback redraws loading screen on each status change)
-    let mut server = match OpenCodeServer::ensure_running(&config, |status| {
-        let _ = terminal.draw(|f| tui::draw_loading_screen(f, status));
-    })
-    .await
-    {
-        Ok(s) => {
-            tracing::info!("OpenCode server at {}", s.base_url());
-            Some(s)
+    // 5. Loading phase: server (callback redraws loading screen on each status change).
+    // Use a crossterm EventStream to detect Ctrl+C in raw mode (ratatui disables
+    // the kernel ISIG flag, so tokio::signal::ctrl_c() is ineffective here).
+    let mut startup_events = crossterm::event::EventStream::new();
+    let mut server = tokio::select! {
+        result = OpenCodeServer::ensure_running(&config, |status| {
+            let _ = terminal.draw(|f| tui::draw_loading_screen(f, status));
+        }) => {
+            match result {
+                Ok(s) => {
+                    tracing::info!("OpenCode server at {}", s.base_url());
+                    Some(s)
+                }
+                Err(e) => {
+                    tracing::warn!("OpenCode server unavailable, continuing without it: {}", e);
+                    let _ = terminal.draw(|f| {
+                        tui::draw_loading_screen(f, "OpenCode server unavailable, starting without it");
+                    });
+                    None
+                }
+            }
         }
-        Err(e) => {
-            tracing::warn!("OpenCode server unavailable, continuing without it: {}", e);
-            let _ = terminal.draw(|f| {
-                tui::draw_loading_screen(f, "OpenCode server unavailable, starting without it");
-            });
-            None
+        _ = async {
+            use crossterm::event::{Event, KeyCode, KeyModifiers};
+            while let Some(Ok(event)) = startup_events.next().await {
+                if let Event::Key(key) = event {
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        return;
+                    }
+                }
+            }
+        } => {
+            tracing::info!("Ctrl+C received during startup, exiting");
+            ratatui::restore();
+            return Ok(());
         }
     };
+    // Drop startup_events so the main loop's EventStream can take over stdin.
+    drop(startup_events);
 
     let mut app = App::new(task_store);
     let mut event_stream = crossterm::event::EventStream::new();

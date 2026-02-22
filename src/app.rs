@@ -22,6 +22,8 @@ pub struct App {
     pub active_tab: usize,
     /// When `true`, the event loop should exit and the TUI should shut down.
     pub should_quit: bool,
+    /// When `true`, the quit confirmation dialog is displayed and input is intercepted.
+    pub show_quit_confirm: bool,
     /// Navigation and expansion state for the left-pane task list widget.
     pub task_list_state: TaskListState,
     /// UI state for Tab 1 (Task Details): prompt input, answer inputs, focus flags.
@@ -41,6 +43,7 @@ impl App {
             cached_stories,
             active_tab: 0,
             should_quit: false,
+            show_quit_confirm: false,
             task_list_state,
             tab1_state: Tab1State::new(),
         }
@@ -56,6 +59,11 @@ impl App {
         self.task_list_state.refresh(&self.cached_stories);
     }
 
+    /// Dismisses the quit confirmation dialog without quitting.
+    pub fn dismiss_quit_confirm(&mut self) {
+        self.show_quit_confirm = false;
+    }
+
     /// Returns the [`TaskId`] of the currently selected task, or `None` if on a story.
     ///
     /// Derived from [`TaskListState::selected_task_id`].
@@ -69,7 +77,11 @@ impl App {
     pub fn handle_message(&mut self, msg: AppMessage) -> Vec<AppMessage> {
         match msg {
             AppMessage::Shutdown => {
-                self.should_quit = true;
+                if self.show_quit_confirm {
+                    self.should_quit = true;
+                } else {
+                    self.show_quit_confirm = true;
+                }
                 vec![]
             }
             AppMessage::TerminalEvent(event) => {
@@ -98,6 +110,7 @@ mod tests {
         assert!(app.selected_task().is_none());
         assert_eq!(app.active_tab, 0);
         assert!(!app.should_quit);
+        assert!(!app.show_quit_confirm);
         assert_eq!(app.task_list_state.selected_index, 0);
         assert!(app.task_list_state.expanded_stories.is_empty());
     }
@@ -106,8 +119,32 @@ mod tests {
     fn test_handle_message_shutdown() {
         let mut app = App::new(TaskStore::new());
         let responses = app.handle_message(AppMessage::Shutdown);
+        // First Shutdown shows the dialog, does not quit.
+        assert!(!app.should_quit);
+        assert!(app.show_quit_confirm);
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn test_handle_message_shutdown_confirm() {
+        let mut app = App::new(TaskStore::new());
+        // First Shutdown shows dialog.
+        app.handle_message(AppMessage::Shutdown);
+        assert!(app.show_quit_confirm);
+        assert!(!app.should_quit);
+        // Second Shutdown (with dialog visible) confirms quit.
+        let responses = app.handle_message(AppMessage::Shutdown);
         assert!(app.should_quit);
         assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn test_dismiss_quit_confirm() {
+        let mut app = App::new(TaskStore::new());
+        app.show_quit_confirm = true;
+        app.dismiss_quit_confirm();
+        assert!(!app.show_quit_confirm);
+        assert!(!app.should_quit);
     }
 
     #[test]

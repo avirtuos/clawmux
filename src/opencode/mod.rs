@@ -71,6 +71,9 @@ impl OpenCodeClient {
     /// Checks the health of the opencode server.
     ///
     /// Sends `GET /global/health` and returns `true` if the server reports healthy.
+    /// A 200 response whose body cannot be parsed as [`HealthResponse`] is treated as
+    /// healthy (the server is reachable), with a warning logged. This handles servers
+    /// that return non-standard JSON bodies while still being alive.
     ///
     /// # Errors
     ///
@@ -79,7 +82,18 @@ impl OpenCodeClient {
     pub async fn health(&self) -> Result<bool> {
         let resp = self.request(Method::GET, "/global/health").send().await?;
         let resp = self.check_response(resp).await?;
-        let health: HealthResponse = resp.json().await?;
-        Ok(health.ok)
+        let body = resp.text().await?;
+        tracing::debug!("Health response body: {}", body);
+        match serde_json::from_str::<HealthResponse>(&body) {
+            Ok(health) => Ok(health.healthy),
+            Err(e) => {
+                tracing::warn!(
+                    "Could not parse health response (treating 200 as healthy): {}; body: {}",
+                    e,
+                    body
+                );
+                Ok(true)
+            }
+        }
     }
 }
