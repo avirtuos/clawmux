@@ -48,6 +48,13 @@ impl Drop for ChildGuard {
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGKILL);
             }
+            #[cfg(not(unix))]
+            {
+                //TODO: Task 5.4 - non-unix support gap: no portable SIGKILL-by-pid API.
+                // On non-unix platforms the orphaned process is logged but not killed.
+                // Consider storing the Child handle in ChildGuard instead of the raw PID.
+                let _ = pid;
+            }
         }
     }
 }
@@ -70,6 +77,14 @@ impl OpenCodeServer {
     /// Build the base URL string from hostname and port components.
     fn build_base_url(hostname: &str, port: u16) -> String {
         format!("http://{}:{}", hostname, port)
+    }
+
+    /// Build Basic Auth credentials for `OpenCodeClient::new`.
+    ///
+    /// The opencode server uses empty-username Basic Auth; only the password
+    /// matters.
+    fn build_auth(password: &str) -> Option<(String, String)> {
+        Some((String::new(), password.to_string()))
     }
 
     /// Start or verify the opencode server, returning a ready `OpenCodeServer`.
@@ -97,7 +112,8 @@ impl OpenCodeServer {
         F: FnMut(&str),
     {
         let base_url = Self::build_base_url(&config.opencode.hostname, config.opencode.port);
-        let client = OpenCodeClient::new(base_url.clone(), None);
+        let password = config.effective_opencode_password();
+        let client = OpenCodeClient::new(base_url.clone(), Self::build_auth(&password));
 
         on_status("Checking for running opencode server...");
         let already_healthy = client.health().await.unwrap_or(false);
@@ -128,7 +144,7 @@ impl OpenCodeServer {
                         "Port {} is already in use, waiting for existing server to become healthy",
                         config.opencode.port
                     );
-                    Self::wait_for_existing_server(base_url, on_status).await
+                    Self::wait_for_existing_server(base_url, &password, on_status).await
                 } else {
                     Self::spawn_and_wait(config, base_url, on_status).await
                 }
@@ -161,11 +177,15 @@ impl OpenCodeServer {
     ///
     /// Returns [`ClawdMuxError::Server`] if the server does not become healthy
     /// within 30 seconds.
-    async fn wait_for_existing_server<F>(base_url: String, mut on_status: F) -> Result<Self>
+    async fn wait_for_existing_server<F>(
+        base_url: String,
+        password: &str,
+        mut on_status: F,
+    ) -> Result<Self>
     where
         F: FnMut(&str),
     {
-        let client = OpenCodeClient::new(base_url.clone(), None);
+        let client = OpenCodeClient::new(base_url.clone(), Self::build_auth(password));
         const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
         const INITIAL_DELAY: Duration = Duration::from_millis(100);
         const MAX_DELAY: Duration = Duration::from_millis(2000);
@@ -281,6 +301,7 @@ impl OpenCodeServer {
             .map_err(|e| ClawdMuxError::Server(format!("opencode binary not found: {}", e)))?;
 
         let env_vars = config.global.env_vars_for_opencode();
+        let password = config.effective_opencode_password();
 
         let mut cmd = tokio::process::Command::new(&opencode_bin);
         cmd.arg("serve")
@@ -295,6 +316,7 @@ impl OpenCodeServer {
         for (key, val) in &env_vars {
             cmd.env(key, val);
         }
+        cmd.env("OPENCODE_SERVER_PASSWORD", &password);
 
         tracing::info!(
             "Spawning opencode: {:?} serve --port {} --hostname {}",
@@ -376,7 +398,7 @@ impl OpenCodeServer {
             })
         };
 
-        let client = OpenCodeClient::new(base_url.clone(), None);
+        let client = OpenCodeClient::new(base_url.clone(), Self::build_auth(&password));
         const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
         const INITIAL_DELAY: Duration = Duration::from_millis(100);
         const MAX_DELAY: Duration = Duration::from_millis(2000);
@@ -418,8 +440,8 @@ impl OpenCodeServer {
 
             // Detect if the child process exited before it could become healthy.
             if let Some(exit_status) = child.try_wait().map_err(ClawdMuxError::Io)? {
-                let stdout_output = Self::collected_stderr(&stdout_buf);
-                let stderr_output = Self::collected_stderr(&stderr_buf);
+                let stdout_output = Self::collected_output(&stdout_buf);
+                let stderr_output = Self::collected_output(&stderr_buf);
                 tracing::warn!("opencode server exited early with status: {}", exit_status);
                 tracing::info!("opencode stdout (captured): {:?}", stdout_output.trim());
                 tracing::info!("opencode stderr (captured): {:?}", stderr_output.trim());
@@ -479,8 +501,8 @@ impl OpenCodeServer {
             guard.disarm();
             // Give the drain tasks a moment to flush the final pipe output.
             sleep(Duration::from_millis(100)).await;
-            let stdout_output = Self::collected_stderr(&stdout_buf);
-            let stderr_output = Self::collected_stderr(&stderr_buf);
+            let stdout_output = Self::collected_output(&stdout_buf);
+            let stderr_output = Self::collected_output(&stderr_buf);
             tracing::info!("opencode stdout (captured): {:?}", stdout_output.trim());
             tracing::info!("opencode stderr (captured): {:?}", stderr_output.trim());
             Err(ClawdMuxError::Server(format!(
@@ -495,8 +517,8 @@ impl OpenCodeServer {
         }
     }
 
-    /// Read the text collected so far from a background stderr drain task.
-    fn collected_stderr(buf: &Arc<Mutex<String>>) -> String {
+    /// Read the text collected so far from a background stdout/stderr drain task.
+    fn collected_output(buf: &Arc<Mutex<String>>) -> String {
         buf.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -515,8 +537,9 @@ impl OpenCodeServer {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Io`] for any I/O error encountered while
-    /// signalling or waiting for the child process.
+    /// Shutdown is best-effort: I/O errors encountered while signalling or
+    /// waiting for the child process are logged and then discarded. This
+    /// function always returns `Ok(())`.
     pub async fn shutdown(&mut self) -> Result<()> {
         let Some(child) = self.child.as_mut() else {
             return Ok(());
@@ -563,6 +586,7 @@ mod tests {
         AppConfig {
             global: GlobalConfig {
                 provider: ProviderSection::default(),
+                opencode_password: None,
             },
             opencode: OpenCodeConfig {
                 mode,
@@ -764,6 +788,42 @@ mod tests {
             !OpenCodeServer::is_port_occupied("127.0.0.1", port).await,
             "Expected is_port_occupied to return false for a released port"
         );
+    }
+
+    #[tokio::test]
+    async fn test_auto_mode_spawn_binary_not_found() {
+        // Use a port that is not in use so ensure_running proceeds to spawn_and_wait.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+            // drops here, releasing the port
+        };
+        let config = make_config(ServerMode::Auto, port);
+
+        // Temporarily clear PATH so which::which("opencode") cannot find the binary.
+        // NOTE: this mutates a process-global variable; tests that depend on PATH
+        // must not run concurrently with this one. In practice cargo test runs each
+        // #[tokio::test] on its own thread but within the same process, so we
+        // restore PATH immediately after the call.
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", "");
+
+        let result = OpenCodeServer::ensure_running(&config, |_| {}).await;
+
+        std::env::set_var("PATH", &original_path);
+
+        assert!(
+            matches!(result, Err(ClawdMuxError::Server(_))),
+            "Expected Server error when binary not found, got: {:?}",
+            result
+        );
+        if let Err(ClawdMuxError::Server(ref msg)) = result {
+            assert!(
+                msg.contains("binary not found"),
+                "Expected 'binary not found' in error message, got: {:?}",
+                msg
+            );
+        }
     }
 
     #[tokio::test]

@@ -59,6 +59,13 @@ pub struct GlobalConfig {
     /// LLM provider section.
     #[serde(default)]
     pub provider: ProviderSection,
+    /// Optional override for the opencode server password.
+    ///
+    /// When set, takes precedence over the project-level password and the
+    /// hardcoded default. The value is injected as `OPENCODE_SERVER_PASSWORD`
+    /// into the spawned opencode process.
+    #[serde(default)]
+    pub opencode_password: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -139,6 +146,7 @@ mod tests {
                 openai: None,
                 google: None,
             },
+            opencode_password: None,
         }
     }
 
@@ -254,6 +262,7 @@ default_model = "claude-opus-4-6"
                 }),
                 google: None,
             },
+            opencode_password: None,
         };
         let vars = config.env_vars_for_opencode();
         assert_eq!(vars.len(), 2);
@@ -273,6 +282,7 @@ default_model = "claude-opus-4-6"
                     default_model: "gemini-pro".to_string(),
                 }),
             },
+            opencode_password: None,
         };
         let vars = config.env_vars_for_opencode();
         assert_eq!(vars.len(), 2);
@@ -299,8 +309,37 @@ default_model = "claude-opus-4-6"
                 openai: None,
                 google: None,
             },
+            opencode_password: None,
         };
         let vars = config.env_vars_for_opencode();
         assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn test_global_config_opencode_password() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let toml = r#"
+opencode_password = "my-global-pw"
+
+[provider]
+default = "anthropic"
+"#;
+        std::fs::write(&path, toml).unwrap();
+
+        let config = GlobalConfig::load(&path).unwrap();
+        assert_eq!(config.opencode_password.as_deref(), Some("my-global-pw"));
+
+        // Round-trip: save and reload preserves the password.
+        config.save(&path).unwrap();
+        let reloaded = GlobalConfig::load(&path).unwrap();
+        assert_eq!(reloaded.opencode_password.as_deref(), Some("my-global-pw"));
+    }
+
+    #[test]
+    fn test_global_config_opencode_password_absent() {
+        // When the field is absent, it defaults to None.
+        let config: GlobalConfig = toml::from_str("").unwrap();
+        assert!(config.opencode_password.is_none());
     }
 }

@@ -372,6 +372,7 @@ mod tests {
                 openai: None,
                 google: None,
             },
+            opencode_password: None,
         };
         config.save(path).unwrap();
     }
