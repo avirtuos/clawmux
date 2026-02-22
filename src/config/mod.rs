@@ -76,6 +76,20 @@ pub struct AppConfig {
 
 #[allow(dead_code)]
 impl AppConfig {
+    /// Resolve the effective opencode server password.
+    ///
+    /// Precedence (highest to lowest):
+    /// 1. `global.opencode_password` — set in `~/.config/clawdmux/config.toml`
+    /// 2. `opencode.password` — set in `.clawdmux/config.toml`
+    /// 3. Hardcoded default: `"clawdmux-default-pw"`
+    pub fn effective_opencode_password(&self) -> String {
+        self.global
+            .opencode_password
+            .clone()
+            .or_else(|| self.opencode.password.clone())
+            .unwrap_or_else(|| "clawdmux-default-pw".to_string())
+    }
+
     /// Load the merged application config.
     ///
     /// Reads the global config from `~/.config/clawdmux/config.toml` and the
@@ -241,5 +255,39 @@ password = "mypassword"
             "expected Config error for unknown server mode, got: {:?}",
             err
         );
+    }
+
+    fn make_app_config(global_pw: Option<&str>, project_pw: Option<&str>) -> AppConfig {
+        use crate::config::providers::{GlobalConfig, ProviderSection};
+        AppConfig {
+            global: GlobalConfig {
+                provider: ProviderSection::default(),
+                opencode_password: global_pw.map(str::to_string),
+            },
+            opencode: OpenCodeConfig {
+                mode: ServerMode::Auto,
+                hostname: "127.0.0.1".to_string(),
+                port: 4096,
+                password: project_pw.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn test_effective_password_hardcoded_default() {
+        let config = make_app_config(None, None);
+        assert_eq!(config.effective_opencode_password(), "clawdmux-default-pw");
+    }
+
+    #[test]
+    fn test_effective_password_project_override() {
+        let config = make_app_config(None, Some("project-pw"));
+        assert_eq!(config.effective_opencode_password(), "project-pw");
+    }
+
+    #[test]
+    fn test_effective_password_global_override() {
+        let config = make_app_config(Some("global-pw"), Some("project-pw"));
+        assert_eq!(config.effective_opencode_password(), "global-pw");
     }
 }
