@@ -92,8 +92,16 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = AppConfig::load(&project_root)?;
-    let mut server = OpenCodeServer::ensure_running(&config).await?;
-    tracing::info!("OpenCode server at {}", server.base_url());
+    let mut server = match OpenCodeServer::ensure_running(&config).await {
+        Ok(s) => {
+            tracing::info!("OpenCode server at {}", s.base_url());
+            Some(s)
+        }
+        Err(e) => {
+            tracing::warn!("OpenCode server unavailable, continuing without it: {}", e);
+            None
+        }
+    };
 
     let mut app = App::new(task_store);
 
@@ -142,8 +150,10 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
 
     ratatui::restore();
 
-    if let Err(e) = server.shutdown().await {
-        tracing::warn!("OpenCode server shutdown error: {}", e);
+    if let Some(ref mut s) = server {
+        if let Err(e) = s.shutdown().await {
+            tracing::warn!("OpenCode server shutdown error: {}", e);
+        }
     }
 
     Ok(())
