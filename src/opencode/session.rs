@@ -6,7 +6,7 @@
 
 use reqwest::Method;
 
-use crate::error::{ClawdMuxError, Result};
+use crate::error::Result;
 use crate::opencode::types::{
     ContentPart, CreateSessionResponse, FileDiff, OpenCodeSession, SendMessageRequest,
 };
@@ -30,10 +30,7 @@ impl OpenCodeClient {
             .json(&serde_json::json!({}))
             .send()
             .await?;
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ClawdMuxError::Api(body));
-        }
+        let resp = self.check_response(resp).await?;
         let created: CreateSessionResponse = resp.json().await?;
         Ok(created.0)
     }
@@ -68,10 +65,7 @@ impl OpenCodeClient {
             agent: Some(agent.opencode_agent_name().to_string()),
         };
         let resp = self.request(Method::POST, &path).json(&body).send().await?;
-        if !resp.status().is_success() {
-            let error_body = resp.text().await.unwrap_or_default();
-            return Err(ClawdMuxError::Api(error_body));
-        }
+        self.check_response(resp).await?;
         Ok(())
     }
 
@@ -90,10 +84,7 @@ impl OpenCodeClient {
     pub async fn abort_session(&self, session_id: &str) -> Result<()> {
         let path = format!("/session/{session_id}");
         let resp = self.request(Method::DELETE, &path).send().await?;
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ClawdMuxError::Api(body));
-        }
+        self.check_response(resp).await?;
         Ok(())
     }
 
@@ -112,10 +103,7 @@ impl OpenCodeClient {
     pub async fn fork_session(&self, session_id: &str) -> Result<OpenCodeSession> {
         let path = format!("/session/{session_id}/fork");
         let resp = self.request(Method::POST, &path).send().await?;
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ClawdMuxError::Api(body));
-        }
+        let resp = self.check_response(resp).await?;
         let created: CreateSessionResponse = resp.json().await?;
         Ok(created.0)
     }
@@ -135,10 +123,7 @@ impl OpenCodeClient {
     pub async fn get_session_diffs(&self, session_id: &str) -> Result<Vec<FileDiff>> {
         let path = format!("/session/{session_id}/diff");
         let resp = self.request(Method::GET, &path).send().await?;
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ClawdMuxError::Api(body));
-        }
+        let resp = self.check_response(resp).await?;
         let diffs: Vec<FileDiff> = resp.json().await?;
         Ok(diffs)
     }
@@ -147,6 +132,7 @@ impl OpenCodeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ClawdMuxError;
     use mockito::Server;
 
     fn make_client(url: &str) -> OpenCodeClient {
@@ -183,8 +169,8 @@ mod tests {
         let client = make_client(&server.url());
         let err = client.create_session().await.expect_err("should fail");
         assert!(
-            matches!(err, ClawdMuxError::Api(_)),
-            "expected Api error, got: {err:?}"
+            matches!(err, ClawdMuxError::Api { status: 500, .. }),
+            "expected Api error with status 500, got: {err:?}"
         );
         mock.assert_async().await;
     }
@@ -262,6 +248,9 @@ mod tests {
         let mut server = Server::new_async().await;
         let mock = server
             .mock("POST", "/session/abc/message")
+            .match_body(
+                r#"{"content":[{"type":"text","text":"do the thing"}],"agent":"clawdmux/implementation"}"#,
+            )
             .with_status(200)
             .create_async()
             .await;
@@ -271,6 +260,42 @@ mod tests {
             .send_prompt_async("abc", &AgentKind::Implementation, "do the thing")
             .await
             .expect("should succeed");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_request_sends_basic_auth() {
+        let mut server = Server::new_async().await;
+        // "user:pass" encodes to "dXNlcjpwYXNz" in base64.
+        let mock = server
+            .mock("GET", "/global/health")
+            .match_header("Authorization", "Basic dXNlcjpwYXNz")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ok":true,"version":"1.0"}"#)
+            .create_async()
+            .await;
+
+        let client =
+            OpenCodeClient::new(server.url(), Some(("user".to_string(), "pass".to_string())));
+        client.health().await.expect("should succeed");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fork_session_success() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/session/abc/fork")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"sess-forked","createdAt":"2024-01-01T00:00:00Z"}"#)
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        let session = client.fork_session("abc").await.expect("should succeed");
+        assert_eq!(session.id, "sess-forked");
         mock.assert_async().await;
     }
 }

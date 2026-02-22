@@ -34,9 +34,14 @@ pub enum ClawdMuxError {
     #[error("Config error: {0}")]
     Config(#[from] toml::de::Error),
 
-    /// An API-level error returned by the opencode server, containing the error message.
-    #[error("API error: {0}")]
-    Api(String),
+    /// An API-level error returned by the opencode server, carrying the HTTP status and body.
+    #[error("API error (HTTP {status}): {body}")]
+    Api {
+        /// The HTTP status code returned by the server.
+        status: u16,
+        /// The response body text.
+        body: String,
+    },
 
     /// An HTTP transport error from the `reqwest` client.
     #[error("HTTP error: {0}")]
@@ -114,7 +119,13 @@ mod tests {
     #[test]
     fn test_string_wrapping_variant_display() {
         let cases: &[(&str, ClawdMuxError)] = &[
-            ("api msg", ClawdMuxError::Api("api msg".to_string())),
+            (
+                "api msg",
+                ClawdMuxError::Api {
+                    status: 500,
+                    body: "api msg".to_string(),
+                },
+            ),
             (
                 "encode msg",
                 ClawdMuxError::Encode("encode msg".to_string()),
