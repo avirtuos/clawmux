@@ -34,12 +34,13 @@ pub fn draw_loading_screen(frame: &mut Frame, status: &str) {
     frame.render_widget(Paragraph::new(text), content_area);
 }
 
-/// Resets Tab 1 state when the selected task changes after navigation.
+/// Syncs all tab states when the selected task changes after navigation.
 ///
 /// Compares the newly selected task against `tab1_state.current_task_id`.
 /// If different, calls [`Tab1State::reset_for_task`] to rebuild answer inputs
-/// and clear per-task focus state.
-fn sync_tab1_on_nav(app: &mut App) {
+/// and clear per-task focus state. Also updates the displayed task for Tab 2
+/// and Tab 3.
+fn sync_tabs_on_nav(app: &mut App) {
     let new_id = app.task_list_state.selected_task_id().cloned();
     if new_id != app.tab1_state.current_task_id {
         match new_id {
@@ -277,11 +278,11 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.task_list_state.move_up();
-                sync_tab1_on_nav(app);
+                sync_tabs_on_nav(app);
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 app.task_list_state.move_down();
-                sync_tab1_on_nav(app);
+                sync_tabs_on_nav(app);
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if app.task_list_state.selected_task_id().is_none() {

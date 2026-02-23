@@ -110,15 +110,13 @@ pub fn render(
     workflow_state: Option<&WorkflowState>,
     state: &Tab3State,
 ) {
-    if task.is_none() {
+    let Some(task) = task else {
         let placeholder = Paragraph::new("Select a task to view team status")
             .style(Style::default().fg(Color::DarkGray))
             .block(Block::default().title("Team Status").borders(Borders::ALL));
         frame.render_widget(placeholder, area);
         return;
-    }
-
-    let task = task.unwrap();
+    };
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -329,6 +327,133 @@ mod tests {
         assert_eq!(state.scroll_offset, 2);
         state.scroll_down(3);
         assert_eq!(state.scroll_offset, 2); // clamped
+    }
+
+    #[test]
+    fn test_work_log_with_entries() {
+        use chrono::{TimeZone, Utc};
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let ts1 = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2024, 1, 16, 14, 0, 0).unwrap();
+        let task = make_task(vec![
+            WorkLogEntry {
+                sequence: 1,
+                timestamp: ts1,
+                agent: AgentKind::Intake,
+                description: "Gathered requirements".to_string(),
+            },
+            WorkLogEntry {
+                sequence: 2,
+                timestamp: ts2,
+                agent: AgentKind::Design,
+                description: "Produced design notes".to_string(),
+            },
+        ]);
+
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), Some(&task), None, &Tab3State::new());
+            })
+            .unwrap();
+
+        let content = buf_content(&terminal);
+        // Entries are rendered newest-first, so ts2 (Design) appears before ts1 (Intake).
+        assert!(
+            content.contains("2024-01-16 14:00"),
+            "missing ts2 timestamp in work log; got: {content}"
+        );
+        assert!(
+            content.contains("Design Agent"),
+            "missing Design Agent in work log; got: {content}"
+        );
+        assert!(
+            content.contains("Produced design notes"),
+            "missing ts2 description in work log; got: {content}"
+        );
+        assert!(
+            content.contains("2024-01-15 10:30"),
+            "missing ts1 timestamp in work log; got: {content}"
+        );
+        assert!(
+            content.contains("Intake Agent"),
+            "missing Intake Agent in work log; got: {content}"
+        );
+        assert!(
+            content.contains("Gathered requirements"),
+            "missing ts1 description in work log; got: {content}"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_coloring() {
+        use ratatui::style::Color;
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let task = make_task(vec![]);
+        let wf_state = WorkflowState {
+            task_id: TaskId::from_path("tasks/1.1.md"),
+            current_agent: AgentKind::Planning,
+            session_id: None,
+            phase: WorkflowPhase::Running,
+        };
+
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    frame.area(),
+                    Some(&task),
+                    Some(&wf_state),
+                    &Tab3State::new(),
+                );
+            })
+            .unwrap();
+
+        // Pipeline content is on row 1 (row 0 is the top border of the Pipeline block).
+        // Labels start at col 1. Layout with Planning as current (index 2):
+        //   "Intake" (6 chars) at cols 1-6    -> index 0, green (completed)
+        //   " > " (3 chars)    at cols 7-9
+        //   "Design" (6 chars) at cols 10-15  -> index 1, green (completed)
+        //   " > " (3 chars)    at cols 16-18
+        //   "Planning" (8 chars) at cols 19-26 -> index 2, yellow+bold (current)
+        //   " > " (3 chars)    at cols 27-29
+        //   "Implementation" (14 chars) at cols 30-43 -> index 3, dark gray (pending)
+        let buffer = terminal.backend().buffer().clone();
+
+        let intake_cell = &buffer[(1, 1)];
+        assert_eq!(
+            intake_cell.fg,
+            Color::Green,
+            "Intake should be green (completed)"
+        );
+
+        let design_cell = &buffer[(10, 1)];
+        assert_eq!(
+            design_cell.fg,
+            Color::Green,
+            "Design should be green (completed)"
+        );
+
+        let planning_cell = &buffer[(19, 1)];
+        assert_eq!(
+            planning_cell.fg,
+            Color::Yellow,
+            "Planning should be yellow (current)"
+        );
+        assert!(
+            planning_cell.modifier.contains(Modifier::BOLD),
+            "Planning should be bold (current)"
+        );
+
+        let impl_cell = &buffer[(30, 1)];
+        assert_eq!(
+            impl_cell.fg,
+            Color::DarkGray,
+            "Implementation should be dark gray (pending)"
+        );
     }
 
     #[test]
