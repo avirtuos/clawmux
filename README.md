@@ -10,6 +10,25 @@ ClawdMux is a GenAI coding assistance multiplexer and task orchestrator. It mana
 - **Unified TUI**: Left pane task navigation + 4-tab right pane (details, activity, team status, review)
 - **Multi-provider LLM support**: Works with any provider supported by opencode (Anthropic, OpenAI, Google, etc.)
 
+## Project Status
+
+**16 of 26 implementation tasks completed. 185 tests passing.**
+
+### What works today
+
+- `clawdmux init` -- full interactive wizard: checks for the `opencode` binary, configures LLM provider credentials, scaffolds the project directory, and generates agent definition files
+- TUI -- terminal UI renders with left-pane task list navigation and Tab 1 (task details view)
+- Task markdown parsing and writing -- round-trip fidelity for all task file sections
+- OpenCode HTTP client -- session creation, SSE event streaming, server lifecycle management (auto-start/reuse)
+- Workflow state machine -- pure state transition logic for all 7 agents and human-in-the-loop gates
+
+### What's next
+
+- Prompt composition (Task 6.2)
+- Tabs 2-4: agent activity feed, team status, code review with inline comments
+- Message dispatcher wiring all subsystems together
+- End-to-end integration: task -> agent -> TUI
+
 ## Getting Started
 
 ### Prerequisites
@@ -48,6 +67,8 @@ clawdmux init --reset-agents
 ```bash
 clawdmux
 ```
+
+The TUI requires an interactive terminal. Log output is written to `clawdmux.log` in the working directory to avoid corrupting the terminal display.
 
 ## Task File Format
 
@@ -89,10 +110,55 @@ A1: Rust
 
 ClawdMux acts as a client to an `opencode serve` HTTP server. See `docs/design.md` for the full architecture documentation.
 
+## Module Structure
+
+```
+src/
+├── main.rs              -- CLI entry point (clap), initializes logging
+├── app.rs               -- Top-level App struct, async runtime and event loop
+├── config/              -- Config file I/O, `init` wizard, provider definitions
+│   ├── mod.rs
+│   ├── init.rs
+│   └── providers.rs
+├── error.rs             -- Unified ClawdMuxError type
+├── messages.rs          -- Internal message bus types (AppMessage enum)
+├── opencode/            -- HTTP client for the opencode server
+│   ├── mod.rs
+│   ├── server.rs        -- Server lifecycle: auto-start, health check, reuse
+│   ├── session.rs       -- Session creation and management
+│   ├── events.rs        -- SSE event streaming and parsing
+│   └── types.rs         -- API request/response types
+├── tasks/               -- Task file parsing, models, and writing
+│   ├── mod.rs
+│   ├── models.rs        -- Task, Story, Status, Agent enums
+│   ├── parser.rs        -- Markdown -> Task round-trip parser
+│   └── writer.rs        -- Task -> Markdown serializer
+├── tui/                 -- Ratatui terminal UI
+│   ├── mod.rs
+│   ├── layout.rs        -- Pane layout definitions
+│   ├── task_list.rs     -- Left-pane task list widget
+│   └── tabs/            -- Right-pane tab views
+│       ├── task_details.rs
+│       ├── agent_activity.rs
+│       ├── team_status.rs
+│       └── code_review.rs
+└── workflow/            -- Agent pipeline state machine
+    ├── mod.rs
+    ├── agents.rs        -- Agent definitions and capabilities
+    ├── transitions.rs   -- State transition logic
+    └── prompt_composer.rs -- Task-to-prompt construction
+```
+
 ## Development
 
 ```bash
 cargo build
-cargo test
+cargo test           # 185 tests
 cargo clippy -- -D warnings
+```
+
+Run with a terminal attached:
+
+```bash
+cargo run
 ```

@@ -1028,6 +1028,8 @@ Add helper: `fn auth_header(&self) -> Option<reqwest::header::HeaderValue>` for 
 
 ### Task 5.3 — SSE Event Stream Consumer
 
+**Status**: COMPLETED
+
 **Objective**: Implement `EventStreamConsumer` in `src/opencode/events.rs` that connects to opencode's SSE stream and maps events to `AppMessage` values.
 
 **Files to Read**:
@@ -1083,6 +1085,8 @@ Use `reqwest_eventsource::EventSource` for the SSE connection. Reconnect on erro
 ---
 
 ### Task 5.4 — Server Lifecycle
+
+**Status**: COMPLETED
 
 **Objective**: Implement `src/opencode/server.rs` which manages spawning the opencode server as a child process, polling for health readiness, and graceful shutdown.
 
