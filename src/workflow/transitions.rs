@@ -124,6 +124,7 @@ impl WorkflowEngine {
                         }]
                     }
                     None => {
+                        state.session_id = None;
                         state.phase = WorkflowPhase::PendingReview;
                         vec![]
                     }
@@ -138,6 +139,12 @@ impl WorkflowEngine {
                 let Some(state) = self.states.get_mut(&task_id) else {
                     return vec![];
                 };
+                // Ignore stale or out-of-order completions that don't match
+                // the current agent; prevents double-advance if both
+                // SessionCompleted and AgentCompleted fire for the same step.
+                if agent != state.current_agent {
+                    return vec![];
+                }
                 match agent.next() {
                     Some(next) => {
                         state.current_agent = next;
@@ -150,6 +157,7 @@ impl WorkflowEngine {
                         }]
                     }
                     None => {
+                        state.session_id = None;
                         state.phase = WorkflowPhase::PendingReview;
                         vec![]
                     }
@@ -162,10 +170,14 @@ impl WorkflowEngine {
                 to,
                 reason,
             } => {
+                let Some(state) = self.states.get_mut(&task_id) else {
+                    return vec![];
+                };
                 if !from.valid_kickback_targets().contains(&to) {
+                    let session_id = state.session_id.clone().unwrap_or_default();
                     return vec![AppMessage::SessionError {
                         task_id,
-                        session_id: String::new(),
+                        session_id,
                         error: format!(
                             "Invalid kickback from {} to {}: not a valid target",
                             from.display_name(),
@@ -173,9 +185,6 @@ impl WorkflowEngine {
                         ),
                     }];
                 }
-                let Some(state) = self.states.get_mut(&task_id) else {
-                    return vec![];
-                };
                 state.current_agent = to;
                 state.session_id = None;
                 let prompt = placeholder_prompt(to, &task_id, Some(&reason));
@@ -188,6 +197,7 @@ impl WorkflowEngine {
 
             AppMessage::AgentAskedQuestion { task_id, .. } => {
                 if let Some(state) = self.states.get_mut(&task_id) {
+                    // TODO: Track question count per task -- currently assumes one question at a time
                     state.phase = WorkflowPhase::AwaitingAnswer { question_index: 0 };
                 }
                 vec![]
@@ -326,12 +336,49 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_completed_ignored_for_mismatched_agent() {
+        let mut engine = WorkflowEngine::new();
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+        // current_agent is Intake; fire AgentCompleted for a different agent
+        let msgs = engine.process(AppMessage::AgentCompleted {
+            task_id: tid.clone(),
+            agent: AgentKind::Design,
+            summary: "done".to_string(),
+        });
+        assert!(
+            msgs.is_empty(),
+            "mismatched AgentCompleted should be ignored"
+        );
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(
+            state.current_agent,
+            AgentKind::Intake,
+            "agent should not advance on mismatch"
+        );
+        assert_eq!(
+            state.phase,
+            WorkflowPhase::Running,
+            "phase should remain Running"
+        );
+    }
+
+    #[test]
     fn test_code_review_completed_transitions_to_pending_review() {
         let mut engine = WorkflowEngine::new();
         let tid = task("6.1");
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
         });
+        // Advance through all 6 pipeline stages via SessionCompleted to reach CodeReview
+        for _ in 0..6 {
+            engine.process(AppMessage::SessionCompleted {
+                task_id: tid.clone(),
+                session_id: "s".to_string(),
+            });
+        }
 
         let msgs = engine.process(AppMessage::AgentCompleted {
             task_id: tid.clone(),
@@ -344,6 +391,7 @@ mod tests {
         );
         let state = engine.state(&tid).expect("state");
         assert_eq!(state.phase, WorkflowPhase::PendingReview);
+        assert_eq!(state.session_id, None, "session_id should be cleared");
     }
 
     #[test]
@@ -438,12 +486,13 @@ mod tests {
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
         });
-        // Move to PendingReview by completing CodeReview
-        engine.process(AppMessage::AgentCompleted {
-            task_id: tid.clone(),
-            agent: AgentKind::CodeReview,
-            summary: "done".to_string(),
-        });
+        // Advance through the full 7-step pipeline via SessionCompleted to reach PendingReview
+        for _ in 0..7 {
+            engine.process(AppMessage::SessionCompleted {
+                task_id: tid.clone(),
+                session_id: "s".to_string(),
+            });
+        }
 
         let msgs = engine.process(AppMessage::HumanApprovedReview {
             task_id: tid.clone(),
