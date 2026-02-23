@@ -27,7 +27,7 @@ fn section_config(agent: &AgentKind) -> SectionConfig {
     let idx = agent.pipeline_index();
     SectionConfig {
         include_prior_qa: idx >= 1,
-        include_design: idx >= 2,
+        include_design: idx >= 1,
         include_impl_plan: idx >= 2,
         include_work_log: idx >= 2,
     }
@@ -188,14 +188,24 @@ fn section_your_role(agent: &AgentKind) -> String {
 /// assembled based on the agent's position in the pipeline:
 ///
 /// - All agents receive: Task Context, Description, Kickback (if present), Your Role.
-/// - Design and later agents also receive Prior Q&A.
-/// - Planning and later agents also receive Design, Implementation Plan, and Work Log.
+/// - Design and later agents (pipeline_index >= 1) also receive Prior Q&A and Design.
+/// - Planning and later agents (pipeline_index >= 2) also receive Implementation Plan and Work Log.
+///
+/// # Preconditions
+///
+/// `agent` must not be [`AgentKind::Human`]. Human is not a pipeline step and
+/// has no automated message to compose. This is enforced with a `debug_assert`.
 #[allow(dead_code)]
 pub fn compose_user_message(
     agent: &AgentKind,
     task: &Task,
     kickback_reason: Option<&str>,
 ) -> String {
+    debug_assert_ne!(
+        *agent,
+        AgentKind::Human,
+        "compose_user_message must not be called for AgentKind::Human"
+    );
     let cfg = section_config(agent);
     let mut sections: Vec<String> = Vec::new();
 
@@ -219,7 +229,7 @@ pub fn compose_user_message(
         }
     }
 
-    // Design: Planning and later agents (pipeline_index >= 2)
+    // Design: Design and later agents (pipeline_index >= 1)
     if cfg.include_design {
         if let Some(s) = section_design(task) {
             sections.push(s);
@@ -316,6 +326,25 @@ mod tests {
         assert!(
             !msg.contains("## Work Log"),
             "Intake should not include ## Work Log"
+        );
+    }
+
+    #[test]
+    fn test_compose_design_boundary() {
+        let task = make_test_task();
+        let msg = compose_user_message(&AgentKind::Design, &task, None);
+        assert!(
+            msg.contains("## Prior Q&A"),
+            "Design should include ## Prior Q&A"
+        );
+        assert!(msg.contains("## Design"), "Design should include ## Design");
+        assert!(
+            !msg.contains("## Implementation Plan"),
+            "Design should not include ## Implementation Plan"
+        );
+        assert!(
+            !msg.contains("## Work Log"),
+            "Design should not include ## Work Log"
         );
     }
 
