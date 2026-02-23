@@ -1,8 +1,522 @@
 //! State transition logic for the agent pipeline.
 //!
 //! Validates and applies state transitions, including kickback validation.
-//! Given a `(current_state, message)` pair, produces `(new_state, Vec<AppMessage>)`
-//! side effects. This pure design makes the engine trivially testable.
-//! Task 1.4 implements the full transition logic.
+//! Given a message, produces side-effect messages. This pure design (no I/O,
+//! no async) makes the engine trivially testable.
 
-//TODO: Task 1.4 -- implement WorkflowEngine state machine transitions
+use std::collections::HashMap;
+
+use crate::messages::AppMessage;
+use crate::tasks::models::TaskId;
+use crate::workflow::agents::AgentKind;
+
+/// The lifecycle phase of a task within the workflow engine.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkflowPhase {
+    /// No work has been started yet.
+    Idle,
+    /// An agent is actively working on the task.
+    Running,
+    /// The workflow is paused, waiting for a human answer.
+    AwaitingAnswer {
+        /// Zero-based index into the task's `questions` list.
+        question_index: usize,
+    },
+    /// All agents have completed; the task is awaiting human approval.
+    PendingReview,
+    /// The human has approved the task; it is complete.
+    Completed,
+    /// An unrecoverable error occurred.
+    Errored {
+        /// Description of what went wrong.
+        reason: String,
+    },
+}
+
+/// Per-task state tracked by the workflow engine.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct WorkflowState {
+    /// The task this state belongs to.
+    pub task_id: TaskId,
+    /// The agent currently responsible for this task.
+    pub current_agent: AgentKind,
+    /// The opencode session ID, if a session is active.
+    pub session_id: Option<String>,
+    /// The current lifecycle phase.
+    pub phase: WorkflowPhase,
+}
+
+/// Pure state machine that drives tasks through the 7-agent pipeline.
+///
+/// The engine holds a map of per-task `WorkflowState` entries and processes
+/// `AppMessage` values, mutating state and returning zero or more side-effect
+/// messages. No I/O or async is performed; this makes the engine trivially
+/// testable.
+#[allow(dead_code)]
+pub struct WorkflowEngine {
+    states: HashMap<TaskId, WorkflowState>,
+}
+
+#[allow(dead_code)]
+impl WorkflowEngine {
+    /// Creates a new `WorkflowEngine` with an empty state map.
+    pub fn new() -> Self {
+        Self {
+            states: HashMap::new(),
+        }
+    }
+
+    /// Returns a reference to the workflow state for the given task, if any.
+    pub fn state(&self, task_id: &TaskId) -> Option<&WorkflowState> {
+        self.states.get(task_id)
+    }
+
+    /// Applies a message to the engine, mutating state and returning side effects.
+    ///
+    /// The returned `Vec<AppMessage>` contains zero or more messages that the
+    /// caller must dispatch (e.g., `CreateSession` to start an agent).
+    pub fn process(&mut self, msg: AppMessage) -> Vec<AppMessage> {
+        match msg {
+            AppMessage::StartTask { task_id } => {
+                let prompt = placeholder_prompt(AgentKind::Intake, &task_id, None);
+                let state = WorkflowState {
+                    task_id: task_id.clone(),
+                    current_agent: AgentKind::Intake,
+                    session_id: None,
+                    phase: WorkflowPhase::Running,
+                };
+                self.states.insert(task_id.clone(), state);
+                vec![AppMessage::CreateSession {
+                    task_id,
+                    agent: AgentKind::Intake,
+                    prompt,
+                }]
+            }
+
+            AppMessage::SessionCreated {
+                task_id,
+                session_id,
+            } => {
+                if let Some(state) = self.states.get_mut(&task_id) {
+                    state.session_id = Some(session_id);
+                }
+                vec![]
+            }
+
+            AppMessage::SessionCompleted {
+                task_id,
+                session_id: _,
+            } => {
+                let Some(state) = self.states.get_mut(&task_id) else {
+                    return vec![];
+                };
+                match state.current_agent.next() {
+                    Some(next) => {
+                        state.current_agent = next;
+                        state.session_id = None;
+                        let prompt = placeholder_prompt(next, &task_id, None);
+                        vec![AppMessage::CreateSession {
+                            task_id,
+                            agent: next,
+                            prompt,
+                        }]
+                    }
+                    None => {
+                        state.phase = WorkflowPhase::PendingReview;
+                        vec![]
+                    }
+                }
+            }
+
+            AppMessage::AgentCompleted {
+                task_id,
+                agent,
+                summary: _,
+            } => {
+                let Some(state) = self.states.get_mut(&task_id) else {
+                    return vec![];
+                };
+                match agent.next() {
+                    Some(next) => {
+                        state.current_agent = next;
+                        state.session_id = None;
+                        let prompt = placeholder_prompt(next, &task_id, None);
+                        vec![AppMessage::CreateSession {
+                            task_id,
+                            agent: next,
+                            prompt,
+                        }]
+                    }
+                    None => {
+                        state.phase = WorkflowPhase::PendingReview;
+                        vec![]
+                    }
+                }
+            }
+
+            AppMessage::AgentKickedBack {
+                task_id,
+                from,
+                to,
+                reason,
+            } => {
+                if !from.valid_kickback_targets().contains(&to) {
+                    return vec![AppMessage::SessionError {
+                        task_id,
+                        session_id: String::new(),
+                        error: format!(
+                            "Invalid kickback from {} to {}: not a valid target",
+                            from.display_name(),
+                            to.display_name()
+                        ),
+                    }];
+                }
+                let Some(state) = self.states.get_mut(&task_id) else {
+                    return vec![];
+                };
+                state.current_agent = to;
+                state.session_id = None;
+                let prompt = placeholder_prompt(to, &task_id, Some(&reason));
+                vec![AppMessage::CreateSession {
+                    task_id,
+                    agent: to,
+                    prompt,
+                }]
+            }
+
+            AppMessage::AgentAskedQuestion { task_id, .. } => {
+                if let Some(state) = self.states.get_mut(&task_id) {
+                    state.phase = WorkflowPhase::AwaitingAnswer { question_index: 0 };
+                }
+                vec![]
+            }
+
+            AppMessage::HumanAnswered {
+                task_id,
+                question_index,
+                answer,
+            } => {
+                let Some(state) = self.states.get_mut(&task_id) else {
+                    return vec![];
+                };
+                state.phase = WorkflowPhase::Running;
+                let agent = state.current_agent;
+                let context = format!("Question {question_index} answer: {answer}");
+                let prompt = placeholder_prompt(agent, &task_id, Some(&context));
+                vec![AppMessage::CreateSession {
+                    task_id,
+                    agent,
+                    prompt,
+                }]
+            }
+
+            AppMessage::HumanApprovedReview { task_id } => {
+                if let Some(state) = self.states.get_mut(&task_id) {
+                    state.phase = WorkflowPhase::Completed;
+                }
+                vec![]
+            }
+
+            AppMessage::HumanRequestedRevisions { task_id, comments } => {
+                let Some(state) = self.states.get_mut(&task_id) else {
+                    return vec![];
+                };
+                state.current_agent = AgentKind::CodeReview;
+                state.phase = WorkflowPhase::Running;
+                state.session_id = None;
+                let context = comments.join("; ");
+                let prompt = placeholder_prompt(AgentKind::CodeReview, &task_id, Some(&context));
+                vec![AppMessage::CreateSession {
+                    task_id,
+                    agent: AgentKind::CodeReview,
+                    prompt,
+                }]
+            }
+
+            AppMessage::SessionError {
+                task_id,
+                session_id: _,
+                error,
+            } => {
+                if let Some(state) = self.states.get_mut(&task_id) {
+                    state.phase = WorkflowPhase::Errored { reason: error };
+                }
+                vec![]
+            }
+
+            // All other variants are no-ops.
+            _ => vec![],
+        }
+    }
+}
+
+/// Returns a placeholder prompt string for the given agent and task.
+///
+/// The context argument, if provided, is appended to the prompt.
+///
+//TODO: Task 6.2 -- replace with real prompt composition using PromptComposer
+fn placeholder_prompt(agent: AgentKind, task_id: &TaskId, context: Option<&str>) -> String {
+    match context {
+        Some(ctx) => format!(
+            "Begin task {} as {} agent. Context: {}",
+            task_id,
+            agent.display_name(),
+            ctx
+        ),
+        None => format!("Begin task {} as {} agent.", task_id, agent.display_name()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: &str) -> TaskId {
+        TaskId::from_path(format!("tasks/{id}.md"))
+    }
+
+    #[test]
+    fn test_start_task_transitions_to_running() {
+        let mut engine = WorkflowEngine::new();
+        let tid = task("6.1");
+        let msgs = engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+        let state = engine.state(&tid).expect("state should exist");
+        assert_eq!(state.phase, WorkflowPhase::Running);
+        assert_eq!(state.current_agent, AgentKind::Intake);
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            matches!(&msgs[0], AppMessage::CreateSession { agent, .. } if *agent == AgentKind::Intake)
+        );
+    }
+
+    #[test]
+    fn test_agent_completed_advances_pipeline() {
+        let mut engine = WorkflowEngine::new();
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+
+        let pipeline = [
+            AgentKind::Intake,
+            AgentKind::Design,
+            AgentKind::Planning,
+            AgentKind::Implementation,
+            AgentKind::CodeQuality,
+            AgentKind::SecurityReview,
+        ];
+
+        for agent in &pipeline {
+            let msgs = engine.process(AppMessage::AgentCompleted {
+                task_id: tid.clone(),
+                agent: *agent,
+                summary: "done".to_string(),
+            });
+            assert_eq!(msgs.len(), 1, "agent {agent:?} should emit CreateSession");
+            let next = agent.next().expect("should have next");
+            assert!(
+                matches!(&msgs[0], AppMessage::CreateSession { agent: a, .. } if *a == next),
+                "expected CreateSession for {next:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_code_review_completed_transitions_to_pending_review() {
+        let mut engine = WorkflowEngine::new();
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+
+        let msgs = engine.process(AppMessage::AgentCompleted {
+            task_id: tid.clone(),
+            agent: AgentKind::CodeReview,
+            summary: "done".to_string(),
+        });
+        assert!(
+            msgs.is_empty(),
+            "CodeReview completed should emit no messages"
+        );
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(state.phase, WorkflowPhase::PendingReview);
+    }
+
+    #[test]
+    fn test_valid_kickback_accepted() {
+        let mut engine = WorkflowEngine::new();
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+
+        let msgs = engine.process(AppMessage::AgentKickedBack {
+            task_id: tid.clone(),
+            from: AgentKind::CodeQuality,
+            to: AgentKind::Implementation,
+            reason: "needs rework".to_string(),
+        });
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            matches!(&msgs[0], AppMessage::CreateSession { agent, .. } if *agent == AgentKind::Implementation)
+        );
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(state.current_agent, AgentKind::Implementation);
+    }
+
+    #[test]
+    fn test_invalid_kickback_rejected() {
+        let mut engine = WorkflowEngine::new();
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+
+        let msgs = engine.process(AppMessage::AgentKickedBack {
+            task_id: tid.clone(),
+            from: AgentKind::Intake,
+            to: AgentKind::Implementation,
+            reason: "bad kickback".to_string(),
+        });
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], AppMessage::SessionError { .. }));
+    }
+
+    #[test]
+    fn test_question_pauses_workflow() {
+        let mut engine = WorkflowEngine::new();
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+
+        let msgs = engine.process(AppMessage::AgentAskedQuestion {
+            task_id: tid.clone(),
+            agent: AgentKind::Intake,
+            question: "What is the scope?".to_string(),
+        });
+        assert!(msgs.is_empty());
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(
+            state.phase,
+            WorkflowPhase::AwaitingAnswer { question_index: 0 }
+        );
+    }
+
+    #[test]
+    fn test_human_answer_resumes_workflow() {
+        let mut engine = WorkflowEngine::new();
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+        engine.process(AppMessage::AgentAskedQuestion {
+            task_id: tid.clone(),
+            agent: AgentKind::Intake,
+            question: "What is the scope?".to_string(),
+        });
+
+        let msgs = engine.process(AppMessage::HumanAnswered {
+            task_id: tid.clone(),
+            question_index: 0,
+            answer: "Full scope".to_string(),
+        });
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0], AppMessage::CreateSession { .. }));
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(state.phase, WorkflowPhase::Running);
+    }
+
+    #[test]
+    fn test_human_approved_completes() {
+        let mut engine = WorkflowEngine::new();
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+        // Move to PendingReview by completing CodeReview
+        engine.process(AppMessage::AgentCompleted {
+            task_id: tid.clone(),
+            agent: AgentKind::CodeReview,
+            summary: "done".to_string(),
+        });
+
+        let msgs = engine.process(AppMessage::HumanApprovedReview {
+            task_id: tid.clone(),
+        });
+        assert!(msgs.is_empty());
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(state.phase, WorkflowPhase::Completed);
+    }
+
+    #[test]
+    fn test_session_error_transitions_to_errored() {
+        let mut engine = WorkflowEngine::new();
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+
+        let msgs = engine.process(AppMessage::SessionError {
+            task_id: tid.clone(),
+            session_id: "sess-1".to_string(),
+            error: "out of memory".to_string(),
+        });
+        assert!(msgs.is_empty());
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(
+            state.phase,
+            WorkflowPhase::Errored {
+                reason: "out of memory".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_session_created_records_session_id() {
+        let mut engine = WorkflowEngine::new();
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+
+        engine.process(AppMessage::SessionCreated {
+            task_id: tid.clone(),
+            session_id: "sess-42".to_string(),
+        });
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(state.session_id, Some("sess-42".to_string()));
+    }
+
+    #[test]
+    fn test_human_requested_revisions() {
+        let mut engine = WorkflowEngine::new();
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+
+        let msgs = engine.process(AppMessage::HumanRequestedRevisions {
+            task_id: tid.clone(),
+            comments: vec!["Fix formatting".to_string(), "Add tests".to_string()],
+        });
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            matches!(&msgs[0], AppMessage::CreateSession { agent, .. } if *agent == AgentKind::CodeReview)
+        );
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(state.current_agent, AgentKind::CodeReview);
+        assert_eq!(state.phase, WorkflowPhase::Running);
+    }
+
+    #[test]
+    fn test_unhandled_message_ignored() {
+        let mut engine = WorkflowEngine::new();
+        let msgs = engine.process(AppMessage::Tick);
+        assert!(msgs.is_empty());
+    }
+}
