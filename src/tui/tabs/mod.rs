@@ -61,6 +61,13 @@ pub fn render(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             let task_id = app.selected_task();
             agent_activity::render(frame, content_area, task_id, &app.tab2_state);
         }
+        2 => {
+            let task = app.selected_task().and_then(|id| app.task_store.get(id));
+            let wf_state = app
+                .selected_task()
+                .and_then(|id| app.workflow_engine.state(id));
+            team_status::render(frame, content_area, task, wf_state, &app.tab3_state);
+        }
         _ => {
             let label = TAB_TITLES.get(app.active_tab).copied().unwrap_or("Unknown");
             let placeholder = Paragraph::new(format!("{label}: Not yet implemented"))

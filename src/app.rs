@@ -7,7 +7,9 @@ use crate::messages::AppMessage;
 use crate::tasks::{Story, TaskId, TaskStore};
 use crate::tui::tabs::agent_activity::Tab2State;
 use crate::tui::tabs::task_details::Tab1State;
+use crate::tui::tabs::team_status::Tab3State;
 use crate::tui::task_list::TaskListState;
+use crate::workflow::transitions::WorkflowEngine;
 
 /// Top-level application state.
 ///
@@ -31,6 +33,10 @@ pub struct App {
     pub tab1_state: Tab1State,
     /// UI state for Tab 2 (Agent Activity): per-task activity lines and scroll.
     pub tab2_state: Tab2State,
+    /// Pure state machine driving tasks through the 7-agent pipeline.
+    pub workflow_engine: WorkflowEngine,
+    /// UI state for Tab 3 (Team Status): work log scroll and current task.
+    pub tab3_state: Tab3State,
 }
 
 impl App {
@@ -50,6 +56,8 @@ impl App {
             task_list_state,
             tab1_state: Tab1State::new(),
             tab2_state: Tab2State::new(),
+            workflow_engine: WorkflowEngine::new(),
+            tab3_state: Tab3State::new(),
         }
     }
 
