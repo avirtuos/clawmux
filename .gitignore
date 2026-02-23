@@ -1,5 +1,4 @@
 target/
 .clawdmux/logs/
 *.log
-tasks/
 .env
