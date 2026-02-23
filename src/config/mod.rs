@@ -90,6 +90,15 @@ impl AppConfig {
             .unwrap_or_else(|| "clawdmux-default-pw".to_string())
     }
 
+    /// Returns `true` if a password was explicitly configured by the user.
+    ///
+    /// When `false`, no password should be injected into the spawned opencode
+    /// process and no auth credentials should be sent on API requests, preserving
+    /// the same behaviour as a vanilla (no-password) opencode server.
+    pub fn has_explicit_password(&self) -> bool {
+        self.global.opencode_password.is_some() || self.opencode.password.is_some()
+    }
+
     /// Load the merged application config.
     ///
     /// Reads the global config from `~/.config/clawdmux/config.toml` and the
@@ -289,5 +298,23 @@ password = "mypassword"
     fn test_effective_password_global_override() {
         let config = make_app_config(Some("global-pw"), Some("project-pw"));
         assert_eq!(config.effective_opencode_password(), "global-pw");
+    }
+
+    #[test]
+    fn test_has_explicit_password_false_by_default() {
+        let config = make_app_config(None, None);
+        assert!(!config.has_explicit_password());
+    }
+
+    #[test]
+    fn test_has_explicit_password_true_when_project_set() {
+        let config = make_app_config(None, Some("project-pw"));
+        assert!(config.has_explicit_password());
+    }
+
+    #[test]
+    fn test_has_explicit_password_true_when_global_set() {
+        let config = make_app_config(Some("global-pw"), None);
+        assert!(config.has_explicit_password());
     }
 }

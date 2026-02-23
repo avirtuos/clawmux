@@ -112,8 +112,15 @@ impl OpenCodeServer {
         F: FnMut(&str),
     {
         let base_url = Self::build_base_url(&config.opencode.hostname, config.opencode.port);
-        let password = config.effective_opencode_password();
-        let client = OpenCodeClient::new(base_url.clone(), Self::build_auth(&password));
+        // Only attach credentials when the user has explicitly configured a password.
+        // Without an explicit password, opencode is started unauthenticated and
+        // requests are sent without an Authorization header, matching pre-password behaviour.
+        let auth = if config.has_explicit_password() {
+            Self::build_auth(&config.effective_opencode_password())
+        } else {
+            None
+        };
+        let client = OpenCodeClient::new(base_url.clone(), auth.clone());
 
         on_status("Checking for running opencode server...");
         let already_healthy = client.health().await.unwrap_or(false);
@@ -144,7 +151,7 @@ impl OpenCodeServer {
                         "Port {} is already in use, waiting for existing server to become healthy",
                         config.opencode.port
                     );
-                    Self::wait_for_existing_server(base_url, &password, on_status).await
+                    Self::wait_for_existing_server(base_url, auth, on_status).await
                 } else {
                     Self::spawn_and_wait(config, base_url, on_status).await
                 }
@@ -179,13 +186,13 @@ impl OpenCodeServer {
     /// within 30 seconds.
     async fn wait_for_existing_server<F>(
         base_url: String,
-        password: &str,
+        auth: Option<(String, String)>,
         mut on_status: F,
     ) -> Result<Self>
     where
         F: FnMut(&str),
     {
-        let client = OpenCodeClient::new(base_url.clone(), Self::build_auth(password));
+        let client = OpenCodeClient::new(base_url.clone(), auth);
         const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
         const INITIAL_DELAY: Duration = Duration::from_millis(100);
         const MAX_DELAY: Duration = Duration::from_millis(2000);
@@ -301,7 +308,6 @@ impl OpenCodeServer {
             .map_err(|e| ClawdMuxError::Server(format!("opencode binary not found: {}", e)))?;
 
         let env_vars = config.global.env_vars_for_opencode();
-        let password = config.effective_opencode_password();
 
         let mut cmd = tokio::process::Command::new(&opencode_bin);
         cmd.arg("serve")
@@ -316,7 +322,16 @@ impl OpenCodeServer {
         for (key, val) in &env_vars {
             cmd.env(key, val);
         }
-        cmd.env("OPENCODE_SERVER_PASSWORD", &password);
+        // Only inject the password env var when the user has explicitly configured one.
+        // Without this guard, spawning opencode with a default password forces auth on
+        // all endpoints (including health checks), causing 401 failures at startup.
+        let auth = if config.has_explicit_password() {
+            let password = config.effective_opencode_password();
+            cmd.env("OPENCODE_SERVER_PASSWORD", &password);
+            Self::build_auth(&password)
+        } else {
+            None
+        };
 
         tracing::info!(
             "Spawning opencode: {:?} serve --port {} --hostname {}",
@@ -398,7 +413,7 @@ impl OpenCodeServer {
             })
         };
 
-        let client = OpenCodeClient::new(base_url.clone(), Self::build_auth(&password));
+        let client = OpenCodeClient::new(base_url.clone(), auth);
         const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
         const INITIAL_DELAY: Duration = Duration::from_millis(100);
         const MAX_DELAY: Duration = Duration::from_millis(2000);

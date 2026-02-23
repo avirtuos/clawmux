@@ -149,6 +149,10 @@ src/
     └── prompt_composer.rs -- Task-to-prompt construction
 ```
 
+## TODO
+
+- **Improve password support for opencode local auth**: Write a project-specific opencode config that enables auth when clawdmux spawns the server, so credentials can be verified end-to-end rather than relying on the user to configure opencode separately.
+
 ## Development
 
 ```bash
