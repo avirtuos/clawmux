@@ -124,10 +124,23 @@ impl EventStreamConsumer {
     pub(crate) async fn handle_event(&self, event: OpenCodeEvent) -> Result<()> {
         match event {
             OpenCodeEvent::SessionCreated { session_id } => {
-                let task_id = {
-                    let map = self.session_map.read().await;
-                    map.get(&session_id).map(|(task_id, _)| task_id.clone())
-                };
+                // Retry up to 3 times with a 50ms sleep to handle the TOCTOU
+                // race where the SSE event arrives before the session map is
+                // populated by the caller that initiated the CreateSession.
+                const MAX_ATTEMPTS: usize = 3;
+                let mut task_id = None;
+                for attempt in 0..MAX_ATTEMPTS {
+                    {
+                        let map = self.session_map.read().await;
+                        task_id = map.get(&session_id).map(|(id, _)| id.clone());
+                    }
+                    if task_id.is_some() {
+                        break;
+                    }
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
                 if let Some(task_id) = task_id {
                     self.send(AppMessage::SessionCreated {
                         task_id,
@@ -135,7 +148,10 @@ impl EventStreamConsumer {
                     })
                     .await?;
                 } else {
-                    debug!("SessionCreated for unknown session_id: {}", session_id);
+                    warn!(
+                        "SessionCreated for unknown session_id after retries: {}",
+                        session_id
+                    );
                 }
             }
             OpenCodeEvent::MessageUpdated {
@@ -401,6 +417,40 @@ mod tests {
             .await
             .expect("handle_event");
         assert!(rx.try_recv().is_err(), "Unknown should always be ignored");
+    }
+
+    /// Verifies that `SessionCreated` succeeds when the session map is populated
+    /// after a short delay (simulating the TOCTOU race condition).
+    #[tokio::test]
+    async fn test_session_created_retry_succeeds() {
+        let (consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/6.1.md");
+        let session_id = "sess-race".to_string();
+
+        // Spawn a task that inserts into the session map after 25ms,
+        // simulating the caller populating the map slightly after the SSE event arrives.
+        let map_clone = Arc::clone(&session_map);
+        let tid_clone = task_id.clone();
+        let sid_clone = session_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let mut map = map_clone.write().await;
+            map.insert(sid_clone, (tid_clone, AgentKind::Intake));
+        });
+
+        consumer
+            .handle_event(OpenCodeEvent::SessionCreated {
+                session_id: session_id.clone(),
+            })
+            .await
+            .expect("handle_event");
+
+        let msg = rx
+            .try_recv()
+            .expect("SessionCreated message should be received after retry");
+        assert!(
+            matches!(msg, AppMessage::SessionCreated { ref session_id, .. } if session_id == "sess-race")
+        );
     }
 
     #[tokio::test]
