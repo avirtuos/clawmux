@@ -5,6 +5,7 @@
 
 use crate::messages::AppMessage;
 use crate::tasks::{Story, TaskId, TaskStore};
+use crate::tui::tabs::agent_activity::Tab2State;
 use crate::tui::tabs::task_details::Tab1State;
 use crate::tui::task_list::TaskListState;
 
@@ -28,6 +29,8 @@ pub struct App {
     pub task_list_state: TaskListState,
     /// UI state for Tab 1 (Task Details): prompt input, answer inputs, focus flags.
     pub tab1_state: Tab1State,
+    /// UI state for Tab 2 (Agent Activity): per-task activity lines and scroll.
+    pub tab2_state: Tab2State,
 }
 
 impl App {
@@ -46,6 +49,7 @@ impl App {
             show_quit_confirm: false,
             task_list_state,
             tab1_state: Tab1State::new(),
+            tab2_state: Tab2State::new(),
         }
     }
 
@@ -92,6 +96,23 @@ impl App {
                 }
             }
             AppMessage::Tick => vec![],
+            AppMessage::StreamingUpdate {
+                task_id,
+                session_id: _,
+                parts,
+            } => {
+                self.tab2_state.push_streaming(&task_id, &parts);
+                vec![]
+            }
+            AppMessage::ToolActivity {
+                task_id,
+                session_id: _,
+                tool,
+                status,
+            } => {
+                self.tab2_state.push_tool(&task_id, tool, status);
+                vec![]
+            }
             other => {
                 tracing::debug!(?other, "unhandled message");
                 vec![]

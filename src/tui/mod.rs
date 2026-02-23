@@ -58,6 +58,8 @@ fn sync_tab1_on_nav(app: &mut App) {
             }
         }
     }
+    app.tab2_state
+        .set_displayed_task(app.task_list_state.selected_task_id());
 }
 
 /// Returns a context-sensitive keybinding hint string for the footer.
@@ -80,6 +82,8 @@ pub fn footer_hint_text(
         "[Esc] exit | [Tab] next answer | Editing answer"
     } else if active_tab == 0 {
         "[i] prompt | [a] answer | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
+    } else if active_tab == 1 {
+        "[PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
     } else {
         "[Tab] next tab | [q] quit"
     }
@@ -211,6 +215,20 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                 }
                 KeyCode::PageDown => {
                     app.tab1_state.scroll_desc_down();
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
+        if app.active_tab == 1 {
+            match key.code {
+                KeyCode::PageUp => {
+                    app.tab2_state.scroll_up();
+                    return None;
+                }
+                KeyCode::PageDown => {
+                    app.tab2_state.scroll_down();
                     return None;
                 }
                 _ => {}
