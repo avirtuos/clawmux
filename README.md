@@ -12,7 +12,7 @@ ClawdMux is a GenAI coding assistance multiplexer and task orchestrator. It mana
 
 ## Project Status
 
-**16 of 26 implementation tasks completed. 185 tests passing.**
+**17 of 26 implementation tasks completed. 195 tests passing.**
 
 ### What works today
 

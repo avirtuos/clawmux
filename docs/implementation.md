@@ -1155,6 +1155,8 @@ impl OpenCodeServer {
 
 ### Task 6.1 — Workflow State Machine
 
+**Status**: COMPLETED
+
 **Objective**: Implement `WorkflowEngine` and the transition logic that advances the pipeline, handles kickbacks, pauses for questions, and emits `AppMessage` side effects.
 
 **Files to Read**:

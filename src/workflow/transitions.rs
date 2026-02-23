@@ -266,7 +266,7 @@ impl WorkflowEngine {
 ///
 /// The context argument, if provided, is appended to the prompt.
 ///
-//TODO: Task 6.2 -- replace with real prompt composition using PromptComposer
+//TODO: Wire compose_user_message into the message dispatch layer (requires task store access)
 fn placeholder_prompt(agent: AgentKind, task_id: &TaskId, context: Option<&str>) -> String {
     match context {
         Some(ctx) => format!(
