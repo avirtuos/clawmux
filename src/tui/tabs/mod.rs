@@ -62,10 +62,9 @@ pub fn render(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             agent_activity::render(frame, content_area, task_id, &app.tab2_state);
         }
         2 => {
-            let task = app.selected_task().and_then(|id| app.task_store.get(id));
-            let wf_state = app
-                .selected_task()
-                .and_then(|id| app.workflow_engine.state(id));
+            let task_id = app.selected_task();
+            let task = task_id.and_then(|id| app.task_store.get(id));
+            let wf_state = task_id.and_then(|id| app.workflow_engine.state(id));
             team_status::render(frame, content_area, task, wf_state, &app.tab3_state);
         }
         _ => {
