@@ -423,12 +423,18 @@ mod tests {
     /// after a short delay (simulating the TOCTOU race condition).
     #[tokio::test]
     async fn test_session_created_retry_succeeds() {
+        // Pause the tokio clock so timers resolve in deterministic order
+        // regardless of real wall-clock timing under CI load.
+        tokio::time::pause();
+
         let (consumer, mut rx, session_map) = make_consumer();
         let task_id = TaskId::from_path("tasks/6.1.md");
         let session_id = "sess-race".to_string();
 
         // Spawn a task that inserts into the session map after 25ms,
         // simulating the caller populating the map slightly after the SSE event arrives.
+        // With the clock paused, the 25ms sleep resolves before the 50ms retry
+        // sleep in handle_event, guaranteeing the map is populated on attempt 2.
         let map_clone = Arc::clone(&session_map);
         let tid_clone = task_id.clone();
         let sid_clone = session_id.clone();

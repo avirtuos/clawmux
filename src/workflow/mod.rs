@@ -8,5 +8,6 @@ pub mod agents;
 pub mod prompt_composer;
 pub mod transitions;
 
+// TODO: Remove #[allow(unused_imports)] once the message dispatcher consumes these
 #[allow(unused_imports)]
 pub use transitions::{WorkflowEngine, WorkflowPhase, WorkflowState};
