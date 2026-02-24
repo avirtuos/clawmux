@@ -156,7 +156,7 @@ pub fn parse_task(content: &str, file_path: PathBuf) -> crate::error::Result<Tas
             }
             "work log" => {
                 let body = trim_section_body(&body_lines);
-                work_log = parse_work_log(&body, &file_name)?;
+                work_log = parse_work_log(&body, &file_name);
             }
             _ => {
                 let body = trim_section_body(&body_lines);
@@ -241,6 +241,7 @@ pub fn create_malformed_task(content: &str, file_path: PathBuf, error_message: S
             raw_content: content.to_string(),
             suggested_fix: None,
             fix_in_progress: false,
+            fix_error: None,
         }),
     }
 }
@@ -359,11 +360,16 @@ fn parse_questions(body: &str, file: &str) -> crate::error::Result<Vec<Question>
 /// ```text
 /// <seq> <ISO8601_timestamp> [<agent display name>] <description>
 /// ```
+///
+/// Entries that cannot be parsed (bad sequence number, bad timestamp, missing
+/// or unrecognised agent brackets) are preserved as [`WorkLogEntry::Raw`] with
+/// a warning message. This prevents a single malformed entry from being silently
+/// lost and ensures round-trip fidelity.
 #[allow(dead_code)]
-fn parse_work_log(body: &str, file: &str) -> crate::error::Result<Vec<WorkLogEntry>> {
+fn parse_work_log(body: &str, file: &str) -> Vec<WorkLogEntry> {
     let mut entries: Vec<WorkLogEntry> = Vec::new();
     if body.is_empty() {
-        return Ok(entries);
+        return entries;
     }
     for line in body.lines() {
         let line = line.trim();
@@ -374,17 +380,40 @@ fn parse_work_log(body: &str, file: &str) -> crate::error::Result<Vec<WorkLogEnt
 
         // Token 1: sequence number.
         let seq_str = tokens.next().unwrap_or("");
-        let sequence: u32 = seq_str.parse().map_err(|_| ClawdMuxError::Parse {
-            file: file.to_string(),
-            message: format!("invalid sequence number in work log: '{seq_str}'"),
-        })?;
+        let sequence: u32 = match seq_str.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    "work log parse: preserving entry with bad sequence '{}' in {} as raw",
+                    seq_str,
+                    file
+                );
+                entries.push(WorkLogEntry::Raw {
+                    text: line.to_string(),
+                    warning: format!("bad sequence number: '{seq_str}'"),
+                });
+                continue;
+            }
+        };
 
         // Token 2: timestamp.
         let ts_str = tokens.next().unwrap_or("");
-        let timestamp = parse_timestamp(ts_str).ok_or_else(|| ClawdMuxError::Parse {
-            file: file.to_string(),
-            message: format!("invalid timestamp in work log: '{ts_str}'"),
-        })?;
+        let timestamp = match parse_timestamp(ts_str) {
+            Some(ts) => ts,
+            None => {
+                tracing::warn!(
+                    "work log parse: preserving entry {} with bad timestamp '{}' in {} as raw",
+                    sequence,
+                    ts_str,
+                    file
+                );
+                entries.push(WorkLogEntry::Raw {
+                    text: line.to_string(),
+                    warning: format!("bad timestamp: '{ts_str}'"),
+                });
+                continue;
+            }
+        };
 
         // Remainder: `[Agent Name] description`.
         let rest = tokens.next().unwrap_or("").to_string()
@@ -398,27 +427,46 @@ fn parse_work_log(body: &str, file: &str) -> crate::error::Result<Vec<WorkLogEnt
         // Extract agent from [...].
         let (agent, description) = if let Some(bracket_end) = rest.find(']') {
             let inner = &rest[1..bracket_end]; // skip leading '['
-            let agent = AgentKind::from_display_name(inner).map_err(|_| ClawdMuxError::Parse {
-                file: file.to_string(),
-                message: format!("invalid agent in work log: '{inner}'"),
-            })?;
-            let desc = rest[bracket_end + 1..].trim().to_string();
-            (agent, desc)
+            match AgentKind::from_display_name(inner) {
+                Ok(a) => {
+                    let desc = rest[bracket_end + 1..].trim().to_string();
+                    (a, desc)
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "work log parse: preserving entry {} with unrecognised agent '{}' in {} as raw",
+                        sequence,
+                        inner,
+                        file
+                    );
+                    entries.push(WorkLogEntry::Raw {
+                        text: line.to_string(),
+                        warning: format!("unrecognised agent: '{inner}'"),
+                    });
+                    continue;
+                }
+            }
         } else {
-            return Err(ClawdMuxError::Parse {
-                file: file.to_string(),
-                message: format!("malformed work log entry (no agent brackets): '{line}'"),
+            tracing::warn!(
+                "work log parse: preserving entry {} with no agent brackets in {} as raw",
+                sequence,
+                file
+            );
+            entries.push(WorkLogEntry::Raw {
+                text: line.to_string(),
+                warning: "no agent brackets found".to_string(),
             });
+            continue;
         };
 
-        entries.push(WorkLogEntry {
+        entries.push(WorkLogEntry::Parsed {
             sequence,
             timestamp,
             agent,
             description,
         });
     }
-    Ok(entries)
+    entries
 }
 
 /// Attempts to parse an ISO 8601 timestamp string as a UTC `DateTime`.
@@ -548,8 +596,14 @@ A1: Lets use rust, it is well suited to this.
             Some("<Plan to use for this task>".to_string())
         );
         assert_eq!(task.work_log.len(), 1);
-        assert_eq!(task.work_log[0].sequence, 1);
-        assert_eq!(task.work_log[0].agent, AgentKind::Design);
+        let WorkLogEntry::Parsed {
+            sequence, agent, ..
+        } = &task.work_log[0]
+        else {
+            panic!("expected Parsed entry");
+        };
+        assert_eq!(*sequence, 1);
+        assert_eq!(*agent, AgentKind::Design);
         assert!(task.extra_sections.is_empty());
     }
 
@@ -745,6 +799,7 @@ Q1 [Intake Agent]: An unanswered question?
                 raw_content: content.to_string(),
                 suggested_fix: None,
                 fix_in_progress: false,
+                fix_error: None,
             })
         );
     }
@@ -766,11 +821,19 @@ x
 ";
         let task = parse_task(content, path("t")).unwrap();
         assert_eq!(task.work_log.len(), 1);
-        let entry = &task.work_log[0];
-        assert_eq!(entry.sequence, 1);
-        assert_eq!(entry.agent, AgentKind::Design);
-        assert_eq!(entry.timestamp.to_rfc3339(), "2026-02-10T10:00:01+00:00");
-        assert_eq!(entry.description, "some work");
+        let WorkLogEntry::Parsed {
+            sequence,
+            agent,
+            timestamp,
+            description,
+        } = &task.work_log[0]
+        else {
+            panic!("expected Parsed entry");
+        };
+        assert_eq!(*sequence, 1);
+        assert_eq!(*agent, AgentKind::Design);
+        assert_eq!(timestamp.to_rfc3339(), "2026-02-10T10:00:01+00:00");
+        assert_eq!(description, "some work");
     }
 
     #[test]
@@ -790,8 +853,160 @@ x
 ";
         let task = parse_task(content, path("t")).unwrap();
         assert_eq!(task.work_log.len(), 1);
-        let entry = &task.work_log[0];
-        assert_eq!(entry.timestamp.to_rfc3339(), "2026-02-10T10:00:01+00:00");
+        let WorkLogEntry::Parsed { timestamp, .. } = &task.work_log[0] else {
+            panic!("expected Parsed entry");
+        };
+        assert_eq!(timestamp.to_rfc3339(), "2026-02-10T10:00:01+00:00");
+    }
+
+    #[test]
+    fn test_parse_work_log_preserves_entry_without_agent_brackets_as_raw() {
+        // An entry without [Agent] brackets should be preserved as Raw, not dropped.
+        let content = "\
+Story: S
+Task: T
+Status: OPEN
+
+## Description
+
+x
+
+## Work Log
+
+1 2026-02-10T10:00:01 [Design Agent] valid entry
+2 2026-02-10T10:00:02 no brackets here just plain text
+3 2026-02-10T10:00:03 [Planning Agent] another valid entry
+";
+        let task = parse_task(content, path("t")).unwrap();
+        // All 3 entries are present; entry 2 is Raw.
+        assert_eq!(task.work_log.len(), 3);
+        assert!(matches!(
+            &task.work_log[0],
+            WorkLogEntry::Parsed { sequence: 1, .. }
+        ));
+        assert!(
+            matches!(&task.work_log[1], WorkLogEntry::Raw { text, .. } if text.contains("no brackets"))
+        );
+        assert!(matches!(
+            &task.work_log[2],
+            WorkLogEntry::Parsed { sequence: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn test_parse_work_log_preserves_entry_with_bad_timestamp_as_raw() {
+        // An entry with an unparseable timestamp should be preserved as Raw.
+        let content = "\
+Story: S
+Task: T
+Status: OPEN
+
+## Description
+
+x
+
+## Work Log
+
+1 2026-02-10T10:00:01 [Design Agent] valid entry
+2 not-a-timestamp [Design Agent] bad timestamp
+";
+        let task = parse_task(content, path("t")).unwrap();
+        assert_eq!(task.work_log.len(), 2);
+        assert!(matches!(
+            &task.work_log[0],
+            WorkLogEntry::Parsed { sequence: 1, .. }
+        ));
+        assert!(
+            matches!(&task.work_log[1], WorkLogEntry::Raw { text, .. } if text.contains("not-a-timestamp"))
+        );
+    }
+
+    #[test]
+    fn test_parse_work_log_preserves_entry_with_unknown_agent_as_raw() {
+        // An entry with an unrecognised agent name should be preserved as Raw.
+        let content = "\
+Story: S
+Task: T
+Status: OPEN
+
+## Description
+
+x
+
+## Work Log
+
+1 2026-02-10T10:00:01 [Design Agent] valid entry
+2 2026-02-10T10:00:02 [Alien Agent] unknown agent
+";
+        let task = parse_task(content, path("t")).unwrap();
+        assert_eq!(task.work_log.len(), 2);
+        assert!(matches!(
+            &task.work_log[0],
+            WorkLogEntry::Parsed { sequence: 1, .. }
+        ));
+        assert!(
+            matches!(&task.work_log[1], WorkLogEntry::Raw { text, warning } if text.contains("Alien Agent") && warning.contains("Alien Agent"))
+        );
+    }
+
+    #[test]
+    fn test_parse_work_log_description_with_brackets_and_json() {
+        // A valid entry whose description contains JSON with [] characters should parse.
+        let content = "\
+Story: S
+Task: T
+Status: OPEN
+
+## Description
+
+x
+
+## Work Log
+
+1 2026-02-10T10:00:01 [Intake Agent] Session error: {\"error\":[{\"code\":\"invalid\"}]}
+";
+        let task = parse_task(content, path("t")).unwrap();
+        assert_eq!(task.work_log.len(), 1);
+        let WorkLogEntry::Parsed { description, .. } = &task.work_log[0] else {
+            panic!("expected Parsed entry");
+        };
+        assert!(description.contains("Session error:"));
+    }
+
+    #[test]
+    fn test_parse_work_log_raw_entry_preserves_text() {
+        // An entry with a bad sequence number should be preserved verbatim as Raw.
+        let content = "\
+Story: S
+Task: T
+Status: OPEN
+
+## Description
+
+x
+
+## Work Log
+
+1 2026-02-10T10:00:01 [Design Agent] valid entry
+not-a-number 2026-02-10T10:00:02 [Design Agent] bad seq
+";
+        let task = parse_task(content, path("t")).unwrap();
+        assert_eq!(task.work_log.len(), 2);
+        assert!(matches!(
+            &task.work_log[0],
+            WorkLogEntry::Parsed { sequence: 1, .. }
+        ));
+        let WorkLogEntry::Raw { text, warning } = &task.work_log[1] else {
+            panic!("expected Raw entry for bad sequence");
+        };
+        assert!(
+            text.contains("not-a-number"),
+            "Raw text should contain original line"
+        );
+        assert!(
+            warning.contains("bad sequence"),
+            "warning should describe the problem"
+        );
     }
 
     #[test]
