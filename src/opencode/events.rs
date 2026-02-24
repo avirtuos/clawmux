@@ -99,7 +99,11 @@ impl EventStreamConsumer {
                         backoff_secs = 1;
                     }
                     Ok(Event::Message(msg)) => {
-                        match serde_json::from_str::<OpenCodeEvent>(&msg.data) {
+                        // opencode sends the event type in the SSE `event:` field rather
+                        // than as a JSON `type` key. Inject it so our tagged enum can
+                        // dispatch correctly.
+                        let data = inject_type_field(&msg.data, &msg.event);
+                        match serde_json::from_str::<OpenCodeEvent>(&data) {
                             Ok(oc_event) => {
                                 if let Err(e) = self.handle_event(oc_event).await {
                                     warn!("Error handling SSE event: {e}");
@@ -280,6 +284,24 @@ impl EventStreamConsumer {
             .await
             .map_err(|e| ClawdMuxError::Sse(e.to_string()))
     }
+}
+
+/// Injects a `"type"` key into a JSON object string if one is not already present.
+///
+/// opencode sends the event type in the SSE `event:` protocol field rather than
+/// as a JSON key inside the body. This helper merges the SSE event name into the
+/// JSON body so that our `#[serde(tag = "type")]` enum can dispatch correctly.
+///
+/// Returns the modified JSON string, or the original string unchanged if parsing fails.
+fn inject_type_field(json_data: &str, event_type: &str) -> String {
+    if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(json_data) {
+        if let Some(obj) = v.as_object_mut() {
+            obj.entry("type")
+                .or_insert_with(|| serde_json::Value::String(event_type.to_string()));
+        }
+        return serde_json::to_string(&v).unwrap_or_else(|_| json_data.to_string());
+    }
+    json_data.to_string()
 }
 
 #[cfg(test)]
@@ -636,5 +658,36 @@ mod tests {
             consumer.accumulated_text.is_empty(),
             "accumulated_text should be cleared on SessionError"
         );
+    }
+
+    /// Verifies that inject_type_field adds the type key when it is absent.
+    #[test]
+    fn test_inject_type_field_adds_missing_key() {
+        let json = r#"{"sessionId":"s1","properties":{}}"#;
+        let result = inject_type_field(json, "SessionCreated");
+        let v: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        assert_eq!(v["type"], "SessionCreated");
+        // Original keys are preserved.
+        assert_eq!(v["sessionId"], "s1");
+    }
+
+    /// Verifies that inject_type_field does not overwrite an existing type key.
+    #[test]
+    fn test_inject_type_field_preserves_existing_key() {
+        let json = r#"{"type":"AlreadyPresent","sessionId":"s2"}"#;
+        let result = inject_type_field(json, "SessionCreated");
+        let v: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        assert_eq!(
+            v["type"], "AlreadyPresent",
+            "existing type key must not be overwritten"
+        );
+    }
+
+    /// Verifies that inject_type_field returns the original string unchanged for non-JSON input.
+    #[test]
+    fn test_inject_type_field_non_json_passthrough() {
+        let not_json = "not json at all";
+        let result = inject_type_field(not_json, "SessionCreated");
+        assert_eq!(result, not_json);
     }
 }
