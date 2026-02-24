@@ -1,7 +1,8 @@
-//! Tab 1: task markdown display, supplemental prompt input, and Q&A section.
+//! Tab 0: task metadata display, description, and supplemental prompt input.
 //!
-//! Renders the selected task's metadata and description (top), a `tui-textarea`
-//! prompt input field (middle), and the question/answer history (bottom).
+//! Renders the selected task's metadata and description (top sections) and a
+//! `tui-textarea` supplemental prompt input field (bottom). Questions have
+//! been moved to Tab 1 (questions.rs).
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -13,14 +14,10 @@ use tui_textarea::TextArea;
 use crate::tasks::models::ParseErrorInfo;
 use crate::tasks::{Task, TaskId};
 
-/// UI state for Tab 1 (Task Details).
+/// UI state for Tab 0 (Task Details).
 pub struct Tab1State {
     /// Supplemental prompt input field shown below the task description.
     pub prompt_input: TextArea<'static>,
-    /// One textarea per unanswered question (indexed to match unanswered questions in order).
-    pub answer_inputs: Vec<TextArea<'static>>,
-    /// Index into `answer_inputs` of the currently focused answer textarea, if any.
-    pub focused_answer: Option<usize>,
     /// Whether the supplemental prompt input has keyboard focus.
     pub prompt_focused: bool,
     /// The ID of the task currently displayed, used to detect task changes.
@@ -40,38 +37,16 @@ impl Tab1State {
         );
         Tab1State {
             prompt_input,
-            answer_inputs: Vec::new(),
-            focused_answer: None,
             prompt_focused: false,
             current_task_id: None,
             desc_scroll: 0,
         }
     }
 
-    /// Rebuilds `answer_inputs` to match the number of unanswered questions in `task`.
+    /// Resets all per-task UI state for `task`.
     ///
-    /// Preserves existing textareas up to the new count; appends new empty ones as needed.
-    pub fn sync_answer_inputs(&mut self, task: &Task) {
-        let unanswered_count = task.questions.iter().filter(|q| q.answer.is_none()).count();
-        self.answer_inputs.truncate(unanswered_count);
-        while self.answer_inputs.len() < unanswered_count {
-            let mut ta = TextArea::default();
-            ta.set_block(Block::default().title("Your Answer").borders(Borders::ALL));
-            self.answer_inputs.push(ta);
-        }
-        // Clamp focused_answer.
-        if let Some(idx) = self.focused_answer {
-            if idx >= unanswered_count {
-                self.focused_answer = None;
-            }
-        }
-    }
-
-    /// Resets all per-task UI state and rebuilds answer inputs for `task`.
-    ///
-    /// Clears prompt text, removes focus, rebuilds answer textareas, and
-    /// records `task.id` as the current task so subsequent navigations can
-    /// detect when the task changes.
+    /// Clears prompt text, removes focus, resets scroll, and records `task.id`
+    /// as the current task so subsequent navigations can detect when the task changes.
     pub fn reset_for_task(&mut self, task: &Task) {
         self.prompt_input = {
             let mut ta = TextArea::default();
@@ -83,9 +58,7 @@ impl Tab1State {
             ta
         };
         self.prompt_focused = false;
-        self.focused_answer = None;
         self.desc_scroll = 0;
-        self.sync_answer_inputs(task);
         self.current_task_id = Some(task.id.clone());
     }
 
@@ -122,20 +95,6 @@ impl Tab1State {
     pub fn set_prompt_unfocused_style(&mut self) {
         self.prompt_input
             .set_block(Self::unfocused_block("Supplemental Prompt"));
-    }
-
-    /// Sets the answer textarea at `idx` to the focused (yellow border) style.
-    pub fn set_answer_focused_style(&mut self, idx: usize) {
-        if let Some(ta) = self.answer_inputs.get_mut(idx) {
-            ta.set_block(Self::focused_block("Your Answer"));
-        }
-    }
-
-    /// Sets the answer textarea at `idx` to the unfocused (default border) style.
-    pub fn set_answer_unfocused_style(&mut self, idx: usize) {
-        if let Some(ta) = self.answer_inputs.get_mut(idx) {
-            ta.set_block(Self::unfocused_block("Your Answer"));
-        }
     }
 }
 
@@ -256,8 +215,7 @@ fn render_malformed_view(
 ///
 /// When no task is selected (`task` is `None`), displays a centered placeholder.
 /// When a task is malformed, delegates to [`render_malformed_view`].
-/// When a task is selected, displays metadata, description, supplemental prompt,
-/// and the question/answer section.
+/// When a task is selected, displays metadata, description, and supplemental prompt.
 pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1State) {
     let Some(task) = task else {
         let placeholder = Paragraph::new("Select a task from the list")
@@ -272,29 +230,12 @@ pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1St
         return;
     }
 
-    // Count answered vs. unanswered questions to size the questions section.
-    let answered: Vec<_> = task
-        .questions
-        .iter()
-        .filter(|q| q.answer.is_some())
-        .collect();
-    let unanswered: Vec<_> = task
-        .questions
-        .iter()
-        .filter(|q| q.answer.is_none())
-        .collect();
-
-    // Unanswered: 7 rows (2-row wrapped label + 5-row textarea).
-    // Answered: 5 rows (bordered block with 3 content rows so long Q can wrap once + A line).
-    let questions_height = (unanswered.len() * 7 + answered.len() * 5) as u16;
-
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(6), // metadata (4 lines + 2 border rows)
             Constraint::Min(2),    // description (scrollable via PgUp/PgDn)
             Constraint::Length(5), // supplemental prompt
-            Constraint::Length(questions_height.max(3)), // questions (at least 3 rows for border)
         ])
         .split(area);
 
@@ -336,88 +277,6 @@ pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1St
 
     // --- Supplemental Prompt ---
     frame.render_widget(&state.prompt_input, sections[2]);
-
-    // --- Questions ---
-    if task.questions.is_empty() {
-        let no_q = Paragraph::new("No questions.")
-            .style(Style::default().fg(Color::DarkGray))
-            .block(Block::default().title("Questions").borders(Borders::ALL));
-        frame.render_widget(no_q, sections[3]);
-        return;
-    }
-
-    // Stack questions vertically.
-    // Display order: unanswered (newest first) at top, answered (newest first) below.
-    let q_area = sections[3];
-    let mut row_constraints: Vec<Constraint> = Vec::new();
-    for _q in &unanswered {
-        row_constraints.push(Constraint::Length(7));
-    }
-    for _q in &answered {
-        row_constraints.push(Constraint::Length(5));
-    }
-    if row_constraints.is_empty() {
-        return;
-    }
-
-    let q_rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(row_constraints)
-        .split(q_area);
-
-    let mut row_idx = 0usize;
-
-    // Unanswered questions — newest first.
-    // `enumerate().rev()` preserves the original index so answer_inputs stays aligned.
-    for (answer_input_idx, q) in unanswered.iter().enumerate().rev() {
-        if row_idx >= q_rows.len() {
-            break;
-        }
-        let label = format!("Q ({}): {}", q.agent.display_name(), q.text);
-        let area = q_rows[row_idx];
-
-        // Split into 2-row wrapped label + Min(3) textarea (gets the remaining 5 rows).
-        let q_split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Min(3)])
-            .split(area);
-
-        let label_para = Paragraph::new(label)
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .wrap(ratatui::widgets::Wrap { trim: false });
-        frame.render_widget(label_para, q_split[0]);
-
-        if let Some(ta) = state.answer_inputs.get(answer_input_idx) {
-            frame.render_widget(ta, q_split[1]);
-        }
-
-        row_idx += 1;
-    }
-
-    // Answered questions — newest first.
-    // Bordered block with 3 content rows: long Q text can wrap once, A text below.
-    for q in answered.iter().rev() {
-        if row_idx >= q_rows.len() {
-            break;
-        }
-        let answer_text = q.answer.as_deref().unwrap_or("");
-        let agent_label = format!("Q ({}): ", q.agent.display_name());
-        let lines = vec![
-            Line::from(vec![
-                Span::styled(agent_label, Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(q.text.clone()),
-            ]),
-            Line::from(vec![
-                Span::styled("A: ", Style::default().fg(Color::Green)),
-                Span::raw(answer_text.to_string()),
-            ]),
-        ];
-        let para = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL))
-            .wrap(ratatui::widgets::Wrap { trim: false });
-        frame.render_widget(para, q_rows[row_idx]);
-        row_idx += 1;
-    }
 }
 
 #[cfg(test)]
@@ -452,9 +311,6 @@ mod tests {
     #[test]
     fn test_tab1_state_new() {
         let state = Tab1State::new();
-        // Prompt textarea should be empty (no lines of content beyond the initial empty line).
-        assert!(state.answer_inputs.is_empty());
-        assert!(state.focused_answer.is_none());
         assert!(!state.prompt_focused);
         assert!(state.current_task_id.is_none());
         assert_eq!(state.desc_scroll, 0);
@@ -493,37 +349,15 @@ mod tests {
 
     #[test]
     fn test_tab1_state_reset_for_task() {
-        use crate::tasks::models::{Question, TaskStatus};
-        use crate::workflow::agents::AgentKind;
-
         let mut state = Tab1State::new();
-        // Set some pre-existing state that should be cleared.
         state.prompt_focused = true;
-        state.focused_answer = Some(0);
 
-        let mut task = make_task("desc");
-        task.questions.push(Question {
-            agent: AgentKind::Intake,
-            text: "What is the scope?".to_string(),
-            answer: None,
-        });
-        task.questions.push(Question {
-            agent: AgentKind::Design,
-            text: "Answered already?".to_string(),
-            answer: Some("Yes".to_string()),
-        });
-
+        let task = make_task("desc");
         state.reset_for_task(&task);
 
-        // prompt cleared.
         assert!(!state.prompt_focused);
-        // focus cleared.
-        assert!(state.focused_answer.is_none());
-        // One unanswered question -> one answer textarea.
-        assert_eq!(state.answer_inputs.len(), 1);
-        // current_task_id set to the task's id.
         assert_eq!(state.current_task_id, Some(task.id.clone()));
-        // Status field is not relevant to this test.
+        assert_eq!(state.desc_scroll, 0);
         let _ = TaskStatus::Open;
     }
 
@@ -548,33 +382,6 @@ mod tests {
         assert!(
             content.contains("Select a task from the list"),
             "Buffer should contain placeholder text, got: {content:?}"
-        );
-    }
-
-    #[test]
-    fn test_task_details_questions_section_visible_24_rows() {
-        // In a 24-row terminal the questions section must be allocated at least 3 rows
-        // (enough for a bordered block) even when the task has no questions.
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let task = make_task("desc");
-        let state = Tab1State::new();
-
-        terminal
-            .draw(|frame| {
-                render(frame, frame.area(), Some(&task), &state);
-            })
-            .unwrap();
-
-        let buf = terminal.backend().buffer().clone();
-        let content: String = buf
-            .content()
-            .iter()
-            .map(|cell| cell.symbol().to_string())
-            .collect();
-        assert!(
-            content.contains("Questions") || content.contains("No questions"),
-            "Questions section should be visible in a 24-row terminal, got: {content:?}"
         );
     }
 
@@ -755,6 +562,38 @@ mod tests {
         assert!(
             content.contains("Press 'f' to retry"),
             "should show retry hint; got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn test_task_details_no_questions_section() {
+        // The details tab no longer shows questions -- verify by checking that
+        // no "Questions" or "Your Answer" label appears in the rendered output.
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut task = make_task("desc");
+        task.questions.push(crate::tasks::models::Question {
+            agent: crate::workflow::agents::AgentKind::Intake,
+            text: "What is scope?".to_string(),
+            answer: None,
+        });
+        let state = Tab1State::new();
+
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), Some(&task), &state);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect();
+        assert!(
+            !content.contains("Your Answer"),
+            "details tab should not show answer textarea; got: {content:?}"
         );
     }
 }

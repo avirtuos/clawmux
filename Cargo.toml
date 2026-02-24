@@ -49,6 +49,9 @@ tracing-appender = "0.2"
 # Async utilities
 futures-util = "0.3"
 
+# Markdown parsing (for Agent Activity rendering)
+pulldown-cmark = "0.12"
+
 # Error handling
 thiserror = "1"
 

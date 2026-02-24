@@ -15,6 +15,7 @@ use crate::tasks::models::{status_to_index, Question, SuggestedFix, TaskStatus, 
 use crate::tasks::{Story, TaskId, TaskStore};
 use crate::tui::tabs::agent_activity::Tab2State;
 use crate::tui::tabs::code_review::Tab4State;
+use crate::tui::tabs::questions::QuestionsTabState;
 use crate::tui::tabs::task_details::Tab1State;
 use crate::tui::tabs::team_status::Tab3State;
 use crate::tui::task_list::TaskListState;
@@ -43,8 +44,10 @@ pub struct App {
     pub show_status_picker: Option<usize>,
     /// Navigation and expansion state for the left-pane task list widget.
     pub task_list_state: TaskListState,
-    /// UI state for Tab 1 (Task Details): prompt input, answer inputs, focus flags.
+    /// UI state for Tab 0 (Task Details): prompt input and focus flags.
     pub tab1_state: Tab1State,
+    /// UI state for Tab 1 (Questions): question navigation and answer inputs.
+    pub questions_state: QuestionsTabState,
     /// UI state for Tab 2 (Agent Activity): per-task activity lines and scroll.
     pub tab2_state: Tab2State,
     /// Pure state machine driving tasks through the 7-agent pipeline.
@@ -92,6 +95,7 @@ impl App {
             show_status_picker: None,
             task_list_state,
             tab1_state: Tab1State::new(),
+            questions_state: QuestionsTabState::new(),
             tab2_state: Tab2State::new(),
             workflow_engine: WorkflowEngine::new(),
             tab3_state: Tab3State::new(),
@@ -422,7 +426,7 @@ impl App {
                 msgs
             }
 
-            // --- HumanAnswered: show answer in activity tab then forward to engine ---
+            // --- HumanAnswered: show answer in activity tab, record on question, forward to engine ---
             AppMessage::HumanAnswered {
                 task_id,
                 question_index,
@@ -430,11 +434,24 @@ impl App {
             } => {
                 self.tab2_state
                     .push_banner(&task_id, format!("[You] {}", answer));
-                self.workflow_engine.process(AppMessage::HumanAnswered {
-                    task_id,
+                // Record the answer on the question model.
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    if let Some(q) = task.questions.get_mut(question_index) {
+                        q.answer = Some(answer.clone());
+                    }
+                }
+                // Rebuild answer textareas so the answered question's textarea is removed.
+                if let Some(task) = self.task_store.get(&task_id) {
+                    let task = task.clone();
+                    self.questions_state.sync_answer_inputs(&task);
+                }
+                let mut msgs = self.workflow_engine.process(AppMessage::HumanAnswered {
+                    task_id: task_id.clone(),
                     question_index,
                     answer,
-                })
+                });
+                msgs.push(AppMessage::TaskUpdated { task_id });
+                msgs
             }
 
             // --- Workflow messages: forward to engine ---
@@ -798,6 +815,9 @@ impl App {
             // --- Diff storage ---
             AppMessage::DiffReady { task_id, diffs } => {
                 self.tab4_state.set_diffs(&task_id, diffs);
+                self.tab4_state.set_displayed_task(Some(&task_id));
+                self.tab4_state.reset_for_diffs();
+                self.active_tab = 4;
                 vec![]
             }
         }
@@ -1561,6 +1581,142 @@ mod tests {
             )),
             "expected a [You] banner in Tab2 lines: {:?}",
             lines
+        );
+    }
+
+    /// Verifies that HumanAnswered calls sync_answer_inputs, reducing answer_inputs by 1.
+    #[test]
+    fn test_human_answered_syncs_answer_inputs() {
+        use crate::tasks::models::{Question, Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: None,
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: vec![
+                Question {
+                    agent: AgentKind::Intake,
+                    text: "Q1?".to_string(),
+                    answer: None,
+                },
+                Question {
+                    agent: AgentKind::Intake,
+                    text: "Q2?".to_string(),
+                    answer: None,
+                },
+            ],
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+        // Initialize answer_inputs for the two unanswered questions.
+        if let Some(t) = app.task_store.get(&task_id) {
+            let t = t.clone();
+            app.questions_state.sync_answer_inputs(&t);
+        }
+        assert_eq!(app.questions_state.answer_inputs.len(), 2);
+
+        app.workflow_engine.process(AppMessage::StartTask {
+            task_id: task_id.clone(),
+        });
+        app.handle_message(AppMessage::HumanAnswered {
+            task_id: task_id.clone(),
+            question_index: 0,
+            answer: "answer to Q1".to_string(),
+        });
+
+        assert_eq!(
+            app.questions_state.answer_inputs.len(),
+            1,
+            "answer_inputs should decrease by 1 after answering one question"
+        );
+    }
+
+    /// Verifies that HumanAnswered records the answer on the question model.
+    #[test]
+    fn test_human_answered_records_answer_on_question() {
+        use crate::tasks::models::{Question, Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: None,
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: vec![Question {
+                agent: AgentKind::Intake,
+                text: "What is the scope?".to_string(),
+                answer: None,
+            }],
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+        app.workflow_engine.process(AppMessage::StartTask {
+            task_id: task_id.clone(),
+        });
+
+        app.handle_message(AppMessage::HumanAnswered {
+            task_id: task_id.clone(),
+            question_index: 0,
+            answer: "Minimal scope.".to_string(),
+        });
+
+        let task = app.task_store.get(&task_id).expect("task should exist");
+        assert_eq!(
+            task.questions[0].answer,
+            Some("Minimal scope.".to_string()),
+            "question.answer should be recorded after HumanAnswered"
+        );
+    }
+
+    /// Verifies that DiffReady stores diffs, switches to Tab 4, and resets navigation.
+    #[test]
+    fn test_handle_diff_ready_switches_to_review_tab() {
+        use crate::opencode::types::{DiffStatus, FileDiff};
+
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+        assert_eq!(app.active_tab, 0, "starts on Tab 0");
+
+        let diffs = vec![FileDiff {
+            path: "src/foo.rs".to_string(),
+            status: DiffStatus::Modified,
+            hunks: vec![],
+        }];
+        let msgs = app.handle_message(AppMessage::DiffReady {
+            task_id: task_id.clone(),
+            diffs,
+        });
+
+        assert!(msgs.is_empty());
+        assert_eq!(app.active_tab, 4, "should switch to Tab 4 (Review)");
+        assert_eq!(
+            app.tab4_state.diffs_for(&task_id).len(),
+            1,
+            "diffs should be stored"
+        );
+        assert_eq!(
+            app.tab4_state.selected_file, 0,
+            "file selection should reset to 0"
         );
     }
 

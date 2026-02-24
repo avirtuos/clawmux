@@ -303,6 +303,21 @@ impl Tab2State {
             .unwrap_or_default()
     }
 
+    /// Returns a thinking status string for any task currently awaiting a response.
+    ///
+    /// Scans all tasks in the awaiting state and returns a formatted string for the
+    /// first one found, or `None` if no tasks are awaiting. Intended for display in
+    /// the global footer so the user knows an agent is working regardless of active tab.
+    pub fn any_thinking_status(&self) -> Option<String> {
+        for (task_id, sent_at) in &self.prompt_sent_at {
+            if let Some(agent_name) = self.active_agent.get(task_id) {
+                let elapsed = sent_at.elapsed().as_secs();
+                return Some(format!("{} is thinking... ({}s)", agent_name, elapsed));
+            }
+        }
+        None
+    }
+
     /// Enables follow-tail mode so the next render tracks the bottom of the buffer.
     fn scroll_to_bottom(&mut self, _task_id: &TaskId) {
         self.follow_tail = true;
@@ -313,6 +328,136 @@ impl Default for Tab2State {
     fn default() -> Self {
         Tab2State::new()
     }
+}
+
+/// Converts a markdown string into styled ratatui [`Line`]s.
+///
+/// Uses `pulldown-cmark` to parse the input and applies ratatui styles:
+/// - Bold (`**text**`) → [`Modifier::BOLD`]
+/// - Italic (`*text*`) → [`Modifier::ITALIC`]
+/// - Inline code (`` `code` ``) → cyan text
+/// - Code blocks → dark gray text, split on newlines
+/// - Headings → bold + color (H1=Cyan, H2=Blue, other=LightBlue)
+/// - Soft/hard breaks → new [`Line`]
+/// - List items → `- ` prefix
+///
+/// Returns a `Vec<Line<'static>>` suitable for rendering with ratatui's [`Paragraph`].
+fn markdown_to_lines(input: &str) -> Vec<Line<'static>> {
+    use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut bold = false;
+    let mut italic = false;
+    let mut in_code_block = false;
+    let mut heading_color: Option<Color> = None;
+    let mut list_depth: usize = 0;
+
+    let parser = Parser::new_ext(input, Options::empty());
+
+    for event in parser {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                bold = true;
+                heading_color = Some(match level {
+                    HeadingLevel::H1 => Color::Cyan,
+                    HeadingLevel::H2 => Color::Blue,
+                    _ => Color::LightBlue,
+                });
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                lines.push(Line::from(std::mem::take(&mut current_spans)));
+                lines.push(Line::from(""));
+                bold = false;
+                heading_color = None;
+            }
+            Event::Start(Tag::Paragraph) => {}
+            Event::End(TagEnd::Paragraph) => {
+                if !current_spans.is_empty() {
+                    lines.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                lines.push(Line::from(""));
+            }
+            Event::Start(Tag::Strong) => {
+                bold = true;
+            }
+            Event::End(TagEnd::Strong) => {
+                bold = false;
+            }
+            Event::Start(Tag::Emphasis) => {
+                italic = true;
+            }
+            Event::End(TagEnd::Emphasis) => {
+                italic = false;
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                in_code_block = true;
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if !current_spans.is_empty() {
+                    lines.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                lines.push(Line::from(""));
+                in_code_block = false;
+            }
+            Event::Code(text) => {
+                // Inline code span.
+                let style = Style::default().fg(Color::Cyan);
+                current_spans.push(Span::styled(format!("`{}`", text.as_ref()), style));
+            }
+            Event::Start(Tag::List(_)) => {
+                list_depth += 1;
+            }
+            Event::End(TagEnd::List(_)) => {
+                list_depth = list_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::Item) => {
+                let indent = "  ".repeat(list_depth.saturating_sub(1));
+                current_spans.push(Span::raw(format!("{}- ", indent)));
+            }
+            Event::End(TagEnd::Item) => {
+                if !current_spans.is_empty() {
+                    lines.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+            }
+            Event::Text(text) => {
+                let mut style = Style::default();
+                if bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if italic {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                if let Some(color) = heading_color {
+                    style = style.fg(color);
+                }
+                if in_code_block {
+                    style = style.fg(Color::DarkGray);
+                    // Code block text may contain embedded newlines; split into separate lines.
+                    for (i, segment) in text.as_ref().split('\n').enumerate() {
+                        if i > 0 {
+                            lines.push(Line::from(std::mem::take(&mut current_spans)));
+                        }
+                        if !segment.is_empty() {
+                            current_spans.push(Span::styled(segment.to_string(), style));
+                        }
+                    }
+                } else {
+                    current_spans.push(Span::styled(text.to_string(), style));
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                lines.push(Line::from(std::mem::take(&mut current_spans)));
+            }
+            _ => {}
+        }
+    }
+
+    if !current_spans.is_empty() {
+        lines.push(Line::from(current_spans));
+    }
+
+    lines
 }
 
 /// Computes the total number of visual (wrapped) lines for `lines` at a given `width`.
@@ -360,9 +505,9 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
     let activity_lines = state.lines_for(task_id);
     let mut lines: Vec<Line> = activity_lines
         .into_iter()
-        .map(|line| match line {
-            ActivityLine::Text { content } => Line::from(content),
-            ActivityLine::ToolActivity { tool, status } => Line::from(vec![
+        .flat_map(|line| match line {
+            ActivityLine::Text { content } => markdown_to_lines(&content),
+            ActivityLine::ToolActivity { tool, status } => vec![Line::from(vec![
                 Span::styled(
                     format!("[{tool}]"),
                     Style::default()
@@ -371,13 +516,13 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
                 ),
                 Span::raw(" "),
                 Span::styled(status, Style::default().fg(Color::Yellow)),
-            ]),
-            ActivityLine::AgentBanner { message } => Line::from(Span::styled(
+            ])],
+            ActivityLine::AgentBanner { message } => vec![Line::from(Span::styled(
                 message,
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
-            )),
+            ))],
         })
         .collect();
 
@@ -792,6 +937,94 @@ mod tests {
         assert!(
             state.follow_tail,
             "scroll_down past max should re-enable follow_tail"
+        );
+    }
+
+    /// Verifies that `**bold**` markdown produces a span with the BOLD modifier.
+    #[test]
+    fn test_markdown_bold_produces_bold_span() {
+        let lines = markdown_to_lines("**bold**");
+        let has_bold = lines.iter().any(|line| {
+            line.spans.iter().any(|span| {
+                span.style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            })
+        });
+        assert!(
+            has_bold,
+            "**bold** should produce a span with BOLD modifier; lines: {lines:?}"
+        );
+    }
+
+    /// Verifies that two lines separated by a newline produce at least 2 non-empty Lines.
+    #[test]
+    fn test_markdown_multiline_splits_lines() {
+        let lines = markdown_to_lines("line1\nline2");
+        let non_empty: Vec<_> = lines.iter().filter(|l| l.width() > 0).collect();
+        assert!(
+            non_empty.len() >= 2,
+            "should produce at least 2 non-empty lines from 'line1\\nline2'; got {} total: {lines:?}",
+            lines.len()
+        );
+    }
+
+    /// Verifies that plain text passes through without losing content.
+    #[test]
+    fn test_markdown_plain_text_passthrough() {
+        let lines = markdown_to_lines("hello world");
+        assert!(!lines.is_empty(), "should produce at least one line");
+        let found = lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("hello world")));
+        assert!(
+            found,
+            "plain text 'hello world' should appear in output; lines: {lines:?}"
+        );
+    }
+
+    /// Verifies that `any_thinking_status` returns None when no task is awaiting.
+    #[test]
+    fn test_any_thinking_status_none_by_default() {
+        let state = Tab2State::new();
+        assert!(
+            state.any_thinking_status().is_none(),
+            "any_thinking_status should be None when no task is awaiting"
+        );
+    }
+
+    /// Verifies that `any_thinking_status` returns a formatted string after set_awaiting_response.
+    #[test]
+    fn test_any_thinking_status_returns_agent_after_set_awaiting() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.set_awaiting_response(&id, "Intake Agent".to_string());
+        let status = state.any_thinking_status();
+        assert!(
+            status.is_some(),
+            "should have a thinking status after set_awaiting_response"
+        );
+        let status = status.unwrap();
+        assert!(
+            status.contains("Intake Agent"),
+            "status should contain the agent name: {status}"
+        );
+        assert!(
+            status.contains("is thinking..."),
+            "status should contain 'is thinking...': {status}"
+        );
+    }
+
+    /// Verifies that `any_thinking_status` returns None after clear_awaiting.
+    #[test]
+    fn test_any_thinking_status_clears_after_clear_awaiting() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.set_awaiting_response(&id, "Intake Agent".to_string());
+        state.clear_awaiting(&id);
+        assert!(
+            state.any_thinking_status().is_none(),
+            "any_thinking_status should be None after clear_awaiting"
         );
     }
 
