@@ -172,10 +172,21 @@ pub fn render(
         task.work_log
             .iter()
             .rev()
-            .map(|entry| {
-                let ts = entry.timestamp.format("%Y-%m-%d %H:%M").to_string();
-                let agent = entry.agent.display_name();
-                Line::from(format!("[{ts}] [{agent}] {}", entry.description))
+            .map(|entry| match entry {
+                crate::tasks::models::WorkLogEntry::Parsed {
+                    timestamp,
+                    agent,
+                    description,
+                    ..
+                } => {
+                    let ts = timestamp.format("%Y-%m-%d %H:%M").to_string();
+                    let agent_name = agent.display_name();
+                    Line::from(format!("[{ts}] [{agent_name}] {description}"))
+                }
+                crate::tasks::models::WorkLogEntry::Raw { text, .. } => Line::from(vec![
+                    Span::styled("[!] ", Style::default().fg(Color::Yellow)),
+                    Span::styled(text.clone(), Style::default().fg(Color::DarkGray)),
+                ]),
             })
             .collect()
     };
@@ -339,13 +350,13 @@ mod tests {
         let ts1 = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2024, 1, 16, 14, 0, 0).unwrap();
         let task = make_task(vec![
-            WorkLogEntry {
+            WorkLogEntry::Parsed {
                 sequence: 1,
                 timestamp: ts1,
                 agent: AgentKind::Intake,
                 description: "Gathered requirements".to_string(),
             },
-            WorkLogEntry {
+            WorkLogEntry::Parsed {
                 sequence: 2,
                 timestamp: ts2,
                 agent: AgentKind::Design,
@@ -487,6 +498,49 @@ mod tests {
         assert_eq!(
             state.scroll_offset, 0,
             "scroll should reset on different task"
+        );
+    }
+
+    #[test]
+    fn test_work_log_raw_entry_rendered_with_warning() {
+        use chrono::{TimeZone, Utc};
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let ts = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let task = make_task(vec![
+            WorkLogEntry::Parsed {
+                sequence: 1,
+                timestamp: ts,
+                agent: AgentKind::Intake,
+                description: "Normal entry".to_string(),
+            },
+            WorkLogEntry::Raw {
+                text: "3 bad-ts [Alien Agent] weird line".to_string(),
+                warning: "bad timestamp".to_string(),
+            },
+        ]);
+
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), Some(&task), None, &Tab3State::new());
+            })
+            .unwrap();
+
+        let content = buf_content(&terminal);
+        // Parsed entry should appear normally.
+        assert!(
+            content.contains("Normal entry"),
+            "parsed entry should be rendered; got: {content}"
+        );
+        // Raw entry should appear with [!] prefix and original text.
+        assert!(
+            content.contains("[!]"),
+            "raw entry should have [!] prefix; got: {content}"
+        );
+        assert!(
+            content.contains("3 bad-ts"),
+            "raw entry text should be rendered; got: {content}"
         );
     }
 }

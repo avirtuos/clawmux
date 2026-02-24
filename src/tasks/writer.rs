@@ -90,17 +90,30 @@ pub fn write_task(task: &Task) -> crate::error::Result<String> {
     if !task.work_log.is_empty() {
         out.push_str("## Work Log\n\n");
         for entry in &task.work_log {
-            out.push_str(
-                format!(
-                    "{} {} [{}] {}",
-                    entry.sequence,
-                    entry.timestamp.to_rfc3339(),
-                    entry.agent.display_name(),
-                    entry.description
-                )
-                .trim_end(),
-            );
-            out.push('\n');
+            match entry {
+                crate::tasks::models::WorkLogEntry::Parsed {
+                    sequence,
+                    timestamp,
+                    agent,
+                    description,
+                } => {
+                    out.push_str(
+                        format!(
+                            "{} {} [{}] {}",
+                            sequence,
+                            timestamp.to_rfc3339(),
+                            agent.display_name(),
+                            description
+                        )
+                        .trim_end(),
+                    );
+                    out.push('\n');
+                }
+                crate::tasks::models::WorkLogEntry::Raw { text, .. } => {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+            }
         }
         out.push('\n'); // blank line to close section
     }
@@ -220,7 +233,7 @@ A1: Lets use rust, it is well suited to this.
             }],
             design: Some("Design notes.".to_string()),
             implementation_plan: Some("Plan notes.".to_string()),
-            work_log: vec![WorkLogEntry {
+            work_log: vec![WorkLogEntry::Parsed {
                 sequence: 1,
                 timestamp: ts,
                 agent: AgentKind::Design,
@@ -297,11 +310,45 @@ bar content
             raw_content: "bad content".to_string(),
             suggested_fix: None,
             fix_in_progress: false,
+            fix_error: None,
         });
         let result = write_task(&task);
         assert!(
             result.is_err(),
             "write_task should refuse to write a malformed task"
+        );
+    }
+
+    #[test]
+    fn test_write_raw_work_log_entry() {
+        let mut task = minimal_task();
+        task.work_log = vec![
+            WorkLogEntry::Parsed {
+                sequence: 1,
+                timestamp: chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                agent: AgentKind::Design,
+                description: "Normal entry.".to_string(),
+            },
+            WorkLogEntry::Raw {
+                text: "this line could not be parsed".to_string(),
+                warning: "bad sequence number: 'this'".to_string(),
+            },
+        ];
+
+        let out = write_task(&task).unwrap();
+        assert!(out.contains("## Work Log"), "should have Work Log section");
+        assert!(
+            out.contains("[Design Agent] Normal entry."),
+            "parsed entry should be formatted normally"
+        );
+        assert!(
+            out.contains("this line could not be parsed"),
+            "raw entry text should be written verbatim"
+        );
+        // The raw warning should NOT appear in the output (it's metadata, not file content).
+        assert!(
+            !out.contains("bad sequence number"),
+            "raw warning should not appear in output"
         );
     }
 

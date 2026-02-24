@@ -268,7 +268,7 @@ pub(crate) fn configure_provider_from_reader<R: BufRead, W: Write>(
 ///
 /// All paths are created only if absent, except agent definition files which
 /// are also overwritten when `args.reset_agents` is `true`.
-fn scaffold_project(project_root: &Path, args: &InitArgs) -> Result<()> {
+pub(crate) fn scaffold_project(project_root: &Path, args: &InitArgs) -> Result<()> {
     tracing::info!("scaffolding project");
 
     // .clawdmux/config.toml

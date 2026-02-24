@@ -82,10 +82,15 @@ pub enum AppMessage {
         session_id: String,
         prompt: String,
     },
-    /// Carries incremental message parts streamed from an agent session.
+    /// Carries the current message parts streamed from an agent session.
+    ///
+    /// `parts` contains the **full current state** of the message (not a delta).
+    /// The `message_id` field identifies which message is being updated so that
+    /// the UI can replace previous content rather than append duplicates.
     StreamingUpdate {
         task_id: TaskId,
         session_id: String,
+        message_id: String,
         parts: Vec<MessagePart>,
     },
     /// Reports a tool invocation status update within a session.
@@ -94,6 +99,19 @@ pub enum AppMessage {
         session_id: String,
         tool: String,
         status: String,
+    },
+    /// Confirms that a prompt was successfully sent to an active session.
+    PromptSent { task_id: TaskId, session_id: String },
+    /// Signals that a session was found idle during periodic liveness polling.
+    ///
+    /// Dispatched by the Tick-driven status poll. The `App` handler guards
+    /// against false positives by checking that the workflow engine still has
+    /// this exact session active in the Running phase.
+    VerifySessionIdle {
+        task_id: TaskId,
+        session_id: String,
+        /// Enriched error message from message listing, or a default.
+        error: String,
     },
     /// Signals that a session has finished processing.
     SessionCompleted {

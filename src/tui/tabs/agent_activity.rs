@@ -4,7 +4,9 @@
 //! activity indicators, and agent reasoning text. Replaces PTY-based terminal
 //! emulation with structured streaming text display.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -15,6 +17,9 @@ use ratatui::Frame;
 use crate::opencode::types::MessagePart;
 use crate::tasks::TaskId;
 
+/// Maximum number of buffer entries per task before old entries are trimmed.
+const MAX_BUFFER_ENTRIES: usize = 500;
+
 /// A single line of activity in the agent activity tab.
 #[derive(Debug, Clone)]
 pub enum ActivityLine {
@@ -22,138 +27,285 @@ pub enum ActivityLine {
     Text { content: String },
     /// A tool invocation status update.
     ToolActivity { tool: String, status: String },
-    #[allow(dead_code)]
     /// A banner message from the agent (e.g. session start/complete).
-    // TODO: Task 7.x -- wire on CreateSession/AgentCompleted
     AgentBanner { message: String },
+}
+
+/// An entry in a task's per-task activity buffer.
+///
+/// Message entries are keyed by `message_id` and replaced in place when a new
+/// `StreamingUpdate` arrives for the same message (because opencode sends the
+/// full accumulated text on every update, not a delta). Tool entries are
+/// discrete events that are always appended.
+#[derive(Debug, Clone)]
+enum BufferEntry {
+    /// Streaming message content; replaced on each update for the same id.
+    Message {
+        id: String,
+        lines: Vec<ActivityLine>,
+    },
+    /// A discrete tool activity event; always appended, never replaced.
+    Tool(ActivityLine),
+    /// A banner lifecycle event; always appended, never replaced.
+    Banner(ActivityLine),
 }
 
 /// UI state for Tab 2 (Agent Activity).
 ///
-/// Buffers per-task activity lines and manages scroll position for the
-/// currently displayed task.
+/// Buffers per-task activity and manages scroll position for the currently
+/// displayed task. Each streaming message is stored as a single replaceable
+/// slot keyed by `message_id`, so subsequent updates show the current state
+/// rather than accumulating duplicate lines.
+///
+/// Scroll is managed via a follow-tail mode: when `follow_tail` is `true` the
+/// viewport automatically tracks the bottom of the buffer. Scrolling up disables
+/// follow-tail; scrolling back down to the bottom re-enables it.
 pub struct Tab2State {
-    /// Per-task activity line buffers.
-    lines: HashMap<TaskId, Vec<ActivityLine>>,
-    /// Vertical scroll offset for the currently displayed task.
+    /// Per-task ordered buffer of message slots and tool events.
+    buffers: HashMap<TaskId, Vec<BufferEntry>>,
+    /// Saved scroll offset used when `follow_tail` is false.
     scroll_offset: usize,
+    /// When `true`, the viewport tracks the bottom of the buffer (auto-scroll).
+    follow_tail: bool,
+    /// Maximum scroll offset from the last render, used for scroll clamping.
+    ///
+    /// Uses `Cell` for interior mutability so `render()` can update it through `&self`.
+    last_max_scroll: Cell<usize>,
     /// The task currently displayed in the viewport.
     current_task_id: Option<TaskId>,
+    /// Tracks when the prompt was sent for each task, for elapsed-time display.
+    prompt_sent_at: HashMap<TaskId, Instant>,
+    /// The currently active agent name per task, shown in the status line.
+    active_agent: HashMap<TaskId, String>,
 }
 
 impl Tab2State {
     /// Creates a new `Tab2State` with empty buffers and no task selected.
     pub fn new() -> Self {
         Tab2State {
-            lines: HashMap::new(),
+            buffers: HashMap::new(),
             scroll_offset: 0,
+            follow_tail: true,
+            last_max_scroll: Cell::new(0),
             current_task_id: None,
+            prompt_sent_at: HashMap::new(),
+            active_agent: HashMap::new(),
         }
     }
 
-    /// Converts `parts` to `ActivityLine` entries and appends them to the buffer for `task_id`.
+    /// Updates the streaming content for a message within `task_id`'s buffer.
     ///
-    /// Automatically scrolls to the bottom if the task is currently displayed.
+    /// Because opencode sends the **full accumulated text** of a message with
+    /// every `message.updated` SSE event, this method replaces the existing
+    /// entry for `message_id` rather than appending to it. If no entry exists
+    /// yet, a new slot is appended.
+    ///
     /// `MessagePart::Unknown` parts are silently skipped.
-    pub fn push_streaming(&mut self, task_id: &TaskId, parts: &[MessagePart]) {
-        let buffer = self.lines.entry(task_id.clone()).or_default();
-        for part in parts {
-            match part {
-                MessagePart::Text { text } => {
-                    buffer.push(ActivityLine::Text {
-                        content: text.clone(),
-                    });
-                }
-                MessagePart::Reasoning { text } => {
-                    buffer.push(ActivityLine::Text {
-                        content: text.clone(),
-                    });
-                }
-                MessagePart::File { path, .. } => {
-                    buffer.push(ActivityLine::Text {
-                        content: format!("[File: {path}]"),
-                    });
-                }
-                MessagePart::Tool { name, .. } => {
-                    buffer.push(ActivityLine::ToolActivity {
-                        tool: name.clone(),
-                        status: "called".to_string(),
-                    });
-                }
-                MessagePart::Unknown => {}
+    /// Automatically scrolls to the bottom if the task is currently displayed.
+    pub fn push_streaming(&mut self, task_id: &TaskId, message_id: &str, parts: &[MessagePart]) {
+        let new_lines: Vec<ActivityLine> = parts
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::Text { text } => Some(ActivityLine::Text {
+                    content: text.clone(),
+                }),
+                MessagePart::Reasoning { text } => Some(ActivityLine::Text {
+                    content: text.clone(),
+                }),
+                MessagePart::File { path, .. } => Some(ActivityLine::Text {
+                    content: format!("[File: {path}]"),
+                }),
+                MessagePart::Tool { name, .. } => Some(ActivityLine::ToolActivity {
+                    tool: name.clone(),
+                    status: "called".to_string(),
+                }),
+                MessagePart::Unknown => None,
+            })
+            .collect();
+
+        let buffer = self.buffers.entry(task_id.clone()).or_default();
+        // Replace in place if this message_id is already in the buffer.
+        if let Some(entry) = buffer
+            .iter_mut()
+            .find(|e| matches!(e, BufferEntry::Message { id, .. } if id == message_id))
+        {
+            if let BufferEntry::Message { lines, .. } = entry {
+                *lines = new_lines;
             }
+        } else {
+            buffer.push(BufferEntry::Message {
+                id: message_id.to_string(),
+                lines: new_lines,
+            });
         }
+
+        self.trim_buffer(task_id);
         if self.current_task_id.as_ref() == Some(task_id) {
             self.scroll_to_bottom(task_id);
         }
     }
 
-    /// Appends a `ToolActivity` line for `task_id`.
+    /// Appends a discrete `ToolActivity` line for `task_id`.
     ///
+    /// Tool activity events are always appended (never deduplicated).
     /// Automatically scrolls to the bottom if the task is currently displayed.
     pub fn push_tool(&mut self, task_id: &TaskId, tool: String, status: String) {
-        let buffer = self.lines.entry(task_id.clone()).or_default();
-        buffer.push(ActivityLine::ToolActivity { tool, status });
+        let buffer = self.buffers.entry(task_id.clone()).or_default();
+        buffer.push(BufferEntry::Tool(ActivityLine::ToolActivity {
+            tool,
+            status,
+        }));
+        self.trim_buffer(task_id);
         if self.current_task_id.as_ref() == Some(task_id) {
             self.scroll_to_bottom(task_id);
+        }
+    }
+
+    /// Appends a lifecycle banner line for `task_id`.
+    ///
+    /// Banner events are always appended (never deduplicated).
+    /// Automatically scrolls to the bottom if the task is currently displayed.
+    pub fn push_banner(&mut self, task_id: &TaskId, message: String) {
+        let buffer = self.buffers.entry(task_id.clone()).or_default();
+        buffer.push(BufferEntry::Banner(ActivityLine::AgentBanner { message }));
+        self.trim_buffer(task_id);
+        if self.current_task_id.as_ref() == Some(task_id) {
+            self.scroll_to_bottom(task_id);
+        }
+    }
+
+    /// Records that a prompt was sent for `task_id` by `agent_name`, starting the elapsed timer.
+    ///
+    /// Call this after a prompt has been successfully dispatched so the status line
+    /// shows the elapsed wait time.
+    pub fn set_awaiting_response(&mut self, task_id: &TaskId, agent_name: String) {
+        self.prompt_sent_at.insert(task_id.clone(), Instant::now());
+        self.active_agent.insert(task_id.clone(), agent_name);
+    }
+
+    /// Clears the "awaiting response" state for `task_id`.
+    ///
+    /// Call this on the first `StreamingUpdate` or on session completion/error so the
+    /// elapsed status line disappears.
+    pub fn clear_awaiting(&mut self, task_id: &TaskId) {
+        self.prompt_sent_at.remove(task_id);
+        self.active_agent.remove(task_id);
+    }
+
+    /// Returns task IDs whose awaiting state has exceeded `timeout`.
+    ///
+    /// A task enters the awaiting state via [`set_awaiting_response`] and exits
+    /// via [`clear_awaiting`]. Sessions that fail silently (OpenCode drops the
+    /// error without emitting a `session.error` SSE event) will accumulate
+    /// elapsed time indefinitely. Callers should call [`clear_awaiting`] and
+    /// emit a [`crate::messages::AppMessage::SessionError`] for each returned ID.
+    pub fn check_timeouts(&self, timeout: Duration) -> Vec<TaskId> {
+        self.prompt_sent_at
+            .iter()
+            .filter(|(_, sent_at)| sent_at.elapsed() > timeout)
+            .map(|(task_id, _)| task_id.clone())
+            .collect()
+    }
+
+    /// Returns a live elapsed-time status string for `task_id`, if awaiting a response.
+    ///
+    /// Returns `None` if the task is not currently waiting for a response.
+    pub fn elapsed_status(&self, task_id: &TaskId) -> Option<String> {
+        match (
+            self.prompt_sent_at.get(task_id),
+            self.active_agent.get(task_id),
+        ) {
+            (Some(sent_at), Some(agent)) => {
+                let elapsed = sent_at.elapsed().as_secs();
+                Some(format!("{}: waiting for response... ({}s)", agent, elapsed))
+            }
+            _ => None,
+        }
+    }
+
+    /// Trims the buffer for `task_id` to at most `MAX_BUFFER_ENTRIES`, removing the oldest entries.
+    fn trim_buffer(&mut self, task_id: &TaskId) {
+        if let Some(buffer) = self.buffers.get_mut(task_id) {
+            if buffer.len() > MAX_BUFFER_ENTRIES {
+                let excess = buffer.len() - MAX_BUFFER_ENTRIES;
+                buffer.drain(..excess);
+            }
         }
     }
 
     /// Removes all buffered lines for `task_id` and resets scroll if it is displayed.
     #[allow(dead_code)]
     pub fn clear(&mut self, task_id: &TaskId) {
-        self.lines.remove(task_id);
+        self.buffers.remove(task_id);
         if self.current_task_id.as_ref() == Some(task_id) {
             self.scroll_offset = 0;
         }
     }
 
-    /// Scrolls the viewport up by one line (saturates at 0).
+    /// Scrolls the viewport up by one visual line.
+    ///
+    /// If in follow-tail mode, first snaps to the bottom offset recorded from the
+    /// last render and then disables follow-tail. If already scrolled, decrements
+    /// the saved offset (saturates at 0).
     pub fn scroll_up(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        if self.follow_tail {
+            self.scroll_offset = self.last_max_scroll.get().saturating_sub(1);
+            self.follow_tail = false;
+        } else {
+            self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        }
     }
 
-    /// Scrolls the viewport down by one line, clamped to `max_scroll()`.
+    /// Scrolls the viewport down by one visual line.
+    ///
+    /// If already in follow-tail mode this is a no-op. When the saved offset
+    /// reaches or exceeds `last_max_scroll`, follow-tail mode is re-enabled.
     pub fn scroll_down(&mut self) {
-        let max = self.max_scroll();
-        if self.scroll_offset < max {
-            self.scroll_offset += 1;
+        if self.follow_tail {
+            return;
+        }
+        self.scroll_offset += 1;
+        if self.scroll_offset >= self.last_max_scroll.get() {
+            self.follow_tail = true;
         }
     }
 
     /// Updates the currently displayed task.
     ///
-    /// If the task changes, resets scroll and scrolls to the bottom of the new task.
+    /// If the task changes, resets scroll offset and enables follow-tail mode so
+    /// the new task's buffer is shown from the bottom.
     pub fn set_displayed_task(&mut self, task_id: Option<&TaskId>) {
         let new_id = task_id.cloned();
         if new_id != self.current_task_id {
             self.current_task_id = new_id;
-            if let Some(ref id) = self.current_task_id.clone() {
-                self.scroll_to_bottom(id);
-            } else {
-                self.scroll_offset = 0;
-            }
+            self.scroll_offset = 0;
+            self.follow_tail = true;
         }
     }
 
-    /// Returns the buffered activity lines for `task_id`, or an empty slice if none.
-    pub fn lines_for(&self, task_id: &TaskId) -> &[ActivityLine] {
-        self.lines.get(task_id).map(Vec::as_slice).unwrap_or(&[])
+    /// Returns the flattened activity lines for `task_id` in display order.
+    ///
+    /// Message slots appear in first-seen order; their lines are the **current**
+    /// state of that message. Tool events appear interleaved at the position
+    /// they were received.
+    pub fn lines_for(&self, task_id: &TaskId) -> Vec<ActivityLine> {
+        self.buffers
+            .get(task_id)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .flat_map(|e| match e {
+                        BufferEntry::Message { lines, .. } => lines.clone(),
+                        BufferEntry::Tool(line) | BufferEntry::Banner(line) => vec![line.clone()],
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    /// Returns the maximum valid scroll offset for the currently displayed task.
-    fn max_scroll(&self) -> usize {
-        if let Some(ref id) = self.current_task_id {
-            self.lines_for(id).len().saturating_sub(1)
-        } else {
-            0
-        }
-    }
-
-    /// Scrolls to the last line of the buffer for `task_id`.
-    fn scroll_to_bottom(&mut self, task_id: &TaskId) {
-        let count = self.lines_for(task_id).len();
-        self.scroll_offset = count.saturating_sub(1);
+    /// Enables follow-tail mode so the next render tracks the bottom of the buffer.
+    fn scroll_to_bottom(&mut self, _task_id: &TaskId) {
+        self.follow_tail = true;
     }
 }
 
@@ -163,11 +315,34 @@ impl Default for Tab2State {
     }
 }
 
+/// Computes the total number of visual (wrapped) lines for `lines` at a given `width`.
+///
+/// Each `Line` whose display width exceeds `width` wraps into multiple visual rows.
+/// Empty lines always contribute exactly one visual row.
+fn visual_line_count(lines: &[Line], width: u16) -> usize {
+    let w = width.max(1) as usize;
+    lines
+        .iter()
+        .map(|line| {
+            let lw = line.width();
+            if lw == 0 {
+                1
+            } else {
+                lw.div_ceil(w)
+            }
+        })
+        .sum()
+}
+
 /// Renders the Agent Activity tab into `area`.
 ///
 /// Displays a placeholder when no task is selected. When a task is selected,
-/// renders buffered activity lines with distinct styles per variant, scrolled
-/// to `state.scroll_offset`.
+/// renders buffered activity lines with distinct styles per variant. In follow-tail
+/// mode the viewport is pinned to the bottom; otherwise `state.scroll_offset` is
+/// used (clamped to the computed maximum).
+///
+/// Updates `state.last_max_scroll` via interior mutability so that `scroll_up` and
+/// `scroll_down` can reference the correct visual line count on the next interaction.
 pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &Tab2State) {
     let block = Block::default()
         .title("Agent Activity")
@@ -182,11 +357,11 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
     }
 
     let task_id = task_id.unwrap();
-    let lines: Vec<Line> = state
-        .lines_for(task_id)
-        .iter()
+    let activity_lines = state.lines_for(task_id);
+    let mut lines: Vec<Line> = activity_lines
+        .into_iter()
         .map(|line| match line {
-            ActivityLine::Text { content } => Line::from(content.as_str()),
+            ActivityLine::Text { content } => Line::from(content),
             ActivityLine::ToolActivity { tool, status } => Line::from(vec![
                 Span::styled(
                     format!("[{tool}]"),
@@ -195,10 +370,10 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled(status.as_str(), Style::default().fg(Color::Yellow)),
+                Span::styled(status, Style::default().fg(Color::Yellow)),
             ]),
             ActivityLine::AgentBanner { message } => Line::from(Span::styled(
-                message.as_str(),
+                message,
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
@@ -206,10 +381,33 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
         })
         .collect();
 
+    if let Some(status) = state.elapsed_status(task_id) {
+        lines.push(Line::from(Span::styled(
+            status,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+
+    // Compute the effective scroll offset using visual (wrapped) line counts.
+    // Subtract 2 from each dimension to account for the surrounding border.
+    let content_width = area.width.saturating_sub(2);
+    let viewport_height = area.height.saturating_sub(2) as usize;
+    let total_visual = visual_line_count(&lines, content_width);
+    let max_scroll = total_visual.saturating_sub(viewport_height);
+    state.last_max_scroll.set(max_scroll);
+
+    let effective_scroll = if state.follow_tail {
+        max_scroll
+    } else {
+        state.scroll_offset.min(max_scroll)
+    };
+
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false })
-        .scroll((state.scroll_offset as u16, 0));
+        .scroll((effective_scroll as u16, 0));
 
     frame.render_widget(paragraph, area);
 }
@@ -229,6 +427,7 @@ mod tests {
         let id = task_id();
         state.push_streaming(
             &id,
+            "msg-1",
             &[MessagePart::Text {
                 text: "hello".to_string(),
             }],
@@ -236,6 +435,62 @@ mod tests {
         let lines = state.lines_for(&id);
         assert_eq!(lines.len(), 1);
         assert!(matches!(lines[0], ActivityLine::Text { ref content } if content == "hello"));
+    }
+
+    /// Verifies that a second push with the same message_id replaces (not appends) the lines.
+    #[test]
+    fn test_push_streaming_replaces_same_message() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.push_streaming(
+            &id,
+            "msg-1",
+            &[MessagePart::Text {
+                text: "Hello".to_string(),
+            }],
+        );
+        state.push_streaming(
+            &id,
+            "msg-1",
+            &[MessagePart::Text {
+                text: "Hello, world".to_string(),
+            }],
+        );
+        // Still exactly one line -- the second update replaced the first.
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), 1, "second push should replace, not append");
+        assert!(
+            matches!(&lines[0], ActivityLine::Text { content } if content == "Hello, world"),
+            "line should contain the latest text, got: {:?}",
+            lines[0]
+        );
+    }
+
+    /// Verifies that pushes with distinct message_ids produce separate lines.
+    #[test]
+    fn test_push_streaming_distinct_messages_accumulate() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.push_streaming(
+            &id,
+            "msg-1",
+            &[MessagePart::Text {
+                text: "first".to_string(),
+            }],
+        );
+        state.push_streaming(
+            &id,
+            "msg-2",
+            &[MessagePart::Text {
+                text: "second".to_string(),
+            }],
+        );
+        let lines = state.lines_for(&id);
+        assert_eq!(
+            lines.len(),
+            2,
+            "distinct message ids should each contribute a line"
+        );
     }
 
     #[test]
@@ -256,6 +511,7 @@ mod tests {
         let id = task_id();
         state.push_streaming(
             &id,
+            "msg-1",
             &[MessagePart::Text {
                 text: "line".to_string(),
             }],
@@ -266,36 +522,292 @@ mod tests {
     }
 
     #[test]
-    fn test_scroll_bounds() {
+    fn test_push_banner() {
         let mut state = Tab2State::new();
         let id = task_id();
+        state.push_banner(&id, "--- Intake Agent ---".to_string());
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            matches!(&lines[0], ActivityLine::AgentBanner { message } if message == "--- Intake Agent ---")
+        );
+    }
 
-        // scroll_up from 0 stays 0.
-        state.set_displayed_task(Some(&id));
-        state.scroll_up();
-        assert_eq!(state.scroll_offset, 0);
+    #[test]
+    fn test_elapsed_status() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        // Before setting awaiting, elapsed_status returns None.
+        assert!(state.elapsed_status(&id).is_none());
+        state.set_awaiting_response(&id, "Intake Agent".to_string());
+        let status = state.elapsed_status(&id).expect("should have a status");
+        assert!(
+            status.contains("Intake Agent"),
+            "status should contain agent name: {}",
+            status
+        );
+        assert!(
+            status.contains("waiting for response"),
+            "status should contain 'waiting for response': {}",
+            status
+        );
+    }
 
-        // scroll_down with no lines stays 0.
-        state.scroll_down();
-        assert_eq!(state.scroll_offset, 0);
+    #[test]
+    fn test_clear_awaiting() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.set_awaiting_response(&id, "Intake Agent".to_string());
+        assert!(state.elapsed_status(&id).is_some());
+        state.clear_awaiting(&id);
+        assert!(state.elapsed_status(&id).is_none());
+    }
 
-        // Push 5 lines; set_displayed_task auto-scrolls to bottom (index 4).
-        for i in 0..5 {
+    #[test]
+    fn test_check_timeouts_empty_when_not_awaiting() {
+        let state = Tab2State::new();
+        let result = state.check_timeouts(Duration::from_secs(1));
+        assert!(result.is_empty(), "no timeouts when no task is awaiting");
+    }
+
+    #[test]
+    fn test_check_timeouts_empty_within_deadline() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.set_awaiting_response(&id, "Intake Agent".to_string());
+        // A very large timeout should not fire immediately after set_awaiting_response.
+        let result = state.check_timeouts(Duration::from_secs(3600));
+        assert!(
+            result.is_empty(),
+            "fresh session should not trigger a timeout with a large deadline"
+        );
+    }
+
+    #[test]
+    fn test_check_timeouts_cleared_after_clear_awaiting() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.set_awaiting_response(&id, "Intake Agent".to_string());
+        state.clear_awaiting(&id);
+        // Even with a zero timeout, a cleared session should not appear.
+        let result = state.check_timeouts(Duration::from_secs(0));
+        assert!(
+            result.is_empty(),
+            "cleared awaiting state should not appear in timeouts"
+        );
+    }
+
+    /// Verifies that push_streaming trims the buffer when it exceeds MAX_BUFFER_ENTRIES.
+    #[test]
+    fn test_buffer_trim_on_push_streaming() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        // Push MAX_BUFFER_ENTRIES + 10 distinct messages (each a separate buffer entry).
+        for i in 0..MAX_BUFFER_ENTRIES + 10 {
             state.push_streaming(
                 &id,
+                &format!("msg-{i}"),
                 &[MessagePart::Text {
                     text: format!("line {i}"),
                 }],
             );
         }
-        assert_eq!(state.scroll_offset, 4);
+        let buffer_len = state.buffers.get(&id).map(|b| b.len()).unwrap_or(0);
+        assert_eq!(
+            buffer_len, MAX_BUFFER_ENTRIES,
+            "buffer should be capped at MAX_BUFFER_ENTRIES, got {buffer_len}"
+        );
+    }
 
-        // scroll_down at max stays clamped at 4.
-        state.scroll_down();
-        assert_eq!(state.scroll_offset, 4);
+    /// Verifies that push_banner trims the buffer when it exceeds MAX_BUFFER_ENTRIES.
+    #[test]
+    fn test_buffer_trim_on_push_banner() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        for i in 0..MAX_BUFFER_ENTRIES + 5 {
+            state.push_banner(&id, format!("banner {i}"));
+        }
+        let buffer_len = state.buffers.get(&id).map(|b| b.len()).unwrap_or(0);
+        assert_eq!(
+            buffer_len, MAX_BUFFER_ENTRIES,
+            "buffer should be capped at MAX_BUFFER_ENTRIES, got {buffer_len}"
+        );
+    }
 
-        // scroll_up decrements.
+    /// Verifies that the most recent entries survive the trim (oldest are removed).
+    #[test]
+    fn test_buffer_trim_preserves_recent() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        // Push MAX_BUFFER_ENTRIES + 1 banners.
+        for i in 0..MAX_BUFFER_ENTRIES + 1 {
+            state.push_banner(&id, format!("banner {i}"));
+        }
+        // The first banner (index 0) should have been trimmed; the last one survives.
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), MAX_BUFFER_ENTRIES);
+        // The first surviving entry should be banner 1 (banner 0 was trimmed).
+        assert!(
+            matches!(&lines[0], ActivityLine::AgentBanner { message } if message == "banner 1"),
+            "oldest entry should be trimmed; first remaining: {:?}",
+            lines[0]
+        );
+        // The last entry should be the most recently pushed banner.
+        let last_msg = format!("banner {}", MAX_BUFFER_ENTRIES);
+        assert!(
+            matches!(lines.last(), Some(ActivityLine::AgentBanner { message }) if message == &last_msg),
+            "newest entry should be preserved; last: {:?}",
+            lines.last()
+        );
+    }
+
+    /// Verifies follow-tail semantics: set_displayed_task enables follow_tail,
+    /// scroll_up disables it, scroll_down can re-enable it.
+    #[test]
+    fn test_scroll_bounds() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+
+        // After set_displayed_task, follow_tail is enabled.
+        state.set_displayed_task(Some(&id));
+        assert!(
+            state.follow_tail,
+            "set_displayed_task should enable follow_tail"
+        );
+
+        // scroll_up when follow_tail=true disables follow_tail and snaps offset.
         state.scroll_up();
-        assert_eq!(state.scroll_offset, 3);
+        assert!(!state.follow_tail, "scroll_up should disable follow_tail");
+
+        // scroll_down re-enables follow_tail when offset reaches last_max_scroll (0).
+        state.scroll_down();
+        assert!(
+            state.follow_tail,
+            "scroll_down past max should re-enable follow_tail"
+        );
+
+        // Push 5 lines with distinct message IDs; push_streaming calls scroll_to_bottom
+        // which sets follow_tail = true.
+        for i in 0..5 {
+            state.push_streaming(
+                &id,
+                &format!("msg-{i}"),
+                &[MessagePart::Text {
+                    text: format!("line {i}"),
+                }],
+            );
+        }
+        assert!(
+            state.follow_tail,
+            "push_streaming should keep follow_tail enabled"
+        );
+
+        // scroll_down when follow_tail=true is a no-op.
+        state.scroll_down();
+        assert!(
+            state.follow_tail,
+            "scroll_down in follow_tail mode should be a no-op"
+        );
+
+        // scroll_up disables follow_tail and saves offset based on last_max_scroll.
+        // last_max_scroll is 0 since render has never been called in this test.
+        state.scroll_up();
+        assert!(
+            !state.follow_tail,
+            "scroll_up should disable follow_tail again"
+        );
+        // With last_max_scroll=0, sat_sub(1)=0.
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    /// Verifies that push_streaming with a new task_id enables follow_tail.
+    #[test]
+    fn test_follow_tail_enabled_on_push() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.set_displayed_task(Some(&id));
+        // Manually disable follow_tail.
+        state.follow_tail = false;
+
+        state.push_streaming(
+            &id,
+            "msg-1",
+            &[MessagePart::Text {
+                text: "hello".to_string(),
+            }],
+        );
+        assert!(
+            state.follow_tail,
+            "push_streaming should re-enable follow_tail for the current task"
+        );
+
+        // Same for push_banner.
+        state.follow_tail = false;
+        state.push_banner(&id, "banner".to_string());
+        assert!(
+            state.follow_tail,
+            "push_banner should re-enable follow_tail for the current task"
+        );
+    }
+
+    /// Verifies that scroll_up disables follow_tail and records the offset.
+    #[test]
+    fn test_scroll_up_disables_follow_tail() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.set_displayed_task(Some(&id));
+        // Simulate a prior render having set last_max_scroll to 10.
+        state.last_max_scroll.set(10);
+
+        assert!(state.follow_tail);
+        state.scroll_up();
+        assert!(!state.follow_tail, "scroll_up should disable follow_tail");
+        // Offset should be last_max_scroll - 1.
+        assert_eq!(
+            state.scroll_offset, 9,
+            "scroll_up snaps to last_max_scroll - 1"
+        );
+    }
+
+    /// Verifies that scroll_down re-enables follow_tail when reaching last_max_scroll.
+    #[test]
+    fn test_scroll_down_reenables_follow_tail() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.set_displayed_task(Some(&id));
+        state.last_max_scroll.set(3);
+
+        // Disable follow_tail and position at offset 1.
+        state.scroll_up(); // follow_tail=false, offset=2
+        state.scroll_up(); // follow_tail=false, offset=1
+
+        assert!(!state.follow_tail);
+        assert_eq!(state.scroll_offset, 1);
+
+        state.scroll_down(); // offset=2
+        assert!(!state.follow_tail, "not yet at max");
+        assert_eq!(state.scroll_offset, 2);
+
+        state.scroll_down(); // offset=3, 3>=3 -> follow_tail=true
+        assert!(
+            state.follow_tail,
+            "scroll_down past max should re-enable follow_tail"
+        );
+    }
+
+    /// Verifies that visual_line_count correctly counts wrapped lines.
+    #[test]
+    fn test_visual_line_count_wrapping() {
+        // A line of width 10 in a 5-wide viewport wraps to 2 visual rows.
+        let lines = vec![
+            Line::from("abcdefghij"), // width 10
+            Line::from("ab"),         // width 2
+            Line::from(""),           // empty -> 1 row
+        ];
+        // At width=5: ceil(10/5)=2 + ceil(2/5)=1 + 1(empty) = 4
+        assert_eq!(visual_line_count(&lines, 5), 4);
+
+        // At width=10: ceil(10/10)=1 + 1 + 1 = 3
+        assert_eq!(visual_line_count(&lines, 10), 3);
     }
 }

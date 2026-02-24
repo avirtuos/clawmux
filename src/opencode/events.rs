@@ -37,6 +37,11 @@ pub struct EventStreamConsumer {
     session_map: SessionMap,
     /// Accumulated assistant text per session ID, drained on session completion.
     accumulated_text: HashMap<String, String>,
+    /// Per-(session, message) accumulated delta text for streaming display.
+    ///
+    /// Each delta is appended here so the full text can be emitted on every chunk.
+    /// Drained when the session completes or errors.
+    accumulated_deltas: HashMap<(String, String), String>,
 }
 
 #[allow(dead_code)]
@@ -52,6 +57,7 @@ impl EventStreamConsumer {
             tx,
             session_map,
             accumulated_text: HashMap::new(),
+            accumulated_deltas: HashMap::new(),
         }
     }
 
@@ -99,19 +105,16 @@ impl EventStreamConsumer {
                         backoff_secs = 1;
                     }
                     Ok(Event::Message(msg)) => {
-                        // opencode sends the event type in the SSE `event:` field rather
-                        // than as a JSON `type` key. Inject it so our tagged enum can
-                        // dispatch correctly.
-                        let data = inject_type_field(&msg.data, &msg.event);
-                        match serde_json::from_str::<OpenCodeEvent>(&data) {
-                            Ok(oc_event) => {
-                                if let Err(e) = self.handle_event(oc_event).await {
-                                    warn!("Error handling SSE event: {e}");
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to deserialize SSE event: {}", e);
-                            }
+                        // opencode wraps all events in {"payload":{"type":"<name>","properties":{...}}}.
+                        // The SSE event: field is always "message" and carries no type info.
+                        tracing::debug!(
+                            "SSE raw: event='{}', data_len={}",
+                            msg.event,
+                            msg.data.len()
+                        );
+                        let oc_event = parse_wire_event(&msg.data);
+                        if let Err(e) = self.handle_event(oc_event).await {
+                            warn!("Error handling SSE event: {e}");
                         }
                     }
                     Err(e) => {
@@ -165,7 +168,9 @@ impl EventStreamConsumer {
                 }
             }
             OpenCodeEvent::MessageUpdated {
-                session_id, parts, ..
+                session_id,
+                message_id,
+                parts,
             } => {
                 let task_id = {
                     let map = self.session_map.read().await;
@@ -182,11 +187,46 @@ impl EventStreamConsumer {
                     self.send(AppMessage::StreamingUpdate {
                         task_id,
                         session_id,
+                        message_id,
                         parts,
                     })
                     .await?;
                 } else {
                     debug!("MessageUpdated for unknown session_id: {}", session_id);
+                }
+            }
+            OpenCodeEvent::MessagePartDelta {
+                session_id,
+                message_id,
+                field,
+                delta,
+            } => {
+                let task_id = {
+                    let map = self.session_map.read().await;
+                    map.get(&session_id).map(|(task_id, _)| task_id.clone())
+                };
+                if let Some(task_id) = task_id {
+                    if field == "text" {
+                        let full_text = {
+                            let entry = self
+                                .accumulated_deltas
+                                .entry((session_id.clone(), message_id.clone()))
+                                .or_default();
+                            entry.push_str(&delta);
+                            entry.clone()
+                        };
+                        self.accumulated_text
+                            .insert(session_id.clone(), full_text.clone());
+                        self.send(AppMessage::StreamingUpdate {
+                            task_id,
+                            session_id,
+                            message_id,
+                            parts: vec![MessagePart::Text { text: full_text }],
+                        })
+                        .await?;
+                    }
+                } else {
+                    debug!("MessagePartDelta for unknown session_id: {}", session_id);
                 }
             }
             OpenCodeEvent::ToolExecuting { session_id, tool } => {
@@ -235,6 +275,8 @@ impl EventStreamConsumer {
                         .accumulated_text
                         .remove(&session_id)
                         .unwrap_or_default();
+                    self.accumulated_deltas
+                        .retain(|(sid, _), _| *sid != session_id);
                     self.send(AppMessage::SessionCompleted {
                         task_id,
                         session_id,
@@ -250,8 +292,10 @@ impl EventStreamConsumer {
                     let map = self.session_map.read().await;
                     map.get(&session_id).map(|(task_id, _)| task_id.clone())
                 };
-                // Clean up accumulated text to prevent memory leaks.
+                // Clean up accumulated text and deltas to prevent memory leaks.
                 self.accumulated_text.remove(&session_id);
+                self.accumulated_deltas
+                    .retain(|(sid, _), _| *sid != session_id);
                 if let Some(task_id) = task_id {
                     self.send(AppMessage::SessionError {
                         task_id,
@@ -267,7 +311,7 @@ impl EventStreamConsumer {
                 // Ignored -- redundant with MessageUpdated
             }
             OpenCodeEvent::Unknown => {
-                debug!("Received unknown SSE event type, ignoring");
+                // Logging is handled inside parse_wire_event at the appropriate level.
             }
         }
         Ok(())
@@ -286,22 +330,148 @@ impl EventStreamConsumer {
     }
 }
 
-/// Injects a `"type"` key into a JSON object string if one is not already present.
+/// Parses an opencode SSE JSON body into an [`OpenCodeEvent`].
 ///
-/// opencode sends the event type in the SSE `event:` protocol field rather than
-/// as a JSON key inside the body. This helper merges the SSE event name into the
-/// JSON body so that our `#[serde(tag = "type")]` enum can dispatch correctly.
+/// The opencode wire format wraps all events in:
+/// `{"payload": {"type": "<event.name>", "properties": {...}}, ...}`
 ///
-/// Returns the modified JSON string, or the original string unchanged if parsing fails.
-fn inject_type_field(json_data: &str, event_type: &str) -> String {
-    if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(json_data) {
-        if let Some(obj) = v.as_object_mut() {
-            obj.entry("type")
-                .or_insert_with(|| serde_json::Value::String(event_type.to_string()));
+/// The SSE protocol `event:` field is always `"message"` and carries no type information.
+/// The actual event type is always found at `payload.type`.
+///
+/// Logging policy:
+/// - Known-but-unneeded events (heartbeats, metadata updates): `debug!`
+/// - Recognized events with missing required fields: `warn!`
+/// - Unrecognized event types: `info!`
+/// - JSON parse failures: `warn!`
+fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
+    let v: serde_json::Value = match serde_json::from_str(json_data) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Failed to parse SSE JSON: {}; data: {}", e, json_data);
+            return OpenCodeEvent::Unknown;
         }
-        return serde_json::to_string(&v).unwrap_or_else(|_| json_data.to_string());
+    };
+
+    let payload = match v.get("payload") {
+        Some(p) => p,
+        None => {
+            warn!("SSE event missing 'payload' field: {}", json_data);
+            return OpenCodeEvent::Unknown;
+        }
+    };
+
+    let event_type = match payload.get("type").and_then(|t| t.as_str()) {
+        Some(t) => t,
+        None => {
+            debug!("SSE payload missing 'type' field: {}", json_data);
+            return OpenCodeEvent::Unknown;
+        }
+    };
+
+    let props = payload
+        .get("properties")
+        .unwrap_or(&serde_json::Value::Null);
+
+    match event_type {
+        "session.created" => {
+            if let Some(id) = props["info"]["id"].as_str() {
+                debug!("SSE session.created: session_id={}", id);
+                OpenCodeEvent::SessionCreated {
+                    session_id: id.to_string(),
+                }
+            } else {
+                warn!("session.created missing info.id: {}", json_data);
+                OpenCodeEvent::Unknown
+            }
+        }
+        "session.error" => {
+            let session_id = props["info"]["id"]
+                .as_str()
+                .or_else(|| props["sessionId"].as_str());
+            let error = props["error"].as_str().unwrap_or("unknown error");
+            match session_id {
+                Some(sid) => OpenCodeEvent::SessionError {
+                    session_id: sid.to_string(),
+                    error: error.to_string(),
+                },
+                None => {
+                    warn!("session.error missing session id: {}", json_data);
+                    OpenCodeEvent::Unknown
+                }
+            }
+        }
+        "session.completed" => {
+            let session_id = props["info"]["id"]
+                .as_str()
+                .or_else(|| props["sessionId"].as_str());
+            match session_id {
+                Some(sid) => OpenCodeEvent::SessionCompleted {
+                    session_id: sid.to_string(),
+                },
+                None => {
+                    warn!("session.completed missing session id: {}", json_data);
+                    OpenCodeEvent::Unknown
+                }
+            }
+        }
+        // message.part.delta carries an incremental text delta (OpenCode >= 1.2).
+        "message.part.delta" => {
+            let session_id = props["sessionID"].as_str();
+            let message_id = props["messageID"].as_str();
+            let field = props["field"].as_str();
+            let delta = props["delta"].as_str();
+            match (session_id, message_id, field, delta) {
+                (Some(sid), Some(mid), Some(fld), Some(dlt)) => OpenCodeEvent::MessagePartDelta {
+                    session_id: sid.to_string(),
+                    message_id: mid.to_string(),
+                    field: fld.to_string(),
+                    delta: dlt.to_string(),
+                },
+                _ => {
+                    warn!(
+                        "message.part.delta: missing required fields; props: {}",
+                        props
+                    );
+                    OpenCodeEvent::Unknown
+                }
+            }
+        }
+        // session.idle is the new completion signal (replaces session.completed in OpenCode >= 1.2).
+        "session.idle" => {
+            let session_id = props["sessionID"]
+                .as_str()
+                .or_else(|| props["sessionId"].as_str());
+            match session_id {
+                Some(sid) => OpenCodeEvent::SessionCompleted {
+                    session_id: sid.to_string(),
+                },
+                None => {
+                    warn!("session.idle missing session id: {}", json_data);
+                    OpenCodeEvent::Unknown
+                }
+            }
+        }
+        // Known events we intentionally do not act on.
+        // message.updated and message.part.updated are superseded by message.part.delta
+        // (OpenCode >= 1.2). Ignoring them prevents accumulated delta text from being
+        // overwritten by a stale full-message snapshot if both event types were emitted.
+        "session.updated"
+        | "server.heartbeat"
+        | "server.connected"
+        | "project.updated"
+        | "message.created"
+        | "session.status"
+        | "session.diff"
+        | "message.updated"
+        | "message.part.updated" => {
+            debug!("SSE event '{}': ignoring", event_type);
+            OpenCodeEvent::Unknown
+        }
+        _ => {
+            info!("Unhandled SSE event type '{}': {}", event_type, props);
+            OpenCodeEvent::Unknown
+        }
     }
-    json_data.to_string()
 }
 
 #[cfg(test)]
@@ -660,34 +830,364 @@ mod tests {
         );
     }
 
-    /// Verifies that inject_type_field adds the type key when it is absent.
+    /// Verifies that parse_wire_event correctly extracts the session ID from the nested
+    /// info object in a session.created payload.
     #[test]
-    fn test_inject_type_field_adds_missing_key() {
-        let json = r#"{"sessionId":"s1","properties":{}}"#;
-        let result = inject_type_field(json, "SessionCreated");
-        let v: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
-        assert_eq!(v["type"], "SessionCreated");
-        // Original keys are preserved.
-        assert_eq!(v["sessionId"], "s1");
-    }
-
-    /// Verifies that inject_type_field does not overwrite an existing type key.
-    #[test]
-    fn test_inject_type_field_preserves_existing_key() {
-        let json = r#"{"type":"AlreadyPresent","sessionId":"s2"}"#;
-        let result = inject_type_field(json, "SessionCreated");
-        let v: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
-        assert_eq!(
-            v["type"], "AlreadyPresent",
-            "existing type key must not be overwritten"
+    fn test_parse_wire_event_session_created() {
+        let json = r#"{"payload":{"type":"session.created","properties":{"info":{"id":"ses_abc","slug":"eager-rocket"}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::SessionCreated { ref session_id } if session_id == "ses_abc"),
+            "unexpected: {event:?}"
         );
     }
 
-    /// Verifies that inject_type_field returns the original string unchanged for non-JSON input.
+    /// Verifies that session.created without info.id returns Unknown (with a warning).
     #[test]
-    fn test_inject_type_field_non_json_passthrough() {
-        let not_json = "not json at all";
-        let result = inject_type_field(not_json, "SessionCreated");
-        assert_eq!(result, not_json);
+    fn test_parse_wire_event_session_created_missing_id() {
+        let json = r#"{"payload":{"type":"session.created","properties":{}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "expected Unknown, got: {event:?}"
+        );
+    }
+
+    /// Verifies that session.error is mapped correctly.
+    #[test]
+    fn test_parse_wire_event_session_error() {
+        let json = r#"{"payload":{"type":"session.error","properties":{"info":{"id":"ses_abc"},"error":"rate limit"}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::SessionError { ref session_id, ref error }
+                if session_id == "ses_abc" && error == "rate limit"),
+            "unexpected: {event:?}"
+        );
+    }
+
+    /// Verifies that session.completed is mapped correctly.
+    #[test]
+    fn test_parse_wire_event_session_completed() {
+        let json =
+            r#"{"payload":{"type":"session.completed","properties":{"info":{"id":"ses_abc"}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::SessionCompleted { ref session_id } if session_id == "ses_abc"),
+            "unexpected: {event:?}"
+        );
+    }
+
+    /// Verifies that message.updated is now treated as a known-ignored event (returns Unknown).
+    ///
+    /// The new API (OpenCode >= 1.2) uses message.part.delta exclusively. Ignoring
+    /// message.updated prevents accumulated delta text from being overwritten by a
+    /// full-message snapshot.
+    #[test]
+    fn test_parse_wire_event_message_updated_now_ignored() {
+        let json = r#"{"payload":{"type":"message.updated","properties":{"sessionId":"ses_abc","messageId":"msg_1","parts":[{"type":"text","text":"hello"}]}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "message.updated should return Unknown (now ignored), got: {event:?}"
+        );
+    }
+
+    /// Verifies that message.part.updated is now treated as a known-ignored event (returns Unknown).
+    #[test]
+    fn test_parse_wire_event_message_part_updated_now_ignored() {
+        let json = r#"{"payload":{"type":"message.part.updated","properties":{"sessionId":"ses_abc","messageId":"msg_1","parts":[{"type":"text","text":"hello"}]}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "message.part.updated should return Unknown (now ignored), got: {event:?}"
+        );
+    }
+
+    /// Verifies that known-but-ignored events (heartbeats etc.) return Unknown.
+    #[test]
+    fn test_parse_wire_event_heartbeat_ignored() {
+        let json = r#"{"payload":{"type":"server.heartbeat","properties":{}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "heartbeat should return Unknown"
+        );
+    }
+
+    /// Verifies that message.part.delta parses all required fields correctly.
+    #[test]
+    fn test_parse_wire_event_message_part_delta() {
+        let json = r#"{"payload":{"type":"message.part.delta","properties":{"sessionID":"ses_abc","messageID":"msg_1","field":"text","delta":"hello "}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(
+                event,
+                OpenCodeEvent::MessagePartDelta {
+                    ref session_id,
+                    ref message_id,
+                    ref field,
+                    ref delta
+                } if session_id == "ses_abc"
+                    && message_id == "msg_1"
+                    && field == "text"
+                    && delta == "hello "
+            ),
+            "unexpected: {event:?}"
+        );
+    }
+
+    /// Verifies that message.part.delta with missing fields returns Unknown.
+    #[test]
+    fn test_parse_wire_event_message_part_delta_missing_fields() {
+        // Missing "delta" field.
+        let json = r#"{"payload":{"type":"message.part.delta","properties":{"sessionID":"ses_abc","messageID":"msg_1","field":"text"}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "expected Unknown when delta is missing, got: {event:?}"
+        );
+    }
+
+    /// Verifies that session.idle maps to SessionCompleted.
+    #[test]
+    fn test_parse_wire_event_session_idle() {
+        let json = r#"{"payload":{"type":"session.idle","properties":{"sessionID":"ses_abc"}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::SessionCompleted { ref session_id } if session_id == "ses_abc"),
+            "unexpected: {event:?}"
+        );
+    }
+
+    /// Verifies that session.idle without a session ID returns Unknown.
+    #[test]
+    fn test_parse_wire_event_session_idle_missing_id() {
+        let json = r#"{"payload":{"type":"session.idle","properties":{}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "expected Unknown when session id is missing, got: {event:?}"
+        );
+    }
+
+    /// Verifies that session.status is treated as a known-ignored event.
+    #[test]
+    fn test_parse_wire_event_session_status_ignored() {
+        let json = r#"{"payload":{"type":"session.status","properties":{"sessionID":"ses_abc","status":"busy"}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "session.status should return Unknown, got: {event:?}"
+        );
+    }
+
+    /// Verifies that session.diff is treated as a known-ignored event.
+    #[test]
+    fn test_parse_wire_event_session_diff_ignored() {
+        let json = r#"{"payload":{"type":"session.diff","properties":{"sessionID":"ses_abc"}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "session.diff should return Unknown, got: {event:?}"
+        );
+    }
+
+    /// Verifies that completely unknown event types return Unknown.
+    #[test]
+    fn test_parse_wire_event_unknown_type() {
+        let json = r#"{"payload":{"type":"some.future.event","properties":{"foo":"bar"}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "unrecognized type should return Unknown"
+        );
+    }
+
+    /// Verifies that invalid JSON returns Unknown.
+    #[test]
+    fn test_parse_wire_event_invalid_json() {
+        let event = parse_wire_event("not json at all");
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "invalid JSON should return Unknown"
+        );
+    }
+
+    /// Verifies that three MessagePartDelta events produce three StreamingUpdates
+    /// with progressively accumulated text.
+    #[tokio::test]
+    async fn test_handle_event_message_part_delta_accumulates() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-d".to_string(),
+                (task_id.clone(), AgentKind::Implementation),
+            );
+        }
+
+        for (i, chunk) in ["Hello", " world", "!"].iter().enumerate() {
+            consumer
+                .handle_event(OpenCodeEvent::MessagePartDelta {
+                    session_id: "sess-d".to_string(),
+                    message_id: "msg-1".to_string(),
+                    field: "text".to_string(),
+                    delta: chunk.to_string(),
+                })
+                .await
+                .expect("handle_event");
+
+            let msg = rx.try_recv().expect("StreamingUpdate expected");
+            let expected = ["Hello", "Hello world", "Hello world!"][i];
+            assert!(
+                matches!(&msg, AppMessage::StreamingUpdate { parts, .. }
+                    if matches!(parts.first(), Some(crate::opencode::types::MessagePart::Text { text }) if text == expected)),
+                "chunk {i}: expected accumulated '{expected}', got: {msg:?}"
+            );
+        }
+    }
+
+    /// Verifies that accumulated delta text is included in SessionCompleted response_text.
+    #[tokio::test]
+    async fn test_handle_event_delta_updates_accumulated_text_for_session_completed() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-e".to_string(),
+                (task_id.clone(), AgentKind::Implementation),
+            );
+        }
+
+        for chunk in &["full ", "response"] {
+            consumer
+                .handle_event(OpenCodeEvent::MessagePartDelta {
+                    session_id: "sess-e".to_string(),
+                    message_id: "msg-1".to_string(),
+                    field: "text".to_string(),
+                    delta: chunk.to_string(),
+                })
+                .await
+                .expect("handle_event");
+            let _ = rx.try_recv().expect("drain StreamingUpdate");
+        }
+
+        consumer
+            .handle_event(OpenCodeEvent::SessionCompleted {
+                session_id: "sess-e".to_string(),
+            })
+            .await
+            .expect("handle_event");
+
+        let msg = rx.try_recv().expect("SessionCompleted expected");
+        assert!(
+            matches!(&msg, AppMessage::SessionCompleted { response_text, .. } if response_text == "full response"),
+            "expected 'full response' in SessionCompleted, got: {msg:?}"
+        );
+    }
+
+    /// Verifies that accumulated_deltas is drained after SessionCompleted.
+    #[tokio::test]
+    async fn test_handle_event_delta_cleanup_on_completed() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-f".to_string(),
+                (task_id.clone(), AgentKind::Implementation),
+            );
+        }
+
+        consumer
+            .handle_event(OpenCodeEvent::MessagePartDelta {
+                session_id: "sess-f".to_string(),
+                message_id: "msg-1".to_string(),
+                field: "text".to_string(),
+                delta: "some text".to_string(),
+            })
+            .await
+            .expect("handle_event");
+        let _ = rx.try_recv().expect("drain StreamingUpdate");
+
+        assert!(
+            !consumer.accumulated_deltas.is_empty(),
+            "accumulated_deltas should be populated before completion"
+        );
+
+        consumer
+            .handle_event(OpenCodeEvent::SessionCompleted {
+                session_id: "sess-f".to_string(),
+            })
+            .await
+            .expect("handle_event");
+        let _ = rx.try_recv().expect("drain SessionCompleted");
+
+        assert!(
+            consumer.accumulated_deltas.is_empty(),
+            "accumulated_deltas should be empty after SessionCompleted"
+        );
+    }
+
+    /// Verifies that accumulated_deltas is drained after SessionError.
+    #[tokio::test]
+    async fn test_handle_event_delta_cleanup_on_error() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-g".to_string(),
+                (task_id.clone(), AgentKind::Implementation),
+            );
+        }
+
+        consumer
+            .handle_event(OpenCodeEvent::MessagePartDelta {
+                session_id: "sess-g".to_string(),
+                message_id: "msg-1".to_string(),
+                field: "text".to_string(),
+                delta: "partial".to_string(),
+            })
+            .await
+            .expect("handle_event");
+        let _ = rx.try_recv().expect("drain StreamingUpdate");
+
+        consumer
+            .handle_event(OpenCodeEvent::SessionError {
+                session_id: "sess-g".to_string(),
+                error: "crash".to_string(),
+            })
+            .await
+            .expect("handle_event");
+        let _ = rx.try_recv().expect("drain SessionError");
+
+        assert!(
+            consumer.accumulated_deltas.is_empty(),
+            "accumulated_deltas should be empty after SessionError"
+        );
+    }
+
+    /// Verifies that MessagePartDelta for an unknown session emits no message.
+    #[tokio::test]
+    async fn test_handle_event_delta_unknown_session_ignored() {
+        let (mut consumer, mut rx, _session_map) = make_consumer();
+
+        consumer
+            .handle_event(OpenCodeEvent::MessagePartDelta {
+                session_id: "no-such-session".to_string(),
+                message_id: "msg-1".to_string(),
+                field: "text".to_string(),
+                delta: "hi".to_string(),
+            })
+            .await
+            .expect("handle_event");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no message expected for delta from unknown session"
+        );
     }
 }

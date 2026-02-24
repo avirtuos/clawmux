@@ -1,14 +1,15 @@
 //! Session lifecycle: create, prompt, abort, fork, and diff retrieval.
 //!
 //! Wraps the opencode session API endpoints:
-//! `POST /session`, `POST /session/:id/message`,
+//! `POST /session`, `POST /session/:id/prompt_async`,
 //! `DELETE /session/:id`, `POST /session/:id/fork`, `GET /session/:id/diff`.
 
 use reqwest::Method;
 
-use crate::error::Result;
+use crate::error::{ClawdMuxError, Result};
 use crate::opencode::types::{
-    ContentPart, CreateSessionResponse, FileDiff, OpenCodeSession, SendMessageRequest,
+    ContentPart, CreateSessionResponse, FileDiff, MessageEntry, OpenCodeSession,
+    SendMessageRequest, SessionStatusResponse,
 };
 use crate::workflow::agents::AgentKind;
 
@@ -31,20 +32,30 @@ impl OpenCodeClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        let created: CreateSessionResponse = resp.json().await?;
+        let body = resp.text().await?;
+        tracing::debug!("create_session response body: {}", body);
+        let created: CreateSessionResponse = serde_json::from_str(&body).map_err(|e| {
+            tracing::warn!(
+                "Failed to parse create_session response: {}; body: {}",
+                e,
+                body
+            );
+            ClawdMuxError::Json(e)
+        })?;
         Ok(created.0)
     }
 
     /// Sends a prompt to a session asynchronously.
     ///
-    /// Sends `POST /session/{session_id}/message`. The agent name is forwarded so the
-    /// server can route the request to the appropriate agent definition.
+    /// Sends `POST /session/{session_id}/prompt_async`. When `agent` is `Some`, the agent
+    /// name is forwarded so the server can route the request to the appropriate agent
+    /// definition. When `None`, the server uses its default model without a custom agent.
     /// Returns `Ok(())` on success; the server streams results via SSE.
     ///
     /// # Arguments
     ///
     /// * `session_id` - The ID of the target session.
-    /// * `agent` - The pipeline agent to route the message to.
+    /// * `agent` - The pipeline agent to route the message to, or `None` for the default.
     /// * `prompt` - The text prompt to send.
     ///
     /// # Errors
@@ -54,18 +65,35 @@ impl OpenCodeClient {
     pub async fn send_prompt_async(
         &self,
         session_id: &str,
-        agent: &AgentKind,
+        agent: Option<&AgentKind>,
         prompt: &str,
     ) -> Result<()> {
-        let path = format!("/session/{session_id}/message");
+        let path = format!("/session/{session_id}/prompt_async");
         let body = SendMessageRequest {
-            content: vec![ContentPart::Text {
+            parts: vec![ContentPart::Text {
                 text: prompt.to_string(),
             }],
-            agent: Some(agent.opencode_agent_name().to_string()),
+            agent: agent.map(|a| a.opencode_agent_name().to_string()),
         };
+        tracing::debug!(
+            "send_prompt_async: session={}, agent={}",
+            session_id,
+            agent.map(|a| a.display_name()).unwrap_or("(default)")
+        );
         let resp = self.request(Method::POST, &path).json(&body).send().await?;
-        self.check_response(resp).await?;
+        let status = resp.status();
+        let resp_body = resp.text().await.unwrap_or_default();
+        tracing::debug!(
+            "send_prompt_async response: status={}, body={}",
+            status,
+            resp_body
+        );
+        if !status.is_success() {
+            return Err(ClawdMuxError::Api {
+                status: status.as_u16(),
+                body: resp_body,
+            });
+        }
         Ok(())
     }
 
@@ -104,7 +132,16 @@ impl OpenCodeClient {
         let path = format!("/session/{session_id}/fork");
         let resp = self.request(Method::POST, &path).send().await?;
         let resp = self.check_response(resp).await?;
-        let created: CreateSessionResponse = resp.json().await?;
+        let body = resp.text().await?;
+        tracing::debug!("fork_session response body: {}", body);
+        let created: CreateSessionResponse = serde_json::from_str(&body).map_err(|e| {
+            tracing::warn!(
+                "Failed to parse fork_session response: {}; body: {}",
+                e,
+                body
+            );
+            ClawdMuxError::Json(e)
+        })?;
         Ok(created.0)
     }
 
@@ -126,6 +163,50 @@ impl OpenCodeClient {
         let resp = self.check_response(resp).await?;
         let diffs: Vec<FileDiff> = resp.json().await?;
         Ok(diffs)
+    }
+
+    /// Retrieves the runtime status of all active sessions.
+    ///
+    /// Sends `GET /session/status` and returns a map of session ID to status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClawdMuxError::Http`] on transport failure or [`ClawdMuxError::Api`]
+    /// on a non-2xx response.
+    pub async fn get_session_statuses(&self) -> Result<SessionStatusResponse> {
+        let resp = self.request(Method::GET, "/session/status").send().await?;
+        let resp = self.check_response(resp).await?;
+        let statuses: SessionStatusResponse = resp.json().await?;
+        Ok(statuses)
+    }
+
+    /// Retrieves all messages for a session.
+    ///
+    /// Sends `GET /session/{session_id}/message` and returns the message list.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The ID of the session whose messages to retrieve.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClawdMuxError::Http`] on transport failure or [`ClawdMuxError::Api`]
+    /// on a non-2xx response.
+    pub async fn get_session_messages(&self, session_id: &str) -> Result<Vec<MessageEntry>> {
+        let path = format!("/session/{session_id}/message");
+        let resp = self.request(Method::GET, &path).send().await?;
+        let resp = self.check_response(resp).await?;
+        let body = resp.text().await?;
+        tracing::debug!("get_session_messages response body: {}", body);
+        let messages: Vec<MessageEntry> = serde_json::from_str(&body).map_err(|e| {
+            tracing::warn!(
+                "Failed to parse get_session_messages response: {}; body: {}",
+                e,
+                body
+            );
+            ClawdMuxError::Json(e)
+        })?;
+        Ok(messages)
     }
 }
 
@@ -244,20 +325,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_prompt_async() {
+    async fn test_send_prompt_async_with_agent() {
+        // When Some(agent) is given the agent name is included in the request body.
         let mut server = Server::new_async().await;
         let mock = server
-            .mock("POST", "/session/abc/message")
+            .mock("POST", "/session/abc/prompt_async")
             .match_body(
-                r#"{"content":[{"type":"text","text":"do the thing"}],"agent":"clawdmux/implementation"}"#,
+                r#"{"parts":[{"type":"text","text":"do the thing"}],"agent":"clawdmux/implementation"}"#,
             )
-            .with_status(200)
+            .with_status(204)
             .create_async()
             .await;
 
         let client = make_client(&server.url());
         client
-            .send_prompt_async("abc", &AgentKind::Implementation, "do the thing")
+            .send_prompt_async("abc", Some(&AgentKind::Implementation), "do the thing")
+            .await
+            .expect("should succeed");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_send_prompt_async_no_agent() {
+        // When None is given the agent field is omitted from the request body.
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/session/abc/prompt_async")
+            .match_body(r#"{"parts":[{"type":"text","text":"fix this"}]}"#)
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        client
+            .send_prompt_async("abc", None, "fix this")
             .await
             .expect("should succeed");
         mock.assert_async().await;
@@ -315,6 +416,101 @@ mod tests {
         let client = make_client(&server.url());
         let session = client.fork_session("abc").await.expect("should succeed");
         assert_eq!(session.id, "sess-forked");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_session_statuses_success() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/session/status")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"sess-1":{"type":"idle"},"sess-2":{"type":"busy"}}"#)
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        let statuses = client.get_session_statuses().await.expect("should succeed");
+        assert_eq!(
+            statuses.get("sess-1"),
+            Some(&crate::opencode::types::SessionStatus::Idle)
+        );
+        assert_eq!(
+            statuses.get("sess-2"),
+            Some(&crate::opencode::types::SessionStatus::Busy)
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_session_statuses_empty() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/session/status")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        let statuses = client.get_session_statuses().await.expect("should succeed");
+        assert!(statuses.is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_session_messages_success() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/session/abc/message")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"info":{"role":"user","finish":null},"parts":[]},{"info":{"role":"assistant","finish":"end_turn"},"parts":[]}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        let messages = client
+            .get_session_messages("abc")
+            .await
+            .expect("should succeed");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].info.role,
+            crate::opencode::types::MessageRole::User
+        );
+        assert_eq!(
+            messages[1].info.role,
+            crate::opencode::types::MessageRole::Assistant
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_session_messages_with_error() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/session/abc/message")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"info":{"role":"assistant","finish":"error","error":{"message":"agent.model on undefined"}},"parts":[]}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        let messages = client
+            .get_session_messages("abc")
+            .await
+            .expect("should succeed");
+        assert_eq!(messages.len(), 1);
+        let err = messages[0].info.error.as_ref().expect("error");
+        assert_eq!(err.message.as_deref(), Some("agent.model on undefined"));
         mock.assert_async().await;
     }
 }

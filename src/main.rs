@@ -30,7 +30,6 @@ use crate::opencode::types::{MessagePart, OpenCodeEvent};
 use crate::opencode::OpenCodeClient;
 use crate::tasks::models::TaskId;
 use crate::tasks::TaskStore;
-use crate::workflow::agents::AgentKind;
 
 /// ClawdMux: GenAI coding assistance multiplexer and task orchestrator.
 #[derive(Parser, Debug)]
@@ -85,10 +84,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config::init::run_init(&project_root, &args)?;
         }
         None => {
+            let project_root = std::env::current_dir()?;
+            check_project_init(&project_root)?;
             run_tui().await?;
         }
     }
 
+    Ok(())
+}
+
+/// Checks whether the project has been initialized with `clawdmux init`.
+///
+/// Looks for `.opencode/agents/clawdmux/` in `project_root`. If missing,
+/// prompts the user on stdout/stdin (before TUI starts) and offers to
+/// scaffold the agent definition files non-interactively. Provider credentials
+/// still require `clawdmux init` to be run separately.
+fn check_project_init(project_root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufRead, Write};
+    let agents_dir = project_root
+        .join(".opencode")
+        .join("agents")
+        .join("clawdmux");
+    if agents_dir.exists() {
+        return Ok(());
+    }
+    println!(
+        "ClawdMux agent definitions not found at {}.",
+        agents_dir.display()
+    );
+    print!("Scaffold agent definition files now? [Y/n] ");
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().lock().read_line(&mut input)?;
+    let response = input.trim();
+    if response.is_empty()
+        || response.eq_ignore_ascii_case("y")
+        || response.eq_ignore_ascii_case("yes")
+    {
+        config::init::scaffold_project(
+            project_root,
+            &config::init::InitArgs {
+                reset_agents: false,
+            },
+        )?;
+        println!(
+            "Agent files scaffolded. Run 'clawdmux init' to configure your LLM provider if needed."
+        );
+    } else {
+        tracing::warn!("Agent definitions not scaffolded; task sessions will likely fail.");
+        println!("Warning: Continuing without agent definitions. Task sessions may fail.");
+    }
     Ok(())
 }
 
@@ -247,6 +292,62 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Polls `GET /session/status` every 5s until the session is `Idle` or gone.
+///
+/// Once idle, fetches messages to extract error details and returns an error string.
+/// Skips the first iteration to give SSE events time to arrive first.
+/// Runs until the session is detected as idle; the caller cancels it via `tokio::select!`
+/// once the primary SSE path completes.
+async fn poll_until_idle(client: &OpenCodeClient, session_id: &str) -> String {
+    let mut first = true;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if first {
+            first = false;
+            continue;
+        }
+        let statuses = match client.get_session_statuses().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("poll_until_idle: status poll failed: {}", e);
+                continue;
+            }
+        };
+        let is_idle = matches!(
+            statuses.get(session_id),
+            Some(crate::opencode::types::SessionStatus::Idle) | None
+        );
+        if !is_idle {
+            continue;
+        }
+        // Session is idle -- fetch messages to extract the error.
+        return match client.get_session_messages(session_id).await {
+            Ok(messages) => messages
+                .iter()
+                .rev()
+                .find_map(|entry| {
+                    if entry.info.role == crate::opencode::types::MessageRole::Assistant {
+                        if let Some(ref err) = entry.info.error {
+                            return err.message.clone();
+                        }
+                        if entry.info.finish.as_deref() == Some("error") {
+                            return Some("Session finished with error status".to_string());
+                        }
+                    }
+                    None
+                })
+                .unwrap_or_else(|| {
+                    "Session was idle after fix prompt -- OpenCode may have crashed silently"
+                        .to_string()
+                }),
+            Err(e) => format!(
+                "Session was idle after fix prompt (message fetch failed: {})",
+                e
+            ),
+        };
+    }
+}
+
 /// Spawns an async task to request an AI-generated fix for a malformed task file.
 ///
 /// Extracts the raw content and error from the task store, then spawns a tokio
@@ -310,10 +411,9 @@ fn spawn_fix_request(
         };
 
         let prompt = build_fix_prompt(&error_message, &raw_content);
-        if let Err(e) = client
-            .send_prompt_async(&session.id, &AgentKind::Implementation, &prompt)
-            .await
-        {
+        // Use no agent (None) so OpenCode uses its default model without requiring
+        // a custom `.opencode/agents/clawdmux/` definition file.
+        if let Err(e) = client.send_prompt_async(&session.id, None, &prompt).await {
             let _ = async_tx
                 .send(AppMessage::TaskFixFailed {
                     task_id,
@@ -324,6 +424,8 @@ fn spawn_fix_request(
         }
 
         // Subscribe to the global SSE stream and collect text for our session.
+        // A 60s timeout prevents the loop from hanging if OpenCode crashes silently
+        // and never emits SessionCompleted or SessionError.
         let url = format!("{}/global/event", base_url);
         let request = reqwest::Client::new().get(&url);
         let mut es = match reqwest_eventsource::EventSource::new(request) {
@@ -340,49 +442,55 @@ fn spawn_fix_request(
         };
 
         let mut collected_text = String::new();
-        while let Some(event) = es.next().await {
-            match event {
-                Ok(reqwest_eventsource::Event::Message(msg)) => {
-                    match serde_json::from_str::<OpenCodeEvent>(&msg.data) {
-                        Ok(OpenCodeEvent::MessageUpdated {
-                            session_id, parts, ..
-                        }) if session_id == session.id => {
-                            for part in &parts {
-                                if let MessagePart::Text { text } = part {
-                                    collected_text = text.clone();
+        let sse_future = async {
+            while let Some(event) = es.next().await {
+                match event {
+                    Ok(reqwest_eventsource::Event::Message(msg)) => {
+                        match serde_json::from_str::<OpenCodeEvent>(&msg.data) {
+                            Ok(OpenCodeEvent::MessageUpdated {
+                                session_id, parts, ..
+                            }) if session_id == session.id => {
+                                for part in &parts {
+                                    if let MessagePart::Text { text } = part {
+                                        collected_text = text.clone();
+                                    }
                                 }
                             }
+                            Ok(OpenCodeEvent::SessionCompleted { session_id })
+                                if session_id == session.id =>
+                            {
+                                return Ok(());
+                            }
+                            Ok(OpenCodeEvent::SessionError { session_id, error })
+                                if session_id == session.id =>
+                            {
+                                return Err(error);
+                            }
+                            _ => {}
                         }
-                        Ok(OpenCodeEvent::SessionCompleted { session_id })
-                            if session_id == session.id =>
-                        {
-                            break;
-                        }
-                        Ok(OpenCodeEvent::SessionError { session_id, error })
-                            if session_id == session.id =>
-                        {
-                            let _ = async_tx
-                                .send(AppMessage::TaskFixFailed {
-                                    task_id,
-                                    error: format!("Session error: {}", error),
-                                })
-                                .await;
-                            return;
-                        }
-                        _ => {}
                     }
+                    Err(e) => {
+                        return Err(format!("SSE stream error: {}", e));
+                    }
+                    _ => {}
                 }
-                Err(e) => {
-                    let _ = async_tx
-                        .send(AppMessage::TaskFixFailed {
-                            task_id,
-                            error: format!("SSE stream error: {}", e),
-                        })
-                        .await;
-                    return;
-                }
-                _ => {}
             }
+            Ok(())
+        };
+
+        let collect_result: Result<(), String> = tokio::select! {
+            result = sse_future => result,
+            idle_error = poll_until_idle(&client, &session.id) => Err(idle_error),
+        };
+
+        if let Err(session_err) = collect_result {
+            let _ = async_tx
+                .send(AppMessage::TaskFixFailed {
+                    task_id,
+                    error: format!("Session error: {}", session_err),
+                })
+                .await;
+            return;
         }
 
         if collected_text.is_empty() {

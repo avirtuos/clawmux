@@ -116,17 +116,31 @@ pub struct Question {
 }
 
 /// A single entry in the task's work log.
+///
+/// Variants:
+/// - `Parsed`: a fully parsed entry with structured fields.
+/// - `Raw`: a line that could not be parsed; preserved verbatim for round-trip fidelity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
-pub struct WorkLogEntry {
-    /// Sequence number of this entry (1-based).
-    pub sequence: u32,
-    /// When this entry was recorded (UTC).
-    pub timestamp: chrono::DateTime<chrono::Utc>,
-    /// The pipeline agent that produced this entry.
-    pub agent: AgentKind,
-    /// A short description of the work performed.
-    pub description: String,
+pub enum WorkLogEntry {
+    /// A fully parsed work log entry.
+    Parsed {
+        /// Sequence number of this entry (1-based).
+        sequence: u32,
+        /// When this entry was recorded (UTC).
+        timestamp: chrono::DateTime<chrono::Utc>,
+        /// The pipeline agent that produced this entry.
+        agent: AgentKind,
+        /// A short description of the work performed.
+        description: String,
+    },
+    /// A raw (unparseable) line preserved verbatim.
+    Raw {
+        /// The original line text as it appeared in the file.
+        text: String,
+        /// A human-readable description of why the line could not be parsed.
+        warning: String,
+    },
 }
 
 /// A proposed correction for a malformed task file.
@@ -149,6 +163,8 @@ pub struct ParseErrorInfo {
     pub suggested_fix: Option<SuggestedFix>,
     /// `true` while an AI fix request is in flight.
     pub fix_in_progress: bool,
+    /// The error from the most recent failed fix request, if any.
+    pub fix_error: Option<String>,
 }
 
 /// A single task loaded from a markdown file.

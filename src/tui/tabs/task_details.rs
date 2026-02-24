@@ -221,6 +221,25 @@ fn render_malformed_view(
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Green)),
         )
+    } else if let Some(ref err) = error_info.fix_error {
+        let lines = vec![
+            Line::from(Span::styled(
+                "Fix request failed:",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::raw(err.clone())),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press 'f' to retry",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        Paragraph::new(lines).block(
+            Block::default()
+                .title("Fix Error")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
     } else {
         Paragraph::new("Press 'f' to request an AI fix suggestion.")
             .style(Style::default().fg(Color::DarkGray))
@@ -265,8 +284,9 @@ pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1St
         .filter(|q| q.answer.is_none())
         .collect();
 
-    // Each unanswered question gets ~5 rows (label + textarea), answered ~3 rows.
-    let questions_height = (answered.len() * 3 + unanswered.len() * 5) as u16;
+    // Unanswered: 7 rows (2-row wrapped label + 5-row textarea).
+    // Answered: 5 rows (bordered block with 3 content rows so long Q can wrap once + A line).
+    let questions_height = (unanswered.len() * 7 + answered.len() * 5) as u16;
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
@@ -326,13 +346,14 @@ pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1St
         return;
     }
 
-    // Stack answered and unanswered questions vertically within the questions area.
+    // Stack questions vertically.
+    // Display order: unanswered (newest first) at top, answered (newest first) below.
     let q_area = sections[3];
     let mut row_constraints: Vec<Constraint> = Vec::new();
-    for _q in &answered {
-        row_constraints.push(Constraint::Length(3));
-    }
     for _q in &unanswered {
+        row_constraints.push(Constraint::Length(7));
+    }
+    for _q in &answered {
         row_constraints.push(Constraint::Length(5));
     }
     if row_constraints.is_empty() {
@@ -345,7 +366,37 @@ pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1St
         .split(q_area);
 
     let mut row_idx = 0usize;
-    for q in &answered {
+
+    // Unanswered questions — newest first.
+    // `enumerate().rev()` preserves the original index so answer_inputs stays aligned.
+    for (answer_input_idx, q) in unanswered.iter().enumerate().rev() {
+        if row_idx >= q_rows.len() {
+            break;
+        }
+        let label = format!("Q ({}): {}", q.agent.display_name(), q.text);
+        let area = q_rows[row_idx];
+
+        // Split into 2-row wrapped label + Min(3) textarea (gets the remaining 5 rows).
+        let q_split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(3)])
+            .split(area);
+
+        let label_para = Paragraph::new(label)
+            .style(Style::default().add_modifier(Modifier::BOLD))
+            .wrap(ratatui::widgets::Wrap { trim: false });
+        frame.render_widget(label_para, q_split[0]);
+
+        if let Some(ta) = state.answer_inputs.get(answer_input_idx) {
+            frame.render_widget(ta, q_split[1]);
+        }
+
+        row_idx += 1;
+    }
+
+    // Answered questions — newest first.
+    // Bordered block with 3 content rows: long Q text can wrap once, A text below.
+    for q in answered.iter().rev() {
         if row_idx >= q_rows.len() {
             break;
         }
@@ -361,31 +412,10 @@ pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1St
                 Span::raw(answer_text.to_string()),
             ]),
         ];
-        let para = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
+        let para = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL))
+            .wrap(ratatui::widgets::Wrap { trim: false });
         frame.render_widget(para, q_rows[row_idx]);
-        row_idx += 1;
-    }
-
-    for (answer_input_idx, q) in unanswered.iter().enumerate() {
-        if row_idx >= q_rows.len() {
-            break;
-        }
-        let label = format!("Q ({}): {}", q.agent.display_name(), q.text);
-        let area = q_rows[row_idx];
-
-        // Split into label row (1) + textarea (4).
-        let q_split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(3)])
-            .split(area);
-
-        let label_para = Paragraph::new(label).style(Style::default().add_modifier(Modifier::BOLD));
-        frame.render_widget(label_para, q_split[0]);
-
-        if let Some(ta) = state.answer_inputs.get(answer_input_idx) {
-            frame.render_widget(ta, q_split[1]);
-        }
-
         row_idx += 1;
     }
 }
@@ -560,6 +590,7 @@ mod tests {
             raw_content: "raw bad content".to_string(),
             suggested_fix: None,
             fix_in_progress: false,
+            fix_error: None,
         });
         let state = Tab1State::new();
 
@@ -597,6 +628,7 @@ mod tests {
             raw_content: "raw file content here".to_string(),
             suggested_fix: None,
             fix_in_progress: false,
+            fix_error: None,
         });
         let state = Tab1State::new();
 
@@ -633,6 +665,7 @@ mod tests {
                 explanation: "Added missing Status line".to_string(),
             }),
             fix_in_progress: false,
+            fix_error: None,
         });
         let state = Tab1State::new();
 
@@ -680,6 +713,48 @@ mod tests {
         assert!(
             content.contains("Hello world"),
             "Buffer should contain description, got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_malformed_shows_fix_error() {
+        use crate::tasks::models::ParseErrorInfo;
+
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut task = make_task("desc");
+        task.parse_error = Some(ParseErrorInfo {
+            error_message: "parse error".to_string(),
+            raw_content: "bad content".to_string(),
+            suggested_fix: None,
+            fix_in_progress: false,
+            fix_error: Some("OpenCode server unavailable".to_string()),
+        });
+        let state = Tab1State::new();
+
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), Some(&task), &state);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect();
+        assert!(
+            content.contains("Fix request failed:"),
+            "should show fix error header; got: {content:?}"
+        );
+        assert!(
+            content.contains("OpenCode server unavailable"),
+            "should show fix error message; got: {content:?}"
+        );
+        assert!(
+            content.contains("Press 'f' to retry"),
+            "should show retry hint; got: {content:?}"
         );
     }
 }

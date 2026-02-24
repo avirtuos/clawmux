@@ -4,6 +4,7 @@
 //! the TUI layer, workflow engine, task store, and opencode client.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -20,7 +21,7 @@ use crate::tui::task_list::TaskListState;
 use crate::workflow::agents::AgentKind;
 use crate::workflow::prompt_composer::compose_user_message;
 use crate::workflow::response_parser::{parse_response, AgentResponse};
-use crate::workflow::transitions::WorkflowEngine;
+use crate::workflow::transitions::{WorkflowEngine, WorkflowPhase};
 
 /// Top-level application state.
 ///
@@ -60,6 +61,8 @@ pub struct App {
     pub async_tx: mpsc::Sender<AppMessage>,
     /// Buffer of messages produced by spawned tasks, drained on each Tick.
     pub pending_messages: Vec<AppMessage>,
+    /// Timestamp of the last `GET /session/status` poll to throttle requests.
+    pub last_status_poll: Instant,
 }
 
 impl App {
@@ -97,6 +100,7 @@ impl App {
             session_map,
             async_tx,
             pending_messages: Vec::new(),
+            last_status_poll: Instant::now(),
         }
     }
 
@@ -172,15 +176,101 @@ impl App {
                     vec![]
                 }
             }
-            AppMessage::Tick => std::mem::take(&mut self.pending_messages),
+            AppMessage::Tick => {
+                let msgs = std::mem::take(&mut self.pending_messages);
+
+                // Periodic liveness poll: every 5s, check sessions awaiting > 3s.
+                let awaiting_tasks = self.tab2_state.check_timeouts(Duration::from_secs(3));
+                if !awaiting_tasks.is_empty()
+                    && self.last_status_poll.elapsed() >= Duration::from_secs(5)
+                {
+                    self.last_status_poll = Instant::now();
+
+                    // Collect (task_id, session_id) pairs for sessions to verify.
+                    let sessions_to_check: Vec<(TaskId, String)> = awaiting_tasks
+                        .into_iter()
+                        .filter_map(|tid| {
+                            self.workflow_engine
+                                .state(&tid)
+                                .and_then(|s| s.session_id.clone().map(|sid| (tid, sid)))
+                        })
+                        .collect();
+
+                    if !sessions_to_check.is_empty() {
+                        if let Some(client) = self.opencode_client.clone() {
+                            let async_tx = self.async_tx.clone();
+                            tokio::spawn(async move {
+                                let statuses = match client.get_session_statuses().await {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        tracing::warn!("Session status poll failed: {}", e);
+                                        return;
+                                    }
+                                };
+                                for (task_id, session_id) in sessions_to_check {
+                                    let is_idle = matches!(
+                                        statuses.get(&session_id),
+                                        Some(crate::opencode::types::SessionStatus::Idle) | None
+                                    );
+                                    if !is_idle {
+                                        continue;
+                                    }
+                                    // Session idle: fetch messages for error details.
+                                    let error = match client.get_session_messages(&session_id).await {
+                                        Ok(messages) => messages
+                                            .iter()
+                                            .rev()
+                                            .find_map(|entry| {
+                                                if entry.info.role
+                                                    == crate::opencode::types::MessageRole::Assistant
+                                                {
+                                                    if let Some(ref err) = entry.info.error {
+                                                        return err.message.clone();
+                                                    }
+                                                    if entry.info.finish.as_deref() == Some("error") {
+                                                        return Some(
+                                                            "Session finished with error status"
+                                                                .to_string(),
+                                                        );
+                                                    }
+                                                }
+                                                None
+                                            })
+                                            .unwrap_or_else(|| {
+                                                "Session was idle after prompt -- OpenCode may have crashed silently".to_string()
+                                            }),
+                                        Err(e) => {
+                                            format!(
+                                                "Session was idle after prompt (message fetch failed: {})",
+                                                e
+                                            )
+                                        }
+                                    };
+                                    let _ = async_tx
+                                        .send(AppMessage::VerifySessionIdle {
+                                            task_id,
+                                            session_id,
+                                            error,
+                                        })
+                                        .await;
+                                }
+                            });
+                        }
+                    }
+                }
+                msgs
+            }
 
             // --- Streaming/tool activity ---
             AppMessage::StreamingUpdate {
                 task_id,
                 session_id: _,
+                message_id,
                 parts,
             } => {
-                self.tab2_state.push_streaming(&task_id, &parts);
+                self.tab2_state.clear_awaiting(&task_id);
+                self.tab2_state
+                    .push_streaming(&task_id, &message_id, &parts);
                 vec![]
             }
             AppMessage::ToolActivity {
@@ -199,6 +289,7 @@ impl App {
                     if let Some(ref mut err_info) = task.parse_error {
                         err_info.fix_in_progress = true;
                         err_info.suggested_fix = None;
+                        err_info.fix_error = None;
                     }
                 }
                 vec![]
@@ -224,6 +315,7 @@ impl App {
                 if let Some(task) = self.task_store.get_mut(&task_id) {
                     if let Some(ref mut err_info) = task.parse_error {
                         err_info.fix_in_progress = false;
+                        err_info.fix_error = Some(error);
                     }
                 }
                 vec![]
@@ -301,9 +393,20 @@ impl App {
                     .state(&task_id)
                     .map(|s| s.current_agent)
                     .unwrap_or(AgentKind::Intake);
+                self.tab2_state.clear_awaiting(&task_id);
+                self.tab2_state.push_banner(
+                    &task_id,
+                    format!("ERROR ({}): {}", current_agent.display_name(), error),
+                );
+                tracing::warn!(
+                    "Session error for task {} ({}): {}",
+                    task_id,
+                    current_agent.display_name(),
+                    error
+                );
                 if let Some(task) = self.task_store.get_mut(&task_id) {
                     let seq = task.work_log.len() as u32 + 1;
-                    task.work_log.push(WorkLogEntry {
+                    task.work_log.push(WorkLogEntry::Parsed {
                         sequence: seq,
                         timestamp: chrono::Utc::now(),
                         agent: current_agent,
@@ -319,11 +422,25 @@ impl App {
                 msgs
             }
 
+            // --- HumanAnswered: show answer in activity tab then forward to engine ---
+            AppMessage::HumanAnswered {
+                task_id,
+                question_index,
+                answer,
+            } => {
+                self.tab2_state
+                    .push_banner(&task_id, format!("[You] {}", answer));
+                self.workflow_engine.process(AppMessage::HumanAnswered {
+                    task_id,
+                    question_index,
+                    answer,
+                })
+            }
+
             // --- Workflow messages: forward to engine ---
             AppMessage::AgentCompleted { .. }
             | AppMessage::AgentKickedBack { .. }
             | AppMessage::AgentAskedQuestion { .. }
-            | AppMessage::HumanAnswered { .. }
             | AppMessage::HumanApprovedReview { .. }
             | AppMessage::HumanRequestedRevisions { .. }
             | AppMessage::SessionCreated { .. } => self.workflow_engine.process(msg),
@@ -334,6 +451,7 @@ impl App {
                 session_id: _,
                 response_text,
             } => {
+                self.tab2_state.clear_awaiting(&task_id);
                 let current_agent = self
                     .workflow_engine
                     .state(&task_id)
@@ -355,7 +473,7 @@ impl App {
                                 }
                             }
                             let seq = task.work_log.len() as u32 + 1;
-                            task.work_log.push(WorkLogEntry {
+                            task.work_log.push(WorkLogEntry::Parsed {
                                 sequence: seq,
                                 timestamp: chrono::Utc::now(),
                                 agent: current_agent.unwrap_or(AgentKind::Intake),
@@ -363,6 +481,15 @@ impl App {
                             });
                         }
                         let agent = current_agent.unwrap_or(AgentKind::Intake);
+                        let truncated = if summary.len() > 80 {
+                            format!("{}...", &summary[..80])
+                        } else {
+                            summary.clone()
+                        };
+                        self.tab2_state.push_banner(
+                            &task_id,
+                            format!("{} completed: {}", agent.display_name(), truncated),
+                        );
                         let mut msgs = self.workflow_engine.process(AppMessage::AgentCompleted {
                             task_id: task_id.clone(),
                             agent,
@@ -382,6 +509,10 @@ impl App {
                                 answer: None,
                             });
                         }
+                        self.tab2_state.push_banner(
+                            &task_id,
+                            format!("{} has a question (see Task Details)", agent.display_name()),
+                        );
                         let mut msgs =
                             self.workflow_engine
                                 .process(AppMessage::AgentAskedQuestion {
@@ -400,6 +531,20 @@ impl App {
                     }) => {
                         let from = current_agent.unwrap_or(AgentKind::Intake);
                         let to = AgentKind::from_display_name(&target_agent).unwrap_or(from);
+                        let truncated_reason = if reason.len() > 80 {
+                            format!("{}...", &reason[..80])
+                        } else {
+                            reason.clone()
+                        };
+                        self.tab2_state.push_banner(
+                            &task_id,
+                            format!(
+                                "{} kicked back to {}: {}",
+                                from.display_name(),
+                                to.display_name(),
+                                truncated_reason
+                            ),
+                        );
                         self.workflow_engine.process(AppMessage::AgentKickedBack {
                             task_id,
                             from,
@@ -413,6 +558,10 @@ impl App {
                         tracing::warn!(
                             "Could not parse structured output for task {}; advancing with fallback",
                             task_id
+                        );
+                        self.tab2_state.push_banner(
+                            &task_id,
+                            "Agent output could not be parsed; advancing".to_string(),
                         );
                         self.workflow_engine.process(AppMessage::AgentCompleted {
                             task_id,
@@ -430,6 +579,13 @@ impl App {
                 context,
                 prompt: _,
             } => {
+                // Push lifecycle banners before spawning so Tab 2 shows activity immediately.
+                let agent_name = agent.display_name().to_string();
+                self.tab2_state
+                    .push_banner(&task_id, format!("--- {} ---", agent_name));
+                self.tab2_state
+                    .push_banner(&task_id, "Creating session...".to_string());
+
                 // Build the real prompt from task context; ignore the placeholder prompt field.
                 let prompt = self
                     .task_store
@@ -438,6 +594,16 @@ impl App {
                     .unwrap_or_else(|| {
                         format!("Begin task {} as {} agent.", task_id, agent.display_name())
                     });
+
+                // Show prompt content in the activity tab (truncated to 500 chars).
+                let display_len = prompt.len().min(500);
+                let prompt_preview = if prompt.len() > 500 {
+                    format!("{}...", &prompt[..display_len])
+                } else {
+                    prompt.clone()
+                };
+                self.tab2_state
+                    .push_banner(&task_id, format!("[Prompt] {}", prompt_preview));
 
                 let client = match self.opencode_client.clone() {
                     Some(c) => c,
@@ -471,13 +637,23 @@ impl App {
                         let mut map = session_map.write().await;
                         map.insert(session.id.clone(), (task_id.clone(), agent));
                     }
-                    if let Err(e) = client.send_prompt_async(&session.id, &agent, &prompt).await {
+                    if let Err(e) = client
+                        .send_prompt_async(&session.id, Some(&agent), &prompt)
+                        .await
+                    {
                         session_map.write().await.remove(&session.id);
                         let _ = async_tx
                             .send(AppMessage::SessionError {
                                 task_id,
                                 session_id: session.id,
                                 error: format!("Failed to send prompt: {e}"),
+                            })
+                            .await;
+                    } else {
+                        let _ = async_tx
+                            .send(AppMessage::PromptSent {
+                                task_id,
+                                session_id: session.id,
                             })
                             .await;
                     }
@@ -522,7 +698,10 @@ impl App {
                             return;
                         }
                     };
-                    if let Err(e) = client.send_prompt_async(&session_id, &agent, &prompt).await {
+                    if let Err(e) = client
+                        .send_prompt_async(&session_id, Some(&agent), &prompt)
+                        .await
+                    {
                         let _ = async_tx
                             .send(AppMessage::SessionError {
                                 task_id,
@@ -533,6 +712,42 @@ impl App {
                     }
                 });
                 vec![]
+            }
+
+            AppMessage::PromptSent { task_id, .. } => {
+                let agent_name = self
+                    .workflow_engine
+                    .state(&task_id)
+                    .map(|s| s.current_agent.display_name().to_string())
+                    .unwrap_or_else(|| "Agent".to_string());
+                self.tab2_state
+                    .push_banner(&task_id, "Prompt sent.".to_string());
+                self.tab2_state.set_awaiting_response(&task_id, agent_name);
+                vec![]
+            }
+
+            AppMessage::VerifySessionIdle {
+                task_id,
+                session_id,
+                error,
+            } => {
+                // Guard: only act if the workflow engine still has this exact session
+                // in the Running phase. If the session already completed or moved on,
+                // this is a stale verification and should be ignored.
+                let is_active = self.workflow_engine.state(&task_id).is_some_and(|s| {
+                    s.session_id.as_deref() == Some(&session_id)
+                        && s.phase == WorkflowPhase::Running
+                });
+                if is_active {
+                    self.tab2_state.clear_awaiting(&task_id);
+                    vec![AppMessage::SessionError {
+                        task_id,
+                        session_id,
+                        error,
+                    }]
+                } else {
+                    vec![]
+                }
             }
 
             AppMessage::AbortSession {
@@ -670,6 +885,24 @@ mod tests {
         assert!(app.pending_messages.is_empty());
     }
 
+    /// Verifies that Tick does not emit SessionError for a freshly started awaiting session.
+    #[test]
+    fn test_handle_tick_does_not_timeout_fresh_session() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+        // Simulate a prompt having just been sent.
+        app.tab2_state
+            .set_awaiting_response(&task_id, "Intake Agent".to_string());
+        // Tick with a fresh session should not produce a SessionError.
+        let msgs = app.handle_message(AppMessage::Tick);
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, AppMessage::SessionError { .. })),
+            "fresh awaiting session should not trigger a timeout on Tick"
+        );
+    }
+
     /// Verifies two-phase quit: first Shutdown shows dialog, second sets should_quit.
     #[test]
     fn test_handle_shutdown() {
@@ -778,6 +1011,7 @@ mod tests {
         let msgs = app.handle_message(AppMessage::StreamingUpdate {
             task_id: task_id.clone(),
             session_id: "sess-1".to_string(),
+            message_id: "msg-1".to_string(),
             parts: vec![MessagePart::Text {
                 text: "hello from agent".to_string(),
             }],
@@ -864,6 +1098,7 @@ mod tests {
                 raw_content: "bad content".to_string(),
                 suggested_fix: None,
                 fix_in_progress: false,
+                fix_error: None,
             }),
         }
     }
@@ -948,6 +1183,7 @@ mod tests {
                     explanation: "Added Status line".to_string(),
                 }),
                 fix_in_progress: false,
+                fix_error: None,
             }),
         };
         let id = task.id.clone();
@@ -1000,6 +1236,7 @@ mod tests {
                     explanation: "Attempted fix".to_string(),
                 }),
                 fix_in_progress: false,
+                fix_error: None,
             }),
         };
         let id = task.id.clone();
@@ -1205,9 +1442,389 @@ mod tests {
         // Work log should contain the error entry.
         let task = app.task_store.get(&task_id).expect("task should exist");
         assert_eq!(task.work_log.len(), 1, "work log should have one entry");
+        let description = match &task.work_log[0] {
+            WorkLogEntry::Parsed { description, .. } => description.as_str(),
+            WorkLogEntry::Raw { text, .. } => text.as_str(),
+        };
         assert!(
-            task.work_log[0].description.contains("rate limit exceeded"),
+            description.contains("rate limit exceeded"),
             "work log entry should include the error message"
+        );
+    }
+
+    /// Verifies that CreateSession pushes banner lines including the prompt text into Tab2.
+    #[test]
+    fn test_handle_create_session_pushes_banners() {
+        use crate::tui::tabs::agent_activity::ActivityLine;
+
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        // Dispatch CreateSession (no opencode client -- will produce SessionError,
+        // but the banners should be pushed synchronously before spawning).
+        app.handle_message(AppMessage::CreateSession {
+            task_id: task_id.clone(),
+            agent: AgentKind::Intake,
+            context: None,
+            prompt: String::new(),
+        });
+
+        let lines = app.tab2_state.lines_for(&task_id);
+        assert!(
+            lines.len() >= 2,
+            "expected at least 2 banner lines, got {}",
+            lines.len()
+        );
+        assert!(
+            matches!(&lines[0], ActivityLine::AgentBanner { message } if message.contains("Intake")),
+            "first line should be the agent name banner: {:?}",
+            lines[0]
+        );
+        assert!(
+            matches!(&lines[1], ActivityLine::AgentBanner { message } if message.contains("Creating session")),
+            "second line should be 'Creating session...': {:?}",
+            lines[1]
+        );
+    }
+
+    /// Verifies that CreateSession pushes a [Prompt] banner with the composed prompt text.
+    #[test]
+    fn test_handle_create_session_pushes_prompt_banner() {
+        use crate::tui::tabs::agent_activity::ActivityLine;
+
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        app.handle_message(AppMessage::CreateSession {
+            task_id: task_id.clone(),
+            agent: AgentKind::Intake,
+            context: None,
+            prompt: String::new(),
+        });
+
+        let lines = app.tab2_state.lines_for(&task_id);
+        let prompt_banner = lines.iter().find(|l| {
+            matches!(l, ActivityLine::AgentBanner { message } if message.starts_with("[Prompt]"))
+        });
+        assert!(
+            prompt_banner.is_some(),
+            "expected a [Prompt] banner in Tab2 lines: {:?}",
+            lines
+        );
+    }
+
+    /// Verifies that HumanAnswered pushes a [You] banner before forwarding to the engine.
+    #[test]
+    fn test_handle_human_answered_pushes_banner() {
+        use crate::tasks::models::{Question, Task, TaskStatus};
+        use crate::tui::tabs::agent_activity::ActivityLine;
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: None,
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: vec![Question {
+                agent: AgentKind::Intake,
+                text: "What is the scope?".to_string(),
+                answer: None,
+            }],
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+        app.workflow_engine.process(AppMessage::StartTask {
+            task_id: task_id.clone(),
+        });
+
+        app.handle_message(AppMessage::HumanAnswered {
+            task_id: task_id.clone(),
+            question_index: 0,
+            answer: "The scope is minimal.".to_string(),
+        });
+
+        let lines = app.tab2_state.lines_for(&task_id);
+        assert!(
+            lines.iter().any(|l| matches!(
+                l,
+                ActivityLine::AgentBanner { message }
+                if message == "[You] The scope is minimal."
+            )),
+            "expected a [You] banner in Tab2 lines: {:?}",
+            lines
+        );
+    }
+
+    /// Verifies that PromptSent pushes a banner and sets awaiting state.
+    #[test]
+    fn test_handle_prompt_sent_sets_awaiting() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        let msgs = app.handle_message(AppMessage::PromptSent {
+            task_id: task_id.clone(),
+            session_id: "sess-1".to_string(),
+        });
+        assert!(msgs.is_empty());
+
+        // The status line should now be active.
+        let status = app.tab2_state.elapsed_status(&task_id);
+        assert!(
+            status.is_some(),
+            "elapsed_status should be set after PromptSent"
+        );
+    }
+
+    /// Verifies that StreamingUpdate clears the awaiting state.
+    #[test]
+    fn test_handle_streaming_update_clears_awaiting() {
+        use crate::opencode::types::MessagePart;
+
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        // Manually set awaiting state.
+        app.tab2_state
+            .set_awaiting_response(&task_id, "Intake Agent".to_string());
+        assert!(app.tab2_state.elapsed_status(&task_id).is_some());
+
+        app.handle_message(AppMessage::StreamingUpdate {
+            task_id: task_id.clone(),
+            session_id: "sess-1".to_string(),
+            message_id: "msg-1".to_string(),
+            parts: vec![MessagePart::Text {
+                text: "hello".to_string(),
+            }],
+        });
+
+        assert!(
+            app.tab2_state.elapsed_status(&task_id).is_none(),
+            "StreamingUpdate should clear the awaiting state"
+        );
+    }
+
+    /// Verifies that SessionError pushes an error banner.
+    #[test]
+    fn test_handle_session_error_pushes_banner() {
+        use crate::tui::tabs::agent_activity::ActivityLine;
+
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        app.handle_message(AppMessage::SessionError {
+            task_id: task_id.clone(),
+            session_id: "sess-err".to_string(),
+            error: "timeout".to_string(),
+        });
+
+        let lines = app.tab2_state.lines_for(&task_id);
+        assert!(
+            lines
+                .iter()
+                .any(|l| matches!(l, ActivityLine::AgentBanner { message }
+                if message.contains("ERROR") && message.contains("timeout"))),
+            "expected an error banner in Tab2 lines: {:?}",
+            lines
+        );
+    }
+
+    /// Helper: builds a task in progress and registers its session ID in the workflow engine.
+    fn make_task_with_active_session(app: &mut App, session_id: &str) -> TaskId {
+        let task_id = make_task_in_progress(app);
+        // Register the session in the workflow engine so phase == Running and session_id is set.
+        app.workflow_engine.process(AppMessage::SessionCreated {
+            task_id: task_id.clone(),
+            session_id: session_id.to_string(),
+        });
+        // Set awaiting state on tab2.
+        app.tab2_state
+            .set_awaiting_response(&task_id, "Intake Agent".to_string());
+        task_id
+    }
+
+    /// VerifySessionIdle with a matching active session escalates to SessionError.
+    #[test]
+    fn test_handle_verify_session_idle_active_session() {
+        let mut app = App::test_default();
+        let task_id = make_task_with_active_session(&mut app, "sess-abc");
+
+        let msgs = app.handle_message(AppMessage::VerifySessionIdle {
+            task_id: task_id.clone(),
+            session_id: "sess-abc".to_string(),
+            error: "agent.model on undefined".to_string(),
+        });
+
+        assert_eq!(msgs.len(), 1, "should produce exactly one SessionError");
+        assert!(
+            matches!(
+                &msgs[0],
+                AppMessage::SessionError { session_id, error, .. }
+                    if session_id == "sess-abc" && error.contains("agent.model")
+            ),
+            "expected SessionError with correct fields, got: {:?}",
+            msgs[0]
+        );
+        // Awaiting state should be cleared.
+        assert!(
+            app.tab2_state.elapsed_status(&task_id).is_none(),
+            "awaiting state should be cleared after VerifySessionIdle"
+        );
+    }
+
+    /// VerifySessionIdle is ignored when the session has already completed.
+    #[test]
+    fn test_handle_verify_session_idle_session_already_completed() {
+        let mut app = App::test_default();
+        let task_id = make_task_with_active_session(&mut app, "sess-abc");
+
+        // Advance workflow to PendingReview (session completed normally).
+        app.workflow_engine.process(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-abc".to_string(),
+            response_text: String::new(),
+        });
+
+        let msgs = app.handle_message(AppMessage::VerifySessionIdle {
+            task_id: task_id.clone(),
+            session_id: "sess-abc".to_string(),
+            error: "stale idle detection".to_string(),
+        });
+
+        assert!(
+            msgs.is_empty(),
+            "stale VerifySessionIdle should be ignored, got: {:?}",
+            msgs
+        );
+    }
+
+    /// VerifySessionIdle is ignored when the session_id no longer matches.
+    #[test]
+    fn test_handle_verify_session_idle_mismatched_session_id() {
+        let mut app = App::test_default();
+        // Task uses "sess-new", but VerifySessionIdle refers to "sess-old".
+        make_task_with_active_session(&mut app, "sess-new");
+        let task_id = TaskId::from_path("tasks/1.1.md");
+
+        let msgs = app.handle_message(AppMessage::VerifySessionIdle {
+            task_id: task_id.clone(),
+            session_id: "sess-old".to_string(),
+            error: "stale session".to_string(),
+        });
+
+        assert!(
+            msgs.is_empty(),
+            "mismatched session_id should be ignored, got: {:?}",
+            msgs
+        );
+    }
+
+    /// TaskFixFailed stores the error message in parse_error.fix_error.
+    #[test]
+    fn test_handle_task_fix_failed_stores_error() {
+        use crate::tasks::TaskId;
+
+        let mut app = App::test_default();
+        app.task_store.insert(make_malformed_task());
+
+        let id = TaskId::from_path("tasks/1.1.md");
+        let responses = app.handle_message(AppMessage::TaskFixFailed {
+            task_id: id.clone(),
+            error: "OpenCode server unavailable".to_string(),
+        });
+        assert!(responses.is_empty());
+        let task = app.task_store.get(&id).unwrap();
+        let err_info = task.parse_error.as_ref().unwrap();
+        assert!(!err_info.fix_in_progress);
+        assert_eq!(
+            err_info.fix_error.as_deref(),
+            Some("OpenCode server unavailable")
+        );
+    }
+
+    /// RequestTaskFix clears any previous fix_error.
+    #[test]
+    fn test_request_task_fix_clears_previous_error() {
+        use crate::tasks::TaskId;
+
+        let mut app = App::test_default();
+        let mut task = make_malformed_task();
+        // Pre-seed a fix error from a previous failed attempt.
+        if let Some(ref mut e) = task.parse_error {
+            e.fix_error = Some("previous error".to_string());
+        }
+        app.task_store.insert(task);
+
+        let id = TaskId::from_path("tasks/1.1.md");
+        let responses = app.handle_message(AppMessage::RequestTaskFix {
+            task_id: id.clone(),
+        });
+        assert!(responses.is_empty());
+        let task = app.task_store.get(&id).unwrap();
+        let err_info = task.parse_error.as_ref().unwrap();
+        assert!(err_info.fix_in_progress);
+        assert!(err_info.fix_error.is_none(), "fix_error should be cleared");
+    }
+
+    /// VerifySessionIdle is ignored for a task with no workflow state.
+    #[test]
+    fn test_handle_verify_session_idle_unknown_task() {
+        let mut app = App::test_default();
+        let unknown_id = TaskId::from_path("tasks/99.99.md");
+
+        let msgs = app.handle_message(AppMessage::VerifySessionIdle {
+            task_id: unknown_id,
+            session_id: "sess-xyz".to_string(),
+            error: "ghost session".to_string(),
+        });
+
+        assert!(
+            msgs.is_empty(),
+            "VerifySessionIdle for unknown task should be ignored"
+        );
+    }
+
+    /// Tick does not emit SessionError for a freshly awaiting session (< 3s).
+    #[test]
+    fn test_tick_does_not_poll_before_3s() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+        // Simulate a prompt just sent.
+        app.tab2_state
+            .set_awaiting_response(&task_id, "Intake Agent".to_string());
+        // Tick immediately: check_timeouts(3s) returns empty, so no poll fires.
+        let msgs = app.handle_message(AppMessage::Tick);
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, AppMessage::SessionError { .. })),
+            "Tick should not emit SessionError for a fresh awaiting session"
+        );
+    }
+
+    /// Tick does not poll when last_status_poll was less than 5s ago.
+    #[test]
+    fn test_tick_does_not_poll_within_5s_cooldown() {
+        let mut app = App::test_default();
+        // last_status_poll defaults to Instant::now() in App::new(), so it's very recent.
+        let task_id = make_task_in_progress(&mut app);
+        app.tab2_state
+            .set_awaiting_response(&task_id, "Intake Agent".to_string());
+        // Tick: even if there were timed-out sessions, last_status_poll.elapsed() < 5s.
+        let msgs = app.handle_message(AppMessage::Tick);
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, AppMessage::SessionError { .. })),
+            "Tick should not poll when last_status_poll is recent"
         );
     }
 }

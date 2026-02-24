@@ -902,6 +902,7 @@ mod tests {
                 raw_content: "bad content".to_string(),
                 suggested_fix: None,
                 fix_in_progress: false,
+                fix_error: None,
             }),
         };
         app.task_store.insert(task);

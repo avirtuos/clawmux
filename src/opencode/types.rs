@@ -119,7 +119,9 @@ pub struct OpenCodeSession {
     /// Unique session identifier.
     pub id: String,
     /// UTC timestamp when the session was created.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Optional because the API may send timestamps in a different format/location.
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A message within an opencode session.
@@ -144,30 +146,59 @@ pub struct OpenCodeMessage {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum OpenCodeEvent {
     /// A new session was created.
-    SessionCreated { session_id: String },
+    SessionCreated {
+        #[serde(alias = "sessionId")]
+        session_id: String,
+    },
     /// A new message was created in a session.
     MessageCreated {
+        #[serde(alias = "sessionId")]
         session_id: String,
         message: OpenCodeMessage,
     },
     /// An existing message's parts were updated.
     MessageUpdated {
+        #[serde(alias = "sessionId")]
         session_id: String,
+        #[serde(alias = "messageId")]
         message_id: String,
         parts: Vec<MessagePart>,
     },
     /// A tool is currently being executed.
-    ToolExecuting { session_id: String, tool: String },
+    ToolExecuting {
+        #[serde(alias = "sessionId")]
+        session_id: String,
+        tool: String,
+    },
     /// A tool finished executing.
     ToolCompleted {
+        #[serde(alias = "sessionId")]
         session_id: String,
         tool: String,
         result: String,
     },
+    /// An incremental text delta for a message part (OpenCode >= 1.2 streaming format).
+    MessagePartDelta {
+        #[serde(alias = "sessionID")]
+        session_id: String,
+        #[serde(alias = "messageID")]
+        message_id: String,
+        /// The field being updated (e.g. "text").
+        field: String,
+        /// Incremental text chunk to append.
+        delta: String,
+    },
     /// A session completed successfully.
-    SessionCompleted { session_id: String },
+    SessionCompleted {
+        #[serde(alias = "sessionId")]
+        session_id: String,
+    },
     /// A session encountered an error.
-    SessionError { session_id: String, error: String },
+    SessionError {
+        #[serde(alias = "sessionId")]
+        session_id: String,
+        error: String,
+    },
     /// An unrecognized event type; ignored gracefully for forward compatibility.
     #[serde(other)]
     Unknown,
@@ -186,13 +217,13 @@ pub enum ContentPart {
     Text { text: String },
 }
 
-/// Request body for `POST /session/:id/message`.
+/// Request body for `POST /session/:id/prompt_async`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendMessageRequest {
-    /// The content parts of the message.
-    pub content: Vec<ContentPart>,
+    /// The content parts of the message (field name matches the opencode API).
+    pub parts: Vec<ContentPart>,
     /// Optional agent identifier to route the message to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
@@ -213,6 +244,74 @@ pub struct HealthResponse {
     pub healthy: bool,
     /// The server version string, if provided by the server.
     pub version: Option<String>,
+}
+
+/// The runtime status of an opencode session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum SessionStatus {
+    /// Session is idle (no active processing).
+    Idle,
+    /// Session is actively processing a prompt.
+    Busy,
+    /// Session is retrying after a transient failure.
+    Retry {
+        attempt: u32,
+        message: String,
+        next: u64,
+    },
+}
+
+/// Response body for `GET /session/status`.
+pub type SessionStatusResponse = std::collections::HashMap<String, SessionStatus>;
+
+/// Timing metadata for a message in the session message listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageTime {
+    /// When processing started (epoch ms), if available.
+    #[serde(default)]
+    pub created: Option<u64>,
+    /// When processing completed (epoch ms), if available.
+    #[serde(default)]
+    pub completed: Option<u64>,
+}
+
+/// An error attached to an assistant message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageError {
+    /// Human-readable error message.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// Info block for a message in the `GET /session/:id/message` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageInfo {
+    /// Message role (user/assistant).
+    pub role: MessageRole,
+    /// How the message finished (e.g. "end_turn", "error"), if at all.
+    #[serde(default)]
+    pub finish: Option<String>,
+    /// Error details, if the message errored.
+    #[serde(default)]
+    pub error: Option<MessageError>,
+    /// Timing metadata.
+    #[serde(default)]
+    pub time: Option<MessageTime>,
+}
+
+/// A single entry in the `GET /session/:id/message` response array.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageEntry {
+    /// Message metadata (role, finish reason, error, timing).
+    pub info: MessageInfo,
+    /// The content parts of this message.
+    #[serde(default)]
+    pub parts: Vec<MessagePart>,
 }
 
 #[cfg(test)]
@@ -284,6 +383,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_opencode_event_camel_case_field() {
+        // The API sends camelCase field names (e.g. "sessionId"); aliases must accept them.
+        let json = r#"{"type":"sessionCreated","sessionId":"s1"}"#;
+        let event: OpenCodeEvent = serde_json::from_str(json).expect("deserialize");
+        assert!(
+            matches!(event, OpenCodeEvent::SessionCreated { ref session_id } if session_id == "s1"),
+            "unexpected variant: {event:?}"
+        );
+    }
+
     // --- OpenCodeMessage ---
 
     #[test]
@@ -307,7 +417,7 @@ mod tests {
     fn test_send_message_request_agent_omitted() {
         // When agent is None the "agent" key must be absent from the serialized JSON.
         let req = SendMessageRequest {
-            content: vec![ContentPart::Text {
+            parts: vec![ContentPart::Text {
                 text: "hello".to_string(),
             }],
             agent: None,
@@ -318,8 +428,8 @@ mod tests {
             "\"agent\" key should be absent when None, got: {json}"
         );
         assert!(
-            json.contains("\"content\""),
-            "\"content\" key should be present, got: {json}"
+            json.contains("\"parts\""),
+            "\"parts\" key should be present, got: {json}"
         );
     }
 
@@ -327,7 +437,7 @@ mod tests {
     fn test_send_message_request_agent_present() {
         // When agent is Some the "agent" key must appear in the serialized JSON.
         let req = SendMessageRequest {
-            content: vec![ContentPart::Text {
+            parts: vec![ContentPart::Text {
                 text: "hello".to_string(),
             }],
             agent: Some("claude".to_string()),
@@ -359,9 +469,20 @@ mod tests {
 
     #[test]
     fn test_create_session_response_deserialize() {
+        // API does not send createdAt; only id is required.
+        let json = r#"{"id":"sess-1"}"#;
+        let resp: CreateSessionResponse = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(resp.0.id, "sess-1");
+        assert!(resp.0.created_at.is_none());
+    }
+
+    #[test]
+    fn test_create_session_response_with_created_at() {
+        // If a server does send createdAt, it should still deserialize correctly.
         let json = r#"{"id":"sess-1","createdAt":"2024-01-01T00:00:00Z"}"#;
         let resp: CreateSessionResponse = serde_json::from_str(json).expect("deserialize");
         assert_eq!(resp.0.id, "sess-1");
+        assert!(resp.0.created_at.is_some());
     }
 
     #[test]
@@ -387,5 +508,83 @@ mod tests {
         let resp: HealthResponse = serde_json::from_str(json).expect("deserialize");
         assert!(resp.healthy);
         assert_eq!(resp.version, None);
+    }
+
+    // --- SessionStatus ---
+
+    #[test]
+    fn test_session_status_idle_deserialize() {
+        let json = r#"{"type":"idle"}"#;
+        let status: SessionStatus = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(status, SessionStatus::Idle);
+    }
+
+    #[test]
+    fn test_session_status_busy_deserialize() {
+        let json = r#"{"type":"busy"}"#;
+        let status: SessionStatus = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(status, SessionStatus::Busy);
+    }
+
+    #[test]
+    fn test_session_status_retry_deserialize() {
+        let json = r#"{"type":"retry","attempt":2,"message":"rate limited","next":1700000000}"#;
+        let status: SessionStatus = serde_json::from_str(json).expect("deserialize");
+        assert!(
+            matches!(
+                &status,
+                SessionStatus::Retry { attempt: 2, message, next: 1700000000 }
+                    if message == "rate limited"
+            ),
+            "unexpected: {status:?}"
+        );
+    }
+
+    #[test]
+    fn test_session_status_response_deserialize() {
+        let json = r#"{"sess-1":{"type":"idle"},"sess-2":{"type":"busy"}}"#;
+        let resp: SessionStatusResponse = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(resp.get("sess-1"), Some(&SessionStatus::Idle));
+        assert_eq!(resp.get("sess-2"), Some(&SessionStatus::Busy));
+    }
+
+    // --- MessageEntry ---
+
+    #[test]
+    fn test_message_entry_with_error_deserialize() {
+        let json = r#"{
+            "info": {
+                "role": "assistant",
+                "finish": "error",
+                "error": {"message": "agent.model on undefined"}
+            },
+            "parts": []
+        }"#;
+        let entry: MessageEntry = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(entry.info.role, MessageRole::Assistant);
+        assert_eq!(entry.info.finish.as_deref(), Some("error"));
+        assert_eq!(
+            entry.info.error.as_ref().and_then(|e| e.message.as_deref()),
+            Some("agent.model on undefined")
+        );
+    }
+
+    #[test]
+    fn test_message_entry_completed_deserialize() {
+        let json = r#"{
+            "info": {
+                "role": "assistant",
+                "finish": "end_turn",
+                "time": {"created": 1000, "completed": 2000}
+            },
+            "parts": [{"type":"text","text":"done"}]
+        }"#;
+        let entry: MessageEntry = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(entry.info.finish.as_deref(), Some("end_turn"));
+        assert!(entry.info.error.is_none());
+        let time = entry.info.time.as_ref().expect("time");
+        assert_eq!(time.created, Some(1000));
+        assert_eq!(time.completed, Some(2000));
+        assert_eq!(entry.parts.len(), 1);
     }
 }

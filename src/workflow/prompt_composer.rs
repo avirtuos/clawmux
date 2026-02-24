@@ -150,13 +150,25 @@ fn section_work_log(task: &Task) -> Option<String> {
         ));
     }
     for entry in task.work_log.iter().skip(skip) {
-        lines.push(format!(
-            "[{}] {} [{}] {}",
-            entry.sequence,
-            entry.timestamp.format("%Y-%m-%dT%H:%M:%SZ"),
-            entry.agent.display_name(),
-            entry.description
-        ));
+        match entry {
+            crate::tasks::models::WorkLogEntry::Parsed {
+                sequence,
+                timestamp,
+                agent,
+                description,
+            } => {
+                lines.push(format!(
+                    "[{}] {} [{}] {}",
+                    sequence,
+                    timestamp.format("%Y-%m-%dT%H:%M:%SZ"),
+                    agent.display_name(),
+                    description
+                ));
+            }
+            crate::tasks::models::WorkLogEntry::Raw { text, .. } => {
+                lines.push(format!("[raw] {text}"));
+            }
+        }
     }
     Some(lines.join("\n"))
 }
@@ -289,13 +301,13 @@ mod tests {
             design: Some("Use a SectionConfig struct.".to_string()),
             implementation_plan: Some("Step 1: write section builders.".to_string()),
             work_log: vec![
-                WorkLogEntry {
+                WorkLogEntry::Parsed {
                     sequence: 1,
                     timestamp: Utc::now(),
                     agent: AgentKind::Intake,
                     description: "Gathered requirements.".to_string(),
                 },
-                WorkLogEntry {
+                WorkLogEntry::Parsed {
                     sequence: 2,
                     timestamp: Utc::now(),
                     agent: AgentKind::Design,
@@ -392,7 +404,7 @@ mod tests {
     fn test_compose_work_log_truncated() {
         let mut task = make_test_task();
         task.work_log = (1u32..=15)
-            .map(|i| WorkLogEntry {
+            .map(|i| WorkLogEntry::Parsed {
                 sequence: i,
                 timestamp: Utc::now(),
                 agent: AgentKind::Implementation,
