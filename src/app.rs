@@ -290,6 +290,35 @@ impl App {
                 msgs
             }
 
+            // --- SessionError: record error in work log then forward to engine ---
+            AppMessage::SessionError {
+                task_id,
+                session_id,
+                error,
+            } => {
+                let current_agent = self
+                    .workflow_engine
+                    .state(&task_id)
+                    .map(|s| s.current_agent)
+                    .unwrap_or(AgentKind::Intake);
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    let seq = task.work_log.len() as u32 + 1;
+                    task.work_log.push(WorkLogEntry {
+                        sequence: seq,
+                        timestamp: chrono::Utc::now(),
+                        agent: current_agent,
+                        description: format!("Session error: {}", error),
+                    });
+                }
+                let mut msgs = self.workflow_engine.process(AppMessage::SessionError {
+                    task_id: task_id.clone(),
+                    session_id,
+                    error,
+                });
+                msgs.push(AppMessage::TaskUpdated { task_id });
+                msgs
+            }
+
             // --- Workflow messages: forward to engine ---
             AppMessage::AgentCompleted { .. }
             | AppMessage::AgentKickedBack { .. }
@@ -297,8 +326,7 @@ impl App {
             | AppMessage::HumanAnswered { .. }
             | AppMessage::HumanApprovedReview { .. }
             | AppMessage::HumanRequestedRevisions { .. }
-            | AppMessage::SessionCreated { .. }
-            | AppMessage::SessionError { .. } => self.workflow_engine.process(msg),
+            | AppMessage::SessionCreated { .. } => self.workflow_engine.process(msg),
 
             // --- SessionCompleted: parse agent response and dispatch semantic message ---
             AppMessage::SessionCompleted {
@@ -1129,6 +1157,57 @@ mod tests {
         assert!(
             msgs.iter().any(|m| matches!(m, AppMessage::CreateSession { agent, .. } if *agent == AgentKind::Design)),
             "expected CreateSession for Design after fallback, got: {msgs:?}"
+        );
+    }
+
+    /// Verifies that SessionError adds a work log entry and emits TaskUpdated.
+    #[test]
+    fn test_handle_session_error_adds_work_log_entry() {
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: None,
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+        // Initialize workflow state so current_agent is known.
+        app.workflow_engine.process(AppMessage::StartTask {
+            task_id: task_id.clone(),
+        });
+
+        let msgs = app.handle_message(AppMessage::SessionError {
+            task_id: task_id.clone(),
+            session_id: "sess-err".to_string(),
+            error: "rate limit exceeded".to_string(),
+        });
+
+        // TaskUpdated must be emitted.
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AppMessage::TaskUpdated { .. })),
+            "expected TaskUpdated after SessionError"
+        );
+
+        // Work log should contain the error entry.
+        let task = app.task_store.get(&task_id).expect("task should exist");
+        assert_eq!(task.work_log.len(), 1, "work log should have one entry");
+        assert!(
+            task.work_log[0].description.contains("rate limit exceeded"),
+            "work log entry should include the error message"
         );
     }
 }
