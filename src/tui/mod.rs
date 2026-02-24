@@ -5,7 +5,7 @@
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
@@ -13,6 +13,7 @@ use tui_textarea::Input;
 
 use crate::app::App;
 use crate::messages::AppMessage;
+use crate::tasks::models::{status_to_index, TaskStatus, ALL_STATUSES};
 
 pub mod layout;
 pub mod tabs;
@@ -70,27 +71,35 @@ fn sync_tabs_on_nav(app: &mut App) {
 /// Returns a context-sensitive keybinding hint string for the footer.
 ///
 /// - When the quit confirmation dialog is visible: shows confirm/cancel bindings.
+/// - When the status picker dialog is visible: shows picker navigation bindings.
 /// - When a textarea is focused: shows Esc / editing hint.
 /// - On Tab 1 with a malformed task selected: shows fix/apply bindings.
+/// - On Tab 1 with an OPEN task selected: shows Enter to start + other bindings.
 /// - On Tab 1 with no focus: shows all available bindings.
 /// - On other tabs: shows minimal bindings.
 pub fn footer_hint_text(
     show_quit_confirm: bool,
+    show_status_picker: bool,
     active_tab: usize,
     prompt_focused: bool,
     focused_answer: Option<usize>,
     is_malformed_task: bool,
+    is_startable_task: bool,
 ) -> &'static str {
     if show_quit_confirm {
         "[y/Enter] confirm quit | [n/Esc] cancel"
+    } else if show_status_picker {
+        "[1-5] select | [Up/Down] navigate | [Enter] confirm | [Esc] cancel"
     } else if prompt_focused {
         "[Esc] exit | Editing prompt"
     } else if focused_answer.is_some() {
         "[Esc] exit | [Tab] next answer | Editing answer"
     } else if active_tab == 0 && is_malformed_task {
         "[f] request fix | [Enter] apply fix | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
+    } else if active_tab == 0 && is_startable_task {
+        "[Enter] start | [i] prompt | [s] status | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 0 {
-        "[i] prompt | [a] answer | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
+        "[i] prompt | [a] answer | [s] status | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 1 || active_tab == 2 {
         "[PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
     } else {
@@ -116,23 +125,34 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     tabs::render(frame, areas.right_pane, app);
 
-    let is_malformed_task = app
-        .selected_task()
-        .and_then(|id| app.task_store.get(id))
-        .map(|t| t.is_malformed())
+    let selected_task = app.selected_task().and_then(|id| app.task_store.get(id));
+    let is_malformed_task = selected_task.map(|t| t.is_malformed()).unwrap_or(false);
+    let is_startable_task = selected_task
+        .map(|t| !t.is_malformed() && t.status == TaskStatus::Open)
         .unwrap_or(false);
     let hint = footer_hint_text(
         app.show_quit_confirm,
+        app.show_status_picker.is_some(),
         app.active_tab,
         app.tab1_state.prompt_focused,
         app.tab1_state.focused_answer,
         is_malformed_task,
+        is_startable_task,
     );
     let footer = Paragraph::new(hint).block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, areas.footer);
 
     if app.show_quit_confirm {
         render_quit_confirm_dialog(frame, frame.area());
+    }
+
+    if let Some(selected_idx) = app.show_status_picker {
+        let current_status = app
+            .selected_task()
+            .and_then(|id| app.task_store.get(id))
+            .map(|t| t.status.clone())
+            .unwrap_or(TaskStatus::Open);
+        render_status_picker_dialog(frame, frame.area(), selected_idx, &current_status);
     }
 }
 
@@ -163,6 +183,69 @@ fn render_quit_confirm_dialog(frame: &mut Frame, area: Rect) {
     frame.render_widget(paragraph, dialog_area);
 }
 
+/// Renders a centered modal status picker dialog over the given area.
+///
+/// Shows all 5 task statuses, with the highlighted entry in yellow bold
+/// and the current status marked with `*`.
+fn render_status_picker_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    selected_idx: usize,
+    current_status: &TaskStatus,
+) {
+    let dialog_width = 36u16;
+    let dialog_height = 10u16;
+    let x = area.x + area.width.saturating_sub(dialog_width) / 2;
+    let y = area.y + area.height.saturating_sub(dialog_height) / 2;
+    let dialog_area = Rect::new(
+        x,
+        y,
+        dialog_width.min(area.width),
+        dialog_height.min(area.height),
+    );
+
+    frame.render_widget(Clear, dialog_area);
+
+    let current_idx = status_to_index(current_status);
+    let lines: Vec<Line> = ALL_STATUSES
+        .iter()
+        .enumerate()
+        .map(|(i, status)| {
+            let marker = if i == current_idx { "*" } else { " " };
+            let text = format!("{}{}.  {}", marker, i + 1, status);
+            if i == selected_idx {
+                Line::from(text).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Line::from(text)
+            }
+        })
+        .collect();
+
+    let block = Block::default()
+        .title(" Status ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, dialog_area);
+}
+
+/// Applies a status change by index, mutating the selected task in the store.
+///
+/// Returns `Some(TaskUpdated)` to trigger persistence, or `None` if the index is
+/// out of range or no task is selected.
+fn apply_status_change(app: &mut App, status_idx: usize) -> Option<AppMessage> {
+    let new_status = ALL_STATUSES.get(status_idx)?.clone();
+    let task_id = app.selected_task()?.clone();
+    if let Some(task) = app.task_store.get_mut(&task_id) {
+        task.status = new_status;
+    }
+    Some(AppMessage::TaskUpdated { task_id })
+}
+
 /// Converts a crossterm event into an optional [`AppMessage`], mutating `app` for navigation.
 ///
 /// - `Up` / `k` -> move task list selection up
@@ -185,6 +268,34 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     return None;
                 }
                 _ => return None,
+            }
+        }
+
+        // When the status picker is open, intercept all input.
+        if let Some(selected_idx) = app.show_status_picker {
+            match key.code {
+                KeyCode::Esc => {
+                    app.dismiss_status_picker();
+                    return None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.show_status_picker = Some(selected_idx.saturating_sub(1));
+                    return None;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.show_status_picker = Some((selected_idx + 1).min(4));
+                    return None;
+                }
+                KeyCode::Char(c @ '1'..='5') => {
+                    let idx = (c as usize) - ('1' as usize);
+                    app.show_status_picker = None;
+                    return apply_status_change(app, idx);
+                }
+                KeyCode::Enter => {
+                    app.show_status_picker = None;
+                    return apply_status_change(app, selected_idx);
+                }
+                _ => return None, // swallow all other keys
             }
         }
 
@@ -257,6 +368,27 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     app.tab1_state.prompt_focused = true;
                     app.tab1_state.set_prompt_focused_style();
                     return None;
+                }
+                // Open the status picker with 's' when a task is selected.
+                if key.code == KeyCode::Char('s')
+                    && key.modifiers == KeyModifiers::NONE
+                    && app.selected_task().is_some()
+                {
+                    app.open_status_picker();
+                    return None;
+                }
+                // Start an OPEN task with Enter.
+                if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
+                    if let Some(task_id) = app.selected_task().cloned() {
+                        let is_open = app
+                            .task_store
+                            .get(&task_id)
+                            .map(|t| t.status == TaskStatus::Open)
+                            .unwrap_or(false);
+                        if is_open {
+                            return Some(AppMessage::StartTask { task_id });
+                        }
+                    }
                 }
                 // Scroll the description paragraph with PgUp/PgDn (no textarea focused).
                 match key.code {
@@ -639,22 +771,23 @@ mod tests {
 
     #[test]
     fn test_footer_hints_normal_tab1() {
-        let text = footer_hint_text(false, 0, false, None, false);
+        let text = footer_hint_text(false, false, 0, false, None, false, false);
         assert!(text.contains("[i] prompt"), "got: {text}");
         assert!(text.contains("[a] answer"), "got: {text}");
+        assert!(text.contains("[s] status"), "got: {text}");
         assert!(text.contains("PgUp/PgDn"), "got: {text}");
     }
 
     #[test]
     fn test_footer_hints_prompt_focused() {
-        let text = footer_hint_text(false, 0, true, None, false);
+        let text = footer_hint_text(false, false, 0, true, None, false, false);
         assert!(text.contains("[Esc]"), "got: {text}");
         assert!(text.contains("Editing prompt"), "got: {text}");
     }
 
     #[test]
     fn test_footer_hints_other_tab() {
-        let text = footer_hint_text(false, 1, false, None, false);
+        let text = footer_hint_text(false, false, 1, false, None, false, false);
         assert!(text.contains("[Tab] next tab"), "got: {text}");
         assert!(text.contains("[q] quit"), "got: {text}");
         assert!(!text.contains("[i]"), "got: {text}");
@@ -662,19 +795,38 @@ mod tests {
 
     #[test]
     fn test_footer_hints_quit_confirm() {
-        let text = footer_hint_text(true, 0, false, None, false);
+        let text = footer_hint_text(true, false, 0, false, None, false, false);
         assert!(text.contains("[y/Enter]"), "got: {text}");
         assert!(text.contains("[n/Esc]"), "got: {text}");
     }
 
     #[test]
     fn test_footer_hints_malformed_task() {
-        let text = footer_hint_text(false, 0, false, None, true);
+        let text = footer_hint_text(false, false, 0, false, None, true, false);
         assert!(text.contains("[f] request fix"), "got: {text}");
         assert!(text.contains("[Enter] apply fix"), "got: {text}");
         assert!(text.contains("PgUp/PgDn"), "got: {text}");
         // Normal task hints should not appear for malformed tasks.
         assert!(!text.contains("[i] prompt"), "got: {text}");
+    }
+
+    #[test]
+    fn test_footer_hints_status_picker() {
+        let text = footer_hint_text(false, true, 0, false, None, false, false);
+        assert!(text.contains("[1-5] select"), "got: {text}");
+        assert!(text.contains("[Up/Down] navigate"), "got: {text}");
+        assert!(text.contains("[Enter] confirm"), "got: {text}");
+        assert!(text.contains("[Esc] cancel"), "got: {text}");
+    }
+
+    #[test]
+    fn test_footer_hints_startable_task() {
+        let text = footer_hint_text(false, false, 0, false, None, false, true);
+        assert!(text.contains("[Enter] start"), "got: {text}");
+        assert!(text.contains("[s] status"), "got: {text}");
+        assert!(text.contains("PgUp/PgDn"), "got: {text}");
+        // Should not show [a] answer when task is startable (it's OPEN, no questions yet).
+        assert!(!text.contains("[a] answer"), "got: {text}");
     }
 
     #[test]
@@ -807,6 +959,221 @@ mod tests {
         assert!(
             matches!(result, Some(AppMessage::ApplyTaskFix { .. })),
             "expected ApplyTaskFix, got: {result:?}"
+        );
+    }
+
+    /// Builds an App with a normal (non-malformed) task selected on Tab 0.
+    fn app_with_normal_task() -> App {
+        use crate::tasks::models::{Task, TaskId, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Alpha".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::Open,
+            assigned_to: None,
+            description: String::new(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        app.task_store.insert(task);
+        app.refresh_stories();
+        app.task_list_state
+            .expanded_stories
+            .insert("1. Alpha".to_string());
+        app.task_list_state.refresh(&app.cached_stories);
+        // Navigate down to select the task row.
+        let down = key_event(KeyCode::Down, KeyModifiers::NONE);
+        handle_input(down, &mut app);
+        app
+    }
+
+    #[test]
+    fn test_handle_input_s_opens_status_picker() {
+        let mut app = app_with_normal_task();
+        assert!(app.show_status_picker.is_none());
+
+        let event = key_event(KeyCode::Char('s'), KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+
+        assert!(result.is_none());
+        // Open status index 0 (OPEN) should be pre-selected.
+        assert_eq!(app.show_status_picker, Some(0));
+    }
+
+    #[test]
+    fn test_handle_input_s_ignored_no_task() {
+        // No task selected (on a story row) -- 's' should not open the picker.
+        let mut app = App::test_default();
+        assert!(app.selected_task().is_none());
+
+        let event = key_event(KeyCode::Char('s'), KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+
+        assert!(result.is_none());
+        assert!(app.show_status_picker.is_none());
+    }
+
+    #[test]
+    fn test_handle_input_s_ignored_prompt_focused() {
+        // When the prompt textarea is focused, 's' goes to the textarea, not the picker.
+        let mut app = app_with_normal_task();
+        app.tab1_state.prompt_focused = true;
+        app.tab1_state.set_prompt_focused_style();
+
+        let event = key_event(KeyCode::Char('s'), KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+
+        assert!(result.is_none());
+        assert!(app.show_status_picker.is_none());
+    }
+
+    #[test]
+    fn test_status_picker_esc_dismisses() {
+        let mut app = app_with_normal_task();
+        app.show_status_picker = Some(2);
+
+        let event = key_event(KeyCode::Esc, KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+
+        assert!(result.is_none());
+        assert!(app.show_status_picker.is_none());
+    }
+
+    #[test]
+    fn test_status_picker_up_down_navigation() {
+        let mut app = app_with_normal_task();
+        app.show_status_picker = Some(2);
+
+        // Up moves to 1.
+        handle_input(key_event(KeyCode::Up, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.show_status_picker, Some(1));
+
+        // Up again to 0.
+        handle_input(key_event(KeyCode::Up, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.show_status_picker, Some(0));
+
+        // Clamped at 0.
+        handle_input(key_event(KeyCode::Up, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.show_status_picker, Some(0));
+
+        // Down to 1.
+        handle_input(key_event(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.show_status_picker, Some(1));
+
+        // Down three more times to reach 4 (Abandoned).
+        handle_input(key_event(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        handle_input(key_event(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        handle_input(key_event(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.show_status_picker, Some(4));
+
+        // Clamped at 4.
+        handle_input(key_event(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.show_status_picker, Some(4));
+    }
+
+    #[test]
+    fn test_status_picker_number_key_selects() {
+        let mut app = app_with_normal_task();
+        app.show_status_picker = Some(0);
+
+        // Press '3' to select PendingReview (index 2).
+        let result = handle_input(key_event(KeyCode::Char('3'), KeyModifiers::NONE), &mut app);
+
+        assert!(app.show_status_picker.is_none(), "picker should close");
+        assert!(
+            matches!(result, Some(AppMessage::TaskUpdated { .. })),
+            "expected TaskUpdated, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_status_picker_enter_confirms() {
+        let mut app = app_with_normal_task();
+        // Pre-select index 3 (Completed).
+        app.show_status_picker = Some(3);
+
+        let result = handle_input(key_event(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+
+        assert!(app.show_status_picker.is_none(), "picker should close");
+        assert!(
+            matches!(result, Some(AppMessage::TaskUpdated { .. })),
+            "expected TaskUpdated, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_status_picker_swallows_other_keys() {
+        let mut app = app_with_normal_task();
+        app.show_status_picker = Some(1);
+
+        // 'q' should NOT quit when picker is open.
+        let result = handle_input(key_event(KeyCode::Char('q'), KeyModifiers::NONE), &mut app);
+        assert!(result.is_none(), "expected None, got: {result:?}");
+        assert_eq!(app.show_status_picker, Some(1), "picker should remain open");
+
+        // Tab should be swallowed.
+        let result = handle_input(key_event(KeyCode::Tab, KeyModifiers::NONE), &mut app);
+        assert!(result.is_none());
+        assert_eq!(app.show_status_picker, Some(1));
+    }
+
+    #[test]
+    fn test_status_picker_changes_task_status() {
+        use crate::tasks::models::{TaskId, TaskStatus};
+
+        let mut app = app_with_normal_task();
+        // Task starts as Open (index 0).
+        let id = TaskId::from_path("tasks/1.1.md");
+        assert_eq!(app.task_store.get(&id).unwrap().status, TaskStatus::Open);
+
+        // Open picker, navigate to Completed (index 3), press Enter.
+        app.show_status_picker = Some(3);
+        handle_input(key_event(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+
+        assert_eq!(
+            app.task_store.get(&id).unwrap().status,
+            TaskStatus::Completed,
+            "task status should be Completed after picker selection"
+        );
+    }
+
+    #[test]
+    fn test_handle_input_enter_starts_open_task() {
+        // An OPEN non-malformed task: Enter should emit StartTask.
+        let mut app = app_with_normal_task();
+
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+        assert!(
+            matches!(result, Some(AppMessage::StartTask { .. })),
+            "expected StartTask for OPEN task, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_handle_input_enter_no_start_non_open_task() {
+        use crate::tasks::models::{TaskId, TaskStatus};
+
+        // Change the task status to InProgress; Enter should not start it.
+        let mut app = app_with_normal_task();
+        let id = TaskId::from_path("tasks/1.1.md");
+        if let Some(task) = app.task_store.get_mut(&id) {
+            task.status = TaskStatus::InProgress;
+        }
+
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+        assert!(
+            result.is_none(),
+            "Enter on a non-OPEN task should return None, got: {result:?}"
         );
     }
 }

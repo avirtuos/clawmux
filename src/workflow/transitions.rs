@@ -80,7 +80,6 @@ impl WorkflowEngine {
     pub fn process(&mut self, msg: AppMessage) -> Vec<AppMessage> {
         match msg {
             AppMessage::StartTask { task_id } => {
-                let prompt = placeholder_prompt(AgentKind::Intake, &task_id, None);
                 let state = WorkflowState {
                     task_id: task_id.clone(),
                     current_agent: AgentKind::Intake,
@@ -91,7 +90,8 @@ impl WorkflowEngine {
                 vec![AppMessage::CreateSession {
                     task_id,
                     agent: AgentKind::Intake,
-                    prompt,
+                    prompt: String::new(),
+                    context: None,
                 }]
             }
 
@@ -108,6 +108,7 @@ impl WorkflowEngine {
             AppMessage::SessionCompleted {
                 task_id,
                 session_id: _,
+                response_text: _,
             } => {
                 let Some(state) = self.states.get_mut(&task_id) else {
                     return vec![];
@@ -116,11 +117,11 @@ impl WorkflowEngine {
                     Some(next) => {
                         state.current_agent = next;
                         state.session_id = None;
-                        let prompt = placeholder_prompt(next, &task_id, None);
                         vec![AppMessage::CreateSession {
                             task_id,
                             agent: next,
-                            prompt,
+                            prompt: String::new(),
+                            context: None,
                         }]
                     }
                     None => {
@@ -149,11 +150,11 @@ impl WorkflowEngine {
                     Some(next) => {
                         state.current_agent = next;
                         state.session_id = None;
-                        let prompt = placeholder_prompt(next, &task_id, None);
                         vec![AppMessage::CreateSession {
                             task_id,
                             agent: next,
-                            prompt,
+                            prompt: String::new(),
+                            context: None,
                         }]
                     }
                     None => {
@@ -187,11 +188,11 @@ impl WorkflowEngine {
                 }
                 state.current_agent = to;
                 state.session_id = None;
-                let prompt = placeholder_prompt(to, &task_id, Some(&reason));
                 vec![AppMessage::CreateSession {
                     task_id,
                     agent: to,
-                    prompt,
+                    prompt: String::new(),
+                    context: Some(reason),
                 }]
             }
 
@@ -213,12 +214,11 @@ impl WorkflowEngine {
                 };
                 state.phase = WorkflowPhase::Running;
                 let agent = state.current_agent;
-                let context = format!("Question {question_index} answer: {answer}");
-                let prompt = placeholder_prompt(agent, &task_id, Some(&context));
                 vec![AppMessage::CreateSession {
                     task_id,
                     agent,
-                    prompt,
+                    prompt: String::new(),
+                    context: Some(format!("Question {question_index} answer: {answer}")),
                 }]
             }
 
@@ -236,12 +236,11 @@ impl WorkflowEngine {
                 state.current_agent = AgentKind::CodeReview;
                 state.phase = WorkflowPhase::Running;
                 state.session_id = None;
-                let context = comments.join("; ");
-                let prompt = placeholder_prompt(AgentKind::CodeReview, &task_id, Some(&context));
                 vec![AppMessage::CreateSession {
                     task_id,
                     agent: AgentKind::CodeReview,
-                    prompt,
+                    prompt: String::new(),
+                    context: Some(comments.join("; ")),
                 }]
             }
 
@@ -259,23 +258,6 @@ impl WorkflowEngine {
             // All other variants are no-ops.
             _ => vec![],
         }
-    }
-}
-
-/// Returns a placeholder prompt string for the given agent and task.
-///
-/// The context argument, if provided, is appended to the prompt.
-///
-//TODO: Wire compose_user_message into the message dispatch layer (requires task store access)
-fn placeholder_prompt(agent: AgentKind, task_id: &TaskId, context: Option<&str>) -> String {
-    match context {
-        Some(ctx) => format!(
-            "Begin task {} as {} agent. Context: {}",
-            task_id,
-            agent.display_name(),
-            ctx
-        ),
-        None => format!("Begin task {} as {} agent.", task_id, agent.display_name()),
     }
 }
 
@@ -377,6 +359,7 @@ mod tests {
             engine.process(AppMessage::SessionCompleted {
                 task_id: tid.clone(),
                 session_id: "s".to_string(),
+                response_text: String::new(),
             });
         }
 
@@ -491,6 +474,7 @@ mod tests {
             engine.process(AppMessage::SessionCompleted {
                 task_id: tid.clone(),
                 session_id: "s".to_string(),
+                response_text: String::new(),
             });
         }
 
@@ -567,5 +551,58 @@ mod tests {
         let mut engine = WorkflowEngine::new();
         let msgs = engine.process(AppMessage::Tick);
         assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn test_create_session_carries_context_on_kickback() {
+        let mut engine = WorkflowEngine::new();
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+
+        let msgs = engine.process(AppMessage::AgentKickedBack {
+            task_id: tid.clone(),
+            from: AgentKind::CodeQuality,
+            to: AgentKind::Implementation,
+            reason: "needs rework".to_string(),
+        });
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            matches!(
+                &msgs[0],
+                AppMessage::CreateSession { context: Some(ctx), .. } if ctx == "needs rework"
+            ),
+            "kickback CreateSession should carry the reason as context"
+        );
+    }
+
+    #[test]
+    fn test_create_session_carries_context_on_answer() {
+        let mut engine = WorkflowEngine::new();
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+        engine.process(AppMessage::AgentAskedQuestion {
+            task_id: tid.clone(),
+            agent: AgentKind::Intake,
+            question: "Scope?".to_string(),
+        });
+
+        let msgs = engine.process(AppMessage::HumanAnswered {
+            task_id: tid.clone(),
+            question_index: 0,
+            answer: "Full scope".to_string(),
+        });
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            matches!(
+                &msgs[0],
+                AppMessage::CreateSession { context: Some(ctx), .. }
+                    if ctx.contains("Full scope")
+            ),
+            "answer CreateSession should carry the answer as context"
+        );
     }
 }

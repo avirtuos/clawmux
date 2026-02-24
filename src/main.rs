@@ -180,7 +180,7 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     // 7. Spawn the EventStreamConsumer if the server is available.
     if let Some(ref s) = server {
         let base_url = s.base_url().to_string();
-        let consumer = EventStreamConsumer::new(async_tx.clone(), Arc::clone(&session_map));
+        let mut consumer = EventStreamConsumer::new(async_tx.clone(), Arc::clone(&session_map));
         tokio::spawn(async move {
             if let Err(e) = consumer.run(base_url).await {
                 tracing::warn!("EventStreamConsumer exited: {}", e);

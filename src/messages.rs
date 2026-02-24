@@ -71,6 +71,8 @@ pub enum AppMessage {
         task_id: TaskId,
         agent: AgentKind,
         prompt: String,
+        /// Semantic context for prompt composition (kickback reason, answer, revisions).
+        context: Option<String>,
     },
     /// Confirms that a session was successfully created.
     SessionCreated { task_id: TaskId, session_id: String },
@@ -94,7 +96,12 @@ pub enum AppMessage {
         status: String,
     },
     /// Signals that a session has finished processing.
-    SessionCompleted { task_id: TaskId, session_id: String },
+    SessionCompleted {
+        task_id: TaskId,
+        session_id: String,
+        /// Accumulated assistant text from MessageUpdated events.
+        response_text: String,
+    },
     /// Signals that a session encountered an unrecoverable error.
     SessionError {
         task_id: TaskId,

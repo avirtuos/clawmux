@@ -10,13 +10,16 @@ use tokio::sync::mpsc;
 use crate::messages::AppMessage;
 use crate::opencode::events::SessionMap;
 use crate::opencode::OpenCodeClient;
-use crate::tasks::models::SuggestedFix;
+use crate::tasks::models::{status_to_index, Question, SuggestedFix, TaskStatus, WorkLogEntry};
 use crate::tasks::{Story, TaskId, TaskStore};
 use crate::tui::tabs::agent_activity::Tab2State;
 use crate::tui::tabs::code_review::Tab4State;
 use crate::tui::tabs::task_details::Tab1State;
 use crate::tui::tabs::team_status::Tab3State;
 use crate::tui::task_list::TaskListState;
+use crate::workflow::agents::AgentKind;
+use crate::workflow::prompt_composer::compose_user_message;
+use crate::workflow::response_parser::{parse_response, AgentResponse};
 use crate::workflow::transitions::WorkflowEngine;
 
 /// Top-level application state.
@@ -35,6 +38,8 @@ pub struct App {
     pub should_quit: bool,
     /// When `true`, the quit confirmation dialog is displayed and input is intercepted.
     pub show_quit_confirm: bool,
+    /// When `Some(idx)`, the status picker dialog is visible with `idx` highlighted.
+    pub show_status_picker: Option<usize>,
     /// Navigation and expansion state for the left-pane task list widget.
     pub task_list_state: TaskListState,
     /// UI state for Tab 1 (Task Details): prompt input, answer inputs, focus flags.
@@ -81,6 +86,7 @@ impl App {
             active_tab: 0,
             should_quit: false,
             show_quit_confirm: false,
+            show_status_picker: None,
             task_list_state,
             tab1_state: Tab1State::new(),
             tab2_state: Tab2State::new(),
@@ -106,6 +112,22 @@ impl App {
     /// Dismisses the quit confirmation dialog without quitting.
     pub fn dismiss_quit_confirm(&mut self) {
         self.show_quit_confirm = false;
+    }
+
+    /// Opens the status picker dialog pre-selecting the current task's status.
+    ///
+    /// If no task is currently selected, this is a no-op.
+    pub fn open_status_picker(&mut self) {
+        if let Some(task_id) = self.selected_task().cloned() {
+            if let Some(task) = self.task_store.get(&task_id) {
+                self.show_status_picker = Some(status_to_index(&task.status));
+            }
+        }
+    }
+
+    /// Dismisses the status picker dialog without changing the task status.
+    pub fn dismiss_status_picker(&mut self) {
+        self.show_status_picker = None;
     }
 
     /// Returns the [`TaskId`] of the currently selected task, or `None` if on a story.
@@ -254,24 +276,141 @@ impl App {
                 vec![]
             }
 
+            // --- StartTask: set task InProgress then forward to engine ---
+            AppMessage::StartTask { task_id } => {
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    task.status = TaskStatus::InProgress;
+                }
+                let mut msgs = self.workflow_engine.process(AppMessage::StartTask {
+                    task_id: task_id.clone(),
+                });
+                msgs.push(AppMessage::TaskUpdated {
+                    task_id: task_id.clone(),
+                });
+                msgs
+            }
+
             // --- Workflow messages: forward to engine ---
-            AppMessage::StartTask { .. }
-            | AppMessage::AgentCompleted { .. }
+            AppMessage::AgentCompleted { .. }
             | AppMessage::AgentKickedBack { .. }
             | AppMessage::AgentAskedQuestion { .. }
             | AppMessage::HumanAnswered { .. }
             | AppMessage::HumanApprovedReview { .. }
             | AppMessage::HumanRequestedRevisions { .. }
             | AppMessage::SessionCreated { .. }
-            | AppMessage::SessionCompleted { .. }
             | AppMessage::SessionError { .. } => self.workflow_engine.process(msg),
+
+            // --- SessionCompleted: parse agent response and dispatch semantic message ---
+            AppMessage::SessionCompleted {
+                task_id,
+                session_id: _,
+                response_text,
+            } => {
+                let current_agent = self
+                    .workflow_engine
+                    .state(&task_id)
+                    .map(|s| s.current_agent);
+
+                match parse_response(&response_text) {
+                    Ok(AgentResponse::Complete {
+                        summary,
+                        updates,
+                        commit_message: _,
+                    }) => {
+                        if let Some(task) = self.task_store.get_mut(&task_id) {
+                            if let Some(upd) = updates {
+                                if let Some(design) = upd.design {
+                                    task.design = Some(design);
+                                }
+                                if let Some(plan) = upd.implementation_plan {
+                                    task.implementation_plan = Some(plan);
+                                }
+                            }
+                            let seq = task.work_log.len() as u32 + 1;
+                            task.work_log.push(WorkLogEntry {
+                                sequence: seq,
+                                timestamp: chrono::Utc::now(),
+                                agent: current_agent.unwrap_or(AgentKind::Intake),
+                                description: summary.clone(),
+                            });
+                        }
+                        let agent = current_agent.unwrap_or(AgentKind::Intake);
+                        let mut msgs = self.workflow_engine.process(AppMessage::AgentCompleted {
+                            task_id: task_id.clone(),
+                            agent,
+                            summary,
+                        });
+                        msgs.push(AppMessage::TaskUpdated {
+                            task_id: task_id.clone(),
+                        });
+                        msgs
+                    }
+                    Ok(AgentResponse::Question { question, .. }) => {
+                        let agent = current_agent.unwrap_or(AgentKind::Intake);
+                        if let Some(task) = self.task_store.get_mut(&task_id) {
+                            task.questions.push(Question {
+                                agent,
+                                text: question.clone(),
+                                answer: None,
+                            });
+                        }
+                        let mut msgs =
+                            self.workflow_engine
+                                .process(AppMessage::AgentAskedQuestion {
+                                    task_id: task_id.clone(),
+                                    agent,
+                                    question,
+                                });
+                        msgs.push(AppMessage::TaskUpdated {
+                            task_id: task_id.clone(),
+                        });
+                        msgs
+                    }
+                    Ok(AgentResponse::Kickback {
+                        target_agent,
+                        reason,
+                    }) => {
+                        let from = current_agent.unwrap_or(AgentKind::Intake);
+                        let to = AgentKind::from_display_name(&target_agent).unwrap_or(from);
+                        self.workflow_engine.process(AppMessage::AgentKickedBack {
+                            task_id,
+                            from,
+                            to,
+                            reason,
+                        })
+                    }
+                    Err(_) => {
+                        // Fallback: advance pipeline with a placeholder summary.
+                        let agent = current_agent.unwrap_or(AgentKind::Intake);
+                        tracing::warn!(
+                            "Could not parse structured output for task {}; advancing with fallback",
+                            task_id
+                        );
+                        self.workflow_engine.process(AppMessage::AgentCompleted {
+                            task_id,
+                            agent,
+                            summary: "(no structured output)".to_string(),
+                        })
+                    }
+                }
+            }
 
             // --- Async session operations ---
             AppMessage::CreateSession {
                 task_id,
                 agent,
-                prompt,
+                context,
+                prompt: _,
             } => {
+                // Build the real prompt from task context; ignore the placeholder prompt field.
+                let prompt = self
+                    .task_store
+                    .get(&task_id)
+                    .map(|task| compose_user_message(&agent, task, context.as_deref()))
+                    .unwrap_or_else(|| {
+                        format!("Begin task {} as {} agent.", task_id, agent.display_name())
+                    });
+
                 let client = match self.opencode_client.clone() {
                     Some(c) => c,
                     None => {
@@ -292,7 +431,7 @@ impl App {
                                 .send(AppMessage::SessionError {
                                     task_id,
                                     session_id: String::new(),
-                                    error: format!("Failed to create session: {}", e),
+                                    error: format!("Failed to create session: {e}"),
                                 })
                                 .await;
                             return;
@@ -310,7 +449,7 @@ impl App {
                             .send(AppMessage::SessionError {
                                 task_id,
                                 session_id: session.id,
-                                error: format!("Failed to send prompt: {}", e),
+                                error: format!("Failed to send prompt: {e}"),
                             })
                             .await;
                     }
@@ -433,6 +572,7 @@ mod tests {
         assert_eq!(app.active_tab, 0);
         assert!(!app.should_quit);
         assert!(!app.show_quit_confirm);
+        assert!(app.show_status_picker.is_none());
         assert_eq!(app.task_list_state.selected_index, 0);
         assert!(app.task_list_state.expanded_stories.is_empty());
     }
@@ -444,6 +584,49 @@ mod tests {
         app.dismiss_quit_confirm();
         assert!(!app.show_quit_confirm);
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn test_open_status_picker_preselects_current() {
+        use crate::tasks::models::{Task, TaskId, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: None,
+            description: String::new(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        app.task_store.insert(task);
+        app.refresh_stories();
+        app.task_list_state
+            .expanded_stories
+            .insert("1. Story".to_string());
+        app.task_list_state.refresh(&app.cached_stories);
+        // Navigate to the task row (index 1).
+        app.task_list_state.selected_index = 1;
+
+        app.open_status_picker();
+        // InProgress is index 1 in ALL_STATUSES.
+        assert_eq!(app.show_status_picker, Some(1));
+    }
+
+    #[test]
+    fn test_dismiss_status_picker() {
+        let mut app = App::test_default();
+        app.show_status_picker = Some(2);
+        app.dismiss_status_picker();
+        assert!(app.show_status_picker.is_none());
     }
 
     #[test]
@@ -503,15 +686,57 @@ mod tests {
         let msgs = app.handle_message(AppMessage::StartTask {
             task_id: task_id.clone(),
         });
-        assert_eq!(msgs.len(), 1);
+        // Expect CreateSession + TaskUpdated.
+        assert_eq!(msgs.len(), 2);
         assert!(
             matches!(
                 &msgs[0],
-                AppMessage::CreateSession { agent, .. }
+                AppMessage::CreateSession { agent, context: None, .. }
                     if *agent == crate::workflow::agents::AgentKind::Intake
             ),
-            "expected CreateSession for Intake, got: {:?}",
+            "expected CreateSession for Intake with context: None, got: {:?}",
             msgs[0]
+        );
+        assert!(
+            matches!(&msgs[1], AppMessage::TaskUpdated { .. }),
+            "expected TaskUpdated as second message"
+        );
+    }
+
+    /// Verifies that StartTask sets task status to InProgress.
+    #[test]
+    fn test_handle_start_task_sets_in_progress() {
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::Open,
+            assigned_to: None,
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+
+        app.handle_message(AppMessage::StartTask {
+            task_id: task_id.clone(),
+        });
+
+        let task = app.task_store.get(&task_id).expect("task should exist");
+        assert_eq!(
+            task.status,
+            TaskStatus::InProgress,
+            "StartTask should set task status to InProgress"
         );
     }
 
@@ -761,6 +986,149 @@ mod tests {
         assert!(
             updated.is_malformed(),
             "task should still be malformed when fix is also broken"
+        );
+    }
+
+    /// Helper: builds a minimal valid task and starts it through the workflow engine.
+    fn make_task_in_progress(app: &mut App) -> TaskId {
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: None,
+            description: "implement feature".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+        // Start task to initialize workflow state (current_agent = Intake).
+        app.workflow_engine.process(AppMessage::StartTask {
+            task_id: task_id.clone(),
+        });
+        task_id
+    }
+
+    #[test]
+    fn test_handle_session_completed_complete_response() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        let response_json =
+            r#"{"action":"complete","summary":"Intake done","updates":{"design":"New design"}}"#;
+        let msgs = app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-1".to_string(),
+            response_text: response_json.to_string(),
+        });
+
+        // Should emit AgentCompleted -> CreateSession for Design + TaskUpdated.
+        assert!(
+            msgs.iter().any(|m| matches!(m, AppMessage::CreateSession { agent, .. } if *agent == AgentKind::Design)),
+            "expected CreateSession for Design, got: {msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AppMessage::TaskUpdated { .. })),
+            "expected TaskUpdated"
+        );
+
+        let task = app.task_store.get(&task_id).expect("task should exist");
+        assert_eq!(
+            task.design.as_deref(),
+            Some("New design"),
+            "design should be updated"
+        );
+        assert_eq!(task.work_log.len(), 1, "work log should have one entry");
+    }
+
+    #[test]
+    fn test_handle_session_completed_question_response() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        let response_json =
+            r#"{"action":"question","question":"What is scope?","context":"Need clarity"}"#;
+        let msgs = app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-1".to_string(),
+            response_text: response_json.to_string(),
+        });
+
+        // AgentAskedQuestion pauses workflow -- no CreateSession should be emitted.
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, AppMessage::CreateSession { .. })),
+            "no CreateSession expected for question"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AppMessage::TaskUpdated { .. })),
+            "expected TaskUpdated"
+        );
+
+        let task = app.task_store.get(&task_id).expect("task should exist");
+        assert_eq!(task.questions.len(), 1, "question should be recorded");
+        assert_eq!(task.questions[0].text, "What is scope?");
+    }
+
+    #[test]
+    fn test_handle_session_completed_kickback_response() {
+        let mut app = App::test_default();
+
+        // Build a task already at CodeQuality (advance engine past Intake through Design, Planning, Impl).
+        let task_id = make_task_in_progress(&mut app);
+        // Advance through Intake -> Design -> Planning -> Implementation -> CodeQuality.
+        for _ in 0..4 {
+            app.workflow_engine.process(AppMessage::AgentCompleted {
+                task_id: task_id.clone(),
+                agent: app.workflow_engine.state(&task_id).unwrap().current_agent,
+                summary: "done".to_string(),
+            });
+        }
+
+        let response_json =
+            r#"{"action":"kickback","target_agent":"Implementation Agent","reason":"Needs tests"}"#;
+        let msgs = app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-1".to_string(),
+            response_text: response_json.to_string(),
+        });
+
+        // AgentKickedBack -> CreateSession for Implementation.
+        assert!(
+            msgs.iter().any(|m| matches!(m, AppMessage::CreateSession { agent, .. } if *agent == AgentKind::Implementation)),
+            "expected CreateSession for Implementation after kickback, got: {msgs:?}"
+        );
+        let _ = app.task_store.get(&task_id).expect("task should exist");
+    }
+
+    #[test]
+    fn test_handle_session_completed_unparseable_fallback() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        // Unparseable text should fallback to AgentCompleted.
+        let msgs = app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-1".to_string(),
+            response_text: "I could not produce structured output.".to_string(),
+        });
+
+        // Fallback AgentCompleted -> pipeline advances -> CreateSession for Design.
+        assert!(
+            msgs.iter().any(|m| matches!(m, AppMessage::CreateSession { agent, .. } if *agent == AgentKind::Design)),
+            "expected CreateSession for Design after fallback, got: {msgs:?}"
         );
     }
 }

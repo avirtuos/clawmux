@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::{ClawdMuxError, Result};
 use crate::messages::AppMessage;
-use crate::opencode::types::OpenCodeEvent;
+use crate::opencode::types::{MessagePart, OpenCodeEvent};
 use crate::tasks::models::TaskId;
 use crate::workflow::agents::AgentKind;
 
@@ -35,6 +35,8 @@ pub type SessionMap = Arc<RwLock<HashMap<String, (TaskId, AgentKind)>>>;
 pub struct EventStreamConsumer {
     tx: mpsc::Sender<AppMessage>,
     session_map: SessionMap,
+    /// Accumulated assistant text per session ID, drained on session completion.
+    accumulated_text: HashMap<String, String>,
 }
 
 #[allow(dead_code)]
@@ -46,7 +48,11 @@ impl EventStreamConsumer {
     /// * `tx` - Sender for routing `AppMessage` values to the main event loop.
     /// * `session_map` - Shared map from session ID to `(TaskId, AgentKind)`.
     pub fn new(tx: mpsc::Sender<AppMessage>, session_map: SessionMap) -> Self {
-        Self { tx, session_map }
+        Self {
+            tx,
+            session_map,
+            accumulated_text: HashMap::new(),
+        }
     }
 
     /// Connects to the opencode SSE stream and processes events indefinitely.
@@ -64,7 +70,7 @@ impl EventStreamConsumer {
     ///
     /// This method is designed to run indefinitely and only returns if the
     /// underlying channel is closed (i.e. the main event loop has shut down).
-    pub async fn run(&self, base_url: String) -> Result<()> {
+    pub async fn run(&mut self, base_url: String) -> Result<()> {
         let url = format!("{}/global/event", base_url);
         let mut backoff_secs = 1u64;
 
@@ -96,7 +102,7 @@ impl EventStreamConsumer {
                         match serde_json::from_str::<OpenCodeEvent>(&msg.data) {
                             Ok(oc_event) => {
                                 if let Err(e) = self.handle_event(oc_event).await {
-                                    warn!("Error handling SSE event: {}", e);
+                                    warn!("Error handling SSE event: {e}");
                                 }
                             }
                             Err(e) => {
@@ -121,7 +127,7 @@ impl EventStreamConsumer {
     /// Looks up the session in the shared session map to resolve `task_id`.
     /// Events with unknown session IDs are silently ignored with a debug log.
     /// `MessageCreated` and `Unknown` variants are always ignored.
-    pub(crate) async fn handle_event(&self, event: OpenCodeEvent) -> Result<()> {
+    pub(crate) async fn handle_event(&mut self, event: OpenCodeEvent) -> Result<()> {
         match event {
             OpenCodeEvent::SessionCreated { session_id } => {
                 // Retry up to 3 times with a 50ms sleep to handle the TOCTOU
@@ -162,6 +168,13 @@ impl EventStreamConsumer {
                     map.get(&session_id).map(|(task_id, _)| task_id.clone())
                 };
                 if let Some(task_id) = task_id {
+                    // Accumulate the latest Text part for this session.
+                    if let Some(text) = parts.iter().rev().find_map(|p| match p {
+                        MessagePart::Text { text } => Some(text.clone()),
+                        _ => None,
+                    }) {
+                        self.accumulated_text.insert(session_id.clone(), text);
+                    }
                     self.send(AppMessage::StreamingUpdate {
                         task_id,
                         session_id,
@@ -214,9 +227,14 @@ impl EventStreamConsumer {
                     map.get(&session_id).map(|(task_id, _)| task_id.clone())
                 };
                 if let Some(task_id) = task_id {
+                    let response_text = self
+                        .accumulated_text
+                        .remove(&session_id)
+                        .unwrap_or_default();
                     self.send(AppMessage::SessionCompleted {
                         task_id,
                         session_id,
+                        response_text,
                     })
                     .await?;
                 } else {
@@ -228,6 +246,8 @@ impl EventStreamConsumer {
                     let map = self.session_map.read().await;
                     map.get(&session_id).map(|(task_id, _)| task_id.clone())
                 };
+                // Clean up accumulated text to prevent memory leaks.
+                self.accumulated_text.remove(&session_id);
                 if let Some(task_id) = task_id {
                     self.send(AppMessage::SessionError {
                         task_id,
@@ -275,9 +295,15 @@ mod tests {
         (consumer, rx, session_map)
     }
 
+    fn make_text_parts(text: &str) -> Vec<crate::opencode::types::MessagePart> {
+        vec![crate::opencode::types::MessagePart::Text {
+            text: text.to_string(),
+        }]
+    }
+
     #[tokio::test]
     async fn test_event_routing_known_session() {
-        let (consumer, mut rx, session_map) = make_consumer();
+        let (mut consumer, mut rx, session_map) = make_consumer();
         let task_id = TaskId::from_path("tasks/1.1.md");
         {
             let mut map = session_map.write().await;
@@ -286,6 +312,18 @@ mod tests {
                 (task_id.clone(), AgentKind::Implementation),
             );
         }
+
+        // Seed a MessageUpdated before SessionCompleted so response_text is populated.
+        consumer
+            .handle_event(OpenCodeEvent::MessageUpdated {
+                session_id: "sess-abc".to_string(),
+                message_id: "msg-0".to_string(),
+                parts: make_text_parts("agent response text"),
+            })
+            .await
+            .expect("handle_event");
+        // Drain the StreamingUpdate.
+        let _ = rx.try_recv().expect("StreamingUpdate message");
 
         // SessionCompleted
         consumer
@@ -296,7 +334,8 @@ mod tests {
             .expect("handle_event");
         let msg = rx.try_recv().expect("SessionCompleted message");
         assert!(
-            matches!(msg, AppMessage::SessionCompleted { ref session_id, .. } if session_id == "sess-abc")
+            matches!(&msg, AppMessage::SessionCompleted { ref session_id, ref response_text, .. }
+                if session_id == "sess-abc" && response_text == "agent response text")
         );
 
         // MessageUpdated
@@ -368,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_routing_unknown_session() {
-        let (consumer, mut rx, _session_map) = make_consumer();
+        let (mut consumer, mut rx, _session_map) = make_consumer();
         // No sessions in the map -- events for unknown sessions are silently ignored.
 
         consumer
@@ -427,7 +466,7 @@ mod tests {
         // regardless of real wall-clock timing under CI load.
         tokio::time::pause();
 
-        let (consumer, mut rx, session_map) = make_consumer();
+        let (mut consumer, mut rx, session_map) = make_consumer();
         let task_id = TaskId::from_path("tasks/6.1.md");
         let session_id = "sess-race".to_string();
 
@@ -509,6 +548,93 @@ mod tests {
         assert!(
             handle.await.expect("spawn"),
             "cloned Arc sees same map state"
+        );
+    }
+
+    /// Verifies that accumulated text is drained and included in SessionCompleted.
+    #[tokio::test]
+    async fn test_accumulated_text_cleared_on_complete() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert("sess-x".to_string(), (task_id.clone(), AgentKind::Intake));
+        }
+
+        // Emit two MessageUpdated events; only the latest text should be kept.
+        consumer
+            .handle_event(OpenCodeEvent::MessageUpdated {
+                session_id: "sess-x".to_string(),
+                message_id: "msg-1".to_string(),
+                parts: make_text_parts("first"),
+            })
+            .await
+            .expect("handle_event");
+        let _ = rx.try_recv().expect("drain StreamingUpdate");
+
+        consumer
+            .handle_event(OpenCodeEvent::MessageUpdated {
+                session_id: "sess-x".to_string(),
+                message_id: "msg-2".to_string(),
+                parts: make_text_parts("second"),
+            })
+            .await
+            .expect("handle_event");
+        let _ = rx.try_recv().expect("drain StreamingUpdate");
+
+        // SessionCompleted should carry the last accumulated text.
+        consumer
+            .handle_event(OpenCodeEvent::SessionCompleted {
+                session_id: "sess-x".to_string(),
+            })
+            .await
+            .expect("handle_event");
+        let msg = rx.try_recv().expect("SessionCompleted message");
+        assert!(
+            matches!(&msg, AppMessage::SessionCompleted { response_text, .. } if response_text == "second"),
+            "expected last accumulated text 'second'"
+        );
+
+        // accumulated_text should now be empty for this session.
+        assert!(
+            consumer.accumulated_text.is_empty(),
+            "accumulated_text should be cleared after SessionCompleted"
+        );
+    }
+
+    /// Verifies that accumulated text is cleaned up when a session errors.
+    #[tokio::test]
+    async fn test_accumulated_text_cleaned_on_error() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert("sess-y".to_string(), (task_id.clone(), AgentKind::Design));
+        }
+
+        consumer
+            .handle_event(OpenCodeEvent::MessageUpdated {
+                session_id: "sess-y".to_string(),
+                message_id: "msg-1".to_string(),
+                parts: make_text_parts("partial text"),
+            })
+            .await
+            .expect("handle_event");
+        let _ = rx.try_recv().expect("drain StreamingUpdate");
+
+        consumer
+            .handle_event(OpenCodeEvent::SessionError {
+                session_id: "sess-y".to_string(),
+                error: "crash".to_string(),
+            })
+            .await
+            .expect("handle_event");
+        // SessionError should still be routed.
+        let _ = rx.try_recv().expect("SessionError message");
+
+        assert!(
+            consumer.accumulated_text.is_empty(),
+            "accumulated_text should be cleared on SessionError"
         );
     }
 }

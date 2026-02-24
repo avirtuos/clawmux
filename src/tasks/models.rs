@@ -50,6 +50,26 @@ pub enum TaskStatus {
     Abandoned,
 }
 
+/// All task statuses in display order for the status picker.
+pub const ALL_STATUSES: [TaskStatus; 5] = [
+    TaskStatus::Open,
+    TaskStatus::InProgress,
+    TaskStatus::PendingReview,
+    TaskStatus::Completed,
+    TaskStatus::Abandoned,
+];
+
+/// Returns the index of a status in [`ALL_STATUSES`].
+pub fn status_to_index(status: &TaskStatus) -> usize {
+    match status {
+        TaskStatus::Open => 0,
+        TaskStatus::InProgress => 1,
+        TaskStatus::PendingReview => 2,
+        TaskStatus::Completed => 3,
+        TaskStatus::Abandoned => 4,
+    }
+}
+
 impl fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -245,6 +265,25 @@ mod tests {
             extra_sections: Vec::new(),
             parse_error: None,
         }
+    }
+
+    #[test]
+    fn test_all_statuses_array() {
+        assert_eq!(ALL_STATUSES.len(), 5);
+        assert_eq!(ALL_STATUSES[0], TaskStatus::Open);
+        assert_eq!(ALL_STATUSES[1], TaskStatus::InProgress);
+        assert_eq!(ALL_STATUSES[2], TaskStatus::PendingReview);
+        assert_eq!(ALL_STATUSES[3], TaskStatus::Completed);
+        assert_eq!(ALL_STATUSES[4], TaskStatus::Abandoned);
+    }
+
+    #[test]
+    fn test_status_to_index() {
+        assert_eq!(status_to_index(&TaskStatus::Open), 0);
+        assert_eq!(status_to_index(&TaskStatus::InProgress), 1);
+        assert_eq!(status_to_index(&TaskStatus::PendingReview), 2);
+        assert_eq!(status_to_index(&TaskStatus::Completed), 3);
+        assert_eq!(status_to_index(&TaskStatus::Abandoned), 4);
     }
 
     #[test]
