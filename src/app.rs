@@ -116,6 +116,20 @@ impl App {
         self.task_list_state.selected_task_id()
     }
 
+    /// Creates a default [`App`] for use in unit tests.
+    ///
+    /// Wires up a local mpsc channel and an empty session map so callers
+    /// do not need to repeat the boilerplate.
+    #[cfg(test)]
+    pub fn test_default() -> Self {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let session_map = Arc::new(RwLock::new(HashMap::new()));
+        App::new(TaskStore::new(), None, session_map, tx)
+    }
+
     /// Processes a single [`AppMessage`], mutating state and returning
     /// any follow-up messages to dispatch.
     pub fn handle_message(&mut self, msg: AppMessage) -> Vec<AppMessage> {
@@ -291,6 +305,7 @@ impl App {
                         map.insert(session.id.clone(), (task_id.clone(), agent));
                     }
                     if let Err(e) = client.send_prompt_async(&session.id, &agent, &prompt).await {
+                        session_map.write().await.remove(&session.id);
                         let _ = async_tx
                             .send(AppMessage::SessionError {
                                 task_id,
@@ -298,14 +313,9 @@ impl App {
                                 error: format!("Failed to send prompt: {}", e),
                             })
                             .await;
-                        return;
                     }
-                    let _ = async_tx
-                        .send(AppMessage::SessionCreated {
-                            task_id,
-                            session_id: session.id,
-                        })
-                        .await;
+                    // SessionCreated is sent by EventStreamConsumer when it sees the SSE
+                    // event; sending it again here would cause double-processing.
                 });
                 vec![]
             }
@@ -414,22 +424,11 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    use tokio::sync::RwLock;
-
     use super::*;
-
-    fn test_app() -> App {
-        let (tx, _rx) = tokio::sync::mpsc::channel(16);
-        let session_map = Arc::new(RwLock::new(HashMap::new()));
-        App::new(TaskStore::new(), None, session_map, tx)
-    }
 
     #[test]
     fn test_app_new() {
-        let app = test_app();
+        let app = App::test_default();
         assert!(app.selected_task().is_none());
         assert_eq!(app.active_tab, 0);
         assert!(!app.should_quit);
@@ -439,31 +438,8 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_message_shutdown() {
-        let mut app = test_app();
-        let responses = app.handle_message(AppMessage::Shutdown);
-        // First Shutdown shows the dialog, does not quit.
-        assert!(!app.should_quit);
-        assert!(app.show_quit_confirm);
-        assert!(responses.is_empty());
-    }
-
-    #[test]
-    fn test_handle_message_shutdown_confirm() {
-        let mut app = test_app();
-        // First Shutdown shows dialog.
-        app.handle_message(AppMessage::Shutdown);
-        assert!(app.show_quit_confirm);
-        assert!(!app.should_quit);
-        // Second Shutdown (with dialog visible) confirms quit.
-        let responses = app.handle_message(AppMessage::Shutdown);
-        assert!(app.should_quit);
-        assert!(responses.is_empty());
-    }
-
-    #[test]
     fn test_dismiss_quit_confirm() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         app.show_quit_confirm = true;
         app.dismiss_quit_confirm();
         assert!(!app.show_quit_confirm);
@@ -472,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_handle_message_tick_drains_pending() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         // Inject a pending message to verify Tick drains the buffer.
         app.pending_messages.push(AppMessage::TaskUpdated {
             task_id: TaskId::from_path("tasks/1.1.md"),
@@ -486,7 +462,7 @@ mod tests {
     /// Verifies two-phase quit: first Shutdown shows dialog, second sets should_quit.
     #[test]
     fn test_handle_shutdown() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         assert!(!app.show_quit_confirm);
         assert!(!app.should_quit);
 
@@ -507,7 +483,7 @@ mod tests {
             Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
         };
 
-        let mut app = test_app();
+        let mut app = App::test_default();
         let key_event = Event::Key(KeyEvent {
             code: KeyCode::Char('q'),
             modifiers: KeyModifiers::NONE,
@@ -522,7 +498,7 @@ mod tests {
     /// Verifies that StartTask causes the workflow engine to emit CreateSession for Intake.
     #[test]
     fn test_handle_start_task_emits_create_session() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         let task_id = TaskId::from_path("tasks/1.1.md");
         let msgs = app.handle_message(AppMessage::StartTask {
             task_id: task_id.clone(),
@@ -544,7 +520,7 @@ mod tests {
     fn test_handle_streaming_update_updates_tab2() {
         use crate::opencode::types::MessagePart;
 
-        let mut app = test_app();
+        let mut app = App::test_default();
         let task_id = TaskId::from_path("tasks/1.1.md");
         let msgs = app.handle_message(AppMessage::StreamingUpdate {
             task_id: task_id.clone(),
@@ -563,7 +539,7 @@ mod tests {
 
     /// Verifies that TaskFileChanged triggers a reload from disk.
     #[test]
-    fn test_handle_task_updated_reloads_store() {
+    fn test_handle_task_file_changed_reloads_store() {
         use crate::tasks::models::{Task, TaskStatus};
         use tempfile::TempDir;
 
@@ -593,9 +569,7 @@ mod tests {
         };
         let task_id = task.id.clone();
 
-        let (tx, _rx) = tokio::sync::mpsc::channel(16);
-        let session_map = Arc::new(RwLock::new(HashMap::new()));
-        let mut app = App::new(TaskStore::new(), None, session_map, tx);
+        let mut app = App::test_default();
         app.task_store.insert(task);
 
         // Modify the file on disk to change the status.
@@ -645,7 +619,7 @@ mod tests {
     fn test_handle_request_fix_sets_in_progress() {
         use crate::tasks::TaskId;
 
-        let mut app = test_app();
+        let mut app = App::test_default();
         app.task_store.insert(make_malformed_task());
 
         let id = TaskId::from_path("tasks/1.1.md");
@@ -663,7 +637,7 @@ mod tests {
     fn test_handle_fix_ready_stores_suggestion() {
         use crate::tasks::TaskId;
 
-        let mut app = test_app();
+        let mut app = App::test_default();
         app.task_store.insert(make_malformed_task());
 
         let id = TaskId::from_path("tasks/1.1.md");
@@ -724,7 +698,7 @@ mod tests {
             }),
         };
         let id = task.id.clone();
-        let mut app = test_app();
+        let mut app = App::test_default();
         app.task_store.insert(task);
 
         let responses = app.handle_message(AppMessage::ApplyTaskFix {
@@ -776,7 +750,7 @@ mod tests {
             }),
         };
         let id = task.id.clone();
-        let mut app = test_app();
+        let mut app = App::test_default();
         app.task_store.insert(task);
 
         app.handle_message(AppMessage::ApplyTaskFix {

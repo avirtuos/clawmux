@@ -63,6 +63,8 @@ fn sync_tabs_on_nav(app: &mut App) {
         .set_displayed_task(app.task_list_state.selected_task_id());
     app.tab3_state
         .set_displayed_task(app.task_list_state.selected_task_id());
+    app.tab4_state
+        .set_displayed_task(app.task_list_state.selected_task_id());
 }
 
 /// Returns a context-sensitive keybinding hint string for the footer.
@@ -348,11 +350,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
     use crossterm::event::{KeyEvent, KeyEventKind, KeyEventState};
-    use tokio::sync::RwLock;
 
     use super::*;
 
@@ -365,15 +363,9 @@ mod tests {
         })
     }
 
-    fn test_app() -> App {
-        let (tx, _rx) = tokio::sync::mpsc::channel(16);
-        let session_map = Arc::new(RwLock::new(HashMap::new()));
-        App::new(crate::tasks::TaskStore::new(), None, session_map, tx)
-    }
-
     #[test]
     fn test_handle_input_q_quits() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         let event = key_event(KeyCode::Char('q'), KeyModifiers::NONE);
         let result = handle_input(event, &mut app);
         assert!(matches!(result, Some(AppMessage::Shutdown)));
@@ -381,7 +373,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_ctrl_c_quits() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         let event = key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let result = handle_input(event, &mut app);
         assert!(matches!(result, Some(AppMessage::Shutdown)));
@@ -389,7 +381,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_other_key_none() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         let event = key_event(KeyCode::Char('a'), KeyModifiers::NONE);
         let result = handle_input(event, &mut app);
         assert!(result.is_none());
@@ -397,7 +389,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_up_moves() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         // Seed two story headers by directly setting up state.
         app.task_list_state
             .expanded_stories
@@ -443,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_down_moves() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         app.task_list_state
             .expanded_stories
             .insert("1. Alpha".to_string());
@@ -482,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_enter_toggles_story() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         // Insert a task so the store has a story to display.
         app.task_store.insert(crate::tasks::models::Task {
             id: crate::tasks::TaskId::from_path("tasks/1.1.md"),
@@ -513,7 +505,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_tab_cycles() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         assert_eq!(app.active_tab, 0);
 
         let tab = key_event(KeyCode::Tab, KeyModifiers::NONE);
@@ -535,7 +527,7 @@ mod tests {
         use crate::tasks::models::{Question, Task, TaskId, TaskStatus};
         use crate::workflow::agents::AgentKind;
 
-        let mut app = test_app();
+        let mut app = App::test_default();
         let task = Task {
             id: TaskId::from_path("tasks/1.1.md"),
             story_name: "1. Alpha".to_string(),
@@ -571,7 +563,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_i_focuses_prompt() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         assert_eq!(app.active_tab, 0);
         assert!(!app.tab1_state.prompt_focused);
 
@@ -599,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_pgdn_scrolls_description() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         assert_eq!(app.active_tab, 0);
         assert_eq!(app.tab1_state.desc_scroll, 0);
 
@@ -612,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_pgup_scrolls_description() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         app.tab1_state.desc_scroll = 2;
 
         let event = key_event(KeyCode::PageUp, KeyModifiers::NONE);
@@ -624,7 +616,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_pgdn_no_scroll_when_prompt_focused() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         app.tab1_state.prompt_focused = true;
 
         let event = key_event(KeyCode::PageDown, KeyModifiers::NONE);
@@ -636,7 +628,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_pgdn_no_scroll_on_other_tab() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         app.active_tab = 1;
 
         let event = key_event(KeyCode::PageDown, KeyModifiers::NONE);
@@ -687,7 +679,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_quit_confirm_y_confirms() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         app.show_quit_confirm = true;
         let event = key_event(KeyCode::Char('y'), KeyModifiers::NONE);
         let result = handle_input(event, &mut app);
@@ -697,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_quit_confirm_enter_confirms() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         app.show_quit_confirm = true;
         let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_input(event, &mut app);
@@ -706,7 +698,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_quit_confirm_n_cancels() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         app.show_quit_confirm = true;
         let event = key_event(KeyCode::Char('n'), KeyModifiers::NONE);
         let result = handle_input(event, &mut app);
@@ -716,7 +708,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_quit_confirm_esc_cancels() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         app.show_quit_confirm = true;
         let event = key_event(KeyCode::Esc, KeyModifiers::NONE);
         let result = handle_input(event, &mut app);
@@ -726,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_quit_confirm_other_keys_ignored() {
-        let mut app = test_app();
+        let mut app = App::test_default();
         app.show_quit_confirm = true;
         let event = key_event(KeyCode::Char('x'), KeyModifiers::NONE);
         let result = handle_input(event, &mut app);
@@ -738,7 +730,7 @@ mod tests {
     fn app_with_malformed_task() -> App {
         use crate::tasks::models::{ParseErrorInfo, Task, TaskId, TaskStatus};
 
-        let mut app = test_app();
+        let mut app = App::test_default();
         let task = Task {
             id: TaskId::from_path("tasks/1.1.md"),
             story_name: "1. Alpha".to_string(),

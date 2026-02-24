@@ -3,7 +3,7 @@
 //! Renders file diffs retrieved from the opencode `/session/:id/diff` endpoint
 //! with syntax-highlighted hunks, and provides a `tui-textarea` comment input
 //! area for human review feedback.
-//! Task 3.6 implements the full code review tab.
+//! Task 9.1 implements the full code review tab rendering.
 
 use std::collections::HashMap;
 
@@ -13,7 +13,7 @@ use crate::tasks::models::TaskId;
 /// UI state for Tab 4 (Code Review): per-task diff storage and current display task.
 ///
 /// Stores diffs indexed by task ID so they survive tab switches.
-/// The full rendering and comment input are deferred to Task 3.6.
+/// The full rendering and comment input are deferred to Task 9.1.
 #[allow(dead_code)]
 pub struct Tab4State {
     /// Per-task list of file diffs fetched from the opencode diff endpoint.

@@ -79,28 +79,17 @@ pub fn render(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use tokio::sync::RwLock;
 
     use super::*;
     use crate::app::App;
-    use crate::tasks::TaskStore;
-
-    fn test_app() -> App {
-        let (tx, _rx) = tokio::sync::mpsc::channel(16);
-        let session_map = Arc::new(RwLock::new(HashMap::new()));
-        App::new(TaskStore::new(), None, session_map, tx)
-    }
 
     #[test]
     fn test_tab_bar_renders_four_tabs() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let app = test_app();
+        let app = App::test_default();
 
         terminal
             .draw(|frame| {
