@@ -10,6 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use tui_textarea::TextArea;
 
+use crate::tasks::models::ParseErrorInfo;
 use crate::tasks::{Task, TaskId};
 
 /// UI state for Tab 1 (Task Details).
@@ -144,9 +145,98 @@ impl Default for Tab1State {
     }
 }
 
+/// Renders the malformed-task view into `area`.
+///
+/// Displays three vertical sections:
+/// 1. A red-bordered error banner with the parse error message.
+/// 2. A scrollable paragraph showing the raw file content.
+/// 3. An action area indicating fix status or prompting the user.
+fn render_malformed_view(
+    frame: &mut Frame,
+    area: Rect,
+    task: &Task,
+    error_info: &ParseErrorInfo,
+    state: &Tab1State,
+) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5), // error banner
+            Constraint::Min(2),    // raw content (scrollable)
+            Constraint::Length(6), // action area
+        ])
+        .split(area);
+
+    // --- Error banner ---
+    let banner_lines = vec![
+        Line::from(Span::styled(
+            "PARSE ERROR",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::raw(error_info.error_message.clone())),
+        Line::from(Span::styled(
+            format!("File: {}", task.file_path.display()),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let banner = Paragraph::new(banner_lines).block(
+        Block::default()
+            .title("Parse Error")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red)),
+    );
+    frame.render_widget(banner, sections[0]);
+
+    // --- Raw content ---
+    let raw_para = Paragraph::new(error_info.raw_content.clone())
+        .block(
+            Block::default()
+                .title("Raw File Content")
+                .borders(Borders::ALL),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .scroll((state.desc_scroll, 0));
+    frame.render_widget(raw_para, sections[1]);
+
+    // --- Action area ---
+    let action_widget = if error_info.fix_in_progress {
+        Paragraph::new("Requesting fix from AI...").block(
+            Block::default()
+                .title("Fix Suggestion")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+    } else if let Some(ref fix) = error_info.suggested_fix {
+        let lines = vec![
+            Line::from(fix.explanation.clone()),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press Enter to apply fix",
+                Style::default().fg(Color::Green),
+            )),
+        ];
+        Paragraph::new(lines).block(
+            Block::default()
+                .title("Suggested Fix")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
+        )
+    } else {
+        Paragraph::new("Press 'f' to request an AI fix suggestion.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(
+                Block::default()
+                    .title("Fix Suggestion")
+                    .borders(Borders::ALL),
+            )
+    };
+    frame.render_widget(action_widget, sections[2]);
+}
+
 /// Renders the Task Details tab into `area`.
 ///
 /// When no task is selected (`task` is `None`), displays a centered placeholder.
+/// When a task is malformed, delegates to [`render_malformed_view`].
 /// When a task is selected, displays metadata, description, supplemental prompt,
 /// and the question/answer section.
 pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1State) {
@@ -157,6 +247,11 @@ pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &Tab1St
         frame.render_widget(placeholder, area);
         return;
     };
+
+    if let Some(ref error_info) = task.parse_error {
+        render_malformed_view(frame, area, task, error_info, state);
+        return;
+    }
 
     // Count answered vs. unanswered questions to size the questions section.
     let answered: Vec<_> = task
@@ -320,6 +415,7 @@ mod tests {
             work_log: Vec::new(),
             file_path: PathBuf::from("tasks/1.1.md"),
             extra_sections: Vec::new(),
+            parse_error: None,
         }
     }
 
@@ -449,6 +545,116 @@ mod tests {
         assert!(
             content.contains("Questions") || content.contains("No questions"),
             "Questions section should be visible in a 24-row terminal, got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_malformed_shows_error() {
+        use crate::tasks::models::ParseErrorInfo;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut task = make_task("desc");
+        task.parse_error = Some(ParseErrorInfo {
+            error_message: "missing required Status field".to_string(),
+            raw_content: "raw bad content".to_string(),
+            suggested_fix: None,
+            fix_in_progress: false,
+        });
+        let state = Tab1State::new();
+
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), Some(&task), &state);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect();
+        assert!(
+            content.contains("PARSE ERROR"),
+            "should show PARSE ERROR banner; got: {content:?}"
+        );
+        assert!(
+            content.contains("missing required Status field"),
+            "should show error message; got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_malformed_shows_raw_content() {
+        use crate::tasks::models::ParseErrorInfo;
+
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut task = make_task("desc");
+        task.parse_error = Some(ParseErrorInfo {
+            error_message: "parse error".to_string(),
+            raw_content: "raw file content here".to_string(),
+            suggested_fix: None,
+            fix_in_progress: false,
+        });
+        let state = Tab1State::new();
+
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), Some(&task), &state);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect();
+        assert!(
+            content.contains("raw file content here"),
+            "should show raw file content; got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_malformed_with_fix() {
+        use crate::tasks::models::{ParseErrorInfo, SuggestedFix};
+
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut task = make_task("desc");
+        task.parse_error = Some(ParseErrorInfo {
+            error_message: "parse error".to_string(),
+            raw_content: "bad content".to_string(),
+            suggested_fix: Some(SuggestedFix {
+                corrected_content: "fixed content".to_string(),
+                explanation: "Added missing Status line".to_string(),
+            }),
+            fix_in_progress: false,
+        });
+        let state = Tab1State::new();
+
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), Some(&task), &state);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect();
+        assert!(
+            content.contains("Added missing Status line"),
+            "should show fix explanation; got: {content:?}"
+        );
+        assert!(
+            content.contains("Press Enter to apply fix"),
+            "should show apply prompt; got: {content:?}"
         );
     }
 

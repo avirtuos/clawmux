@@ -22,7 +22,11 @@ use crate::app::App;
 use crate::config::AppConfig;
 use crate::messages::AppMessage;
 use crate::opencode::server::OpenCodeServer;
+use crate::opencode::types::{MessagePart, OpenCodeEvent};
+use crate::opencode::OpenCodeClient;
+use crate::tasks::models::TaskId;
 use crate::tasks::TaskStore;
+use crate::workflow::agents::AgentKind;
 
 /// ClawdMux: GenAI coding assistance multiplexer and task orchestrator.
 #[derive(Parser, Debug)]
@@ -159,6 +163,7 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_stream = crossterm::event::EventStream::new();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(250));
     tick_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let (fix_tx, mut fix_rx) = tokio::sync::mpsc::channel::<AppMessage>(8);
 
     loop {
         terminal.draw(|frame| tui::draw(frame, &app))?;
@@ -177,12 +182,19 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
             _ = tokio::signal::ctrl_c() => {
                 app.handle_message(AppMessage::Shutdown)
             }
+            Some(fix_msg) = fix_rx.recv() => {
+                app.handle_message(fix_msg)
+            }
         };
 
         // Dispatch any follow-up messages produced by the handler,
         // including messages produced by follow-up handlers themselves.
         let mut queue = std::collections::VecDeque::from(messages);
         while let Some(msg) = queue.pop_front() {
+            // Intercept RequestTaskFix to spawn an async fix task.
+            if let AppMessage::RequestTaskFix { ref task_id } = msg {
+                spawn_fix_request(task_id, &app, &server, &config, fix_tx.clone());
+            }
             queue.extend(app.handle_message(msg));
         }
 
@@ -200,6 +212,183 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Spawns an async task to request an AI-generated fix for a malformed task file.
+///
+/// Extracts the raw content and error from the task store, then spawns a tokio
+/// task that creates an OpenCode session, sends a fix prompt, collects the
+/// response via SSE, and sends the result back through `fix_tx`.
+///
+/// If the OpenCode server is unavailable or the task data cannot be found,
+/// sends a [`AppMessage::TaskFixFailed`] immediately.
+fn spawn_fix_request(
+    task_id: &TaskId,
+    app: &App,
+    server: &Option<OpenCodeServer>,
+    config: &AppConfig,
+    fix_tx: tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let base_url = match server {
+        Some(s) => s.base_url().to_string(),
+        None => {
+            let task_id = task_id.clone();
+            tokio::spawn(async move {
+                let _ = fix_tx
+                    .send(AppMessage::TaskFixFailed {
+                        task_id,
+                        error: "OpenCode server unavailable".to_string(),
+                    })
+                    .await;
+            });
+            return;
+        }
+    };
+
+    let (raw_content, error_message) = match app.task_store.get(task_id) {
+        Some(t) => match t.parse_error.as_ref() {
+            Some(e) => (e.raw_content.clone(), e.error_message.clone()),
+            None => return,
+        },
+        None => return,
+    };
+
+    let task_id = task_id.clone();
+    let auth = if config.has_explicit_password() {
+        Some(("clawdmux".to_string(), config.effective_opencode_password()))
+    } else {
+        None
+    };
+
+    tokio::spawn(async move {
+        let client = OpenCodeClient::new(base_url.clone(), auth);
+
+        let session = match client.create_session().await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = fix_tx
+                    .send(AppMessage::TaskFixFailed {
+                        task_id,
+                        error: format!("Failed to create session: {}", e),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        let prompt = build_fix_prompt(&error_message, &raw_content);
+        if let Err(e) = client
+            .send_prompt_async(&session.id, &AgentKind::Implementation, &prompt)
+            .await
+        {
+            let _ = fix_tx
+                .send(AppMessage::TaskFixFailed {
+                    task_id,
+                    error: format!("Failed to send fix prompt: {}", e),
+                })
+                .await;
+            return;
+        }
+
+        // Subscribe to the global SSE stream and collect text for our session.
+        let url = format!("{}/global/event", base_url);
+        let request = reqwest::Client::new().get(&url);
+        let mut es = match reqwest_eventsource::EventSource::new(request) {
+            Ok(es) => es,
+            Err(e) => {
+                let _ = fix_tx
+                    .send(AppMessage::TaskFixFailed {
+                        task_id,
+                        error: format!("Failed to open SSE stream: {}", e),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        let mut collected_text = String::new();
+        while let Some(event) = es.next().await {
+            match event {
+                Ok(reqwest_eventsource::Event::Message(msg)) => {
+                    match serde_json::from_str::<OpenCodeEvent>(&msg.data) {
+                        Ok(OpenCodeEvent::MessageUpdated {
+                            session_id, parts, ..
+                        }) if session_id == session.id => {
+                            for part in &parts {
+                                if let MessagePart::Text { text } = part {
+                                    collected_text = text.clone();
+                                }
+                            }
+                        }
+                        Ok(OpenCodeEvent::SessionCompleted { session_id })
+                            if session_id == session.id =>
+                        {
+                            break;
+                        }
+                        Ok(OpenCodeEvent::SessionError { session_id, error })
+                            if session_id == session.id =>
+                        {
+                            let _ = fix_tx
+                                .send(AppMessage::TaskFixFailed {
+                                    task_id,
+                                    error: format!("Session error: {}", error),
+                                })
+                                .await;
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    let _ = fix_tx
+                        .send(AppMessage::TaskFixFailed {
+                            task_id,
+                            error: format!("SSE stream error: {}", e),
+                        })
+                        .await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if collected_text.is_empty() {
+            let _ = fix_tx
+                .send(AppMessage::TaskFixFailed {
+                    task_id,
+                    error: "No fix content received from AI".to_string(),
+                })
+                .await;
+            return;
+        }
+
+        let _ = fix_tx
+            .send(AppMessage::TaskFixReady {
+                task_id,
+                corrected_content: collected_text,
+                explanation: "AI-generated fix suggestion".to_string(),
+            })
+            .await;
+    });
+}
+
+/// Builds the fix prompt to send to the AI for a malformed task file.
+fn build_fix_prompt(error_message: &str, raw_content: &str) -> String {
+    format!(
+        "The following task markdown file failed to parse.\n\n\
+         ERROR: {error_message}\n\n\
+         Expected format:\n\
+         Story: <story name>\n\
+         Task: <task name>\n\
+         Status: OPEN | IN_PROGRESS | PENDING_REVIEW | COMPLETED | ABANDONED\n\
+         Assigned To: [<Agent Name>]  (optional)\n\n\
+         ## Description\n\
+         <text>\n\n\
+         Raw file content:\n\
+         {raw_content}\n\n\
+         Output ONLY the corrected markdown. No code fences, no explanation.\n\
+         Preserve as much original content as possible."
+    )
 }
 
 #[cfg(test)]

@@ -69,6 +69,7 @@ fn sync_tabs_on_nav(app: &mut App) {
 ///
 /// - When the quit confirmation dialog is visible: shows confirm/cancel bindings.
 /// - When a textarea is focused: shows Esc / editing hint.
+/// - On Tab 1 with a malformed task selected: shows fix/apply bindings.
 /// - On Tab 1 with no focus: shows all available bindings.
 /// - On other tabs: shows minimal bindings.
 pub fn footer_hint_text(
@@ -76,6 +77,7 @@ pub fn footer_hint_text(
     active_tab: usize,
     prompt_focused: bool,
     focused_answer: Option<usize>,
+    is_malformed_task: bool,
 ) -> &'static str {
     if show_quit_confirm {
         "[y/Enter] confirm quit | [n/Esc] cancel"
@@ -83,6 +85,8 @@ pub fn footer_hint_text(
         "[Esc] exit | Editing prompt"
     } else if focused_answer.is_some() {
         "[Esc] exit | [Tab] next answer | Editing answer"
+    } else if active_tab == 0 && is_malformed_task {
+        "[f] request fix | [Enter] apply fix | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 0 {
         "[i] prompt | [a] answer | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 1 || active_tab == 2 {
@@ -110,11 +114,17 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     tabs::render(frame, areas.right_pane, app);
 
+    let is_malformed_task = app
+        .selected_task()
+        .and_then(|id| app.task_store.get(id))
+        .map(|t| t.is_malformed())
+        .unwrap_or(false);
     let hint = footer_hint_text(
         app.show_quit_confirm,
         app.active_tab,
         app.tab1_state.prompt_focused,
         app.tab1_state.focused_answer,
+        is_malformed_task,
     );
     let footer = Paragraph::new(hint).block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, areas.footer);
@@ -178,49 +188,86 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
 
         // When Tab 1 is active and a textarea has focus, forward input to it.
         if app.active_tab == 0 {
-            if app.tab1_state.prompt_focused {
-                if key.code == KeyCode::Esc {
-                    app.tab1_state.prompt_focused = false;
-                    app.tab1_state.set_prompt_unfocused_style();
-                } else {
-                    app.tab1_state.prompt_input.input(Input::from(key));
-                }
-                return None;
-            }
-            if let Some(idx) = app.tab1_state.focused_answer {
-                if key.code == KeyCode::Esc {
-                    app.tab1_state.set_answer_unfocused_style(idx);
-                    app.tab1_state.focused_answer = None;
-                } else if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
-                    let len = app.tab1_state.answer_inputs.len();
-                    if len > 0 {
-                        let new_idx = (idx + 1) % len;
-                        app.tab1_state.set_answer_unfocused_style(idx);
-                        app.tab1_state.focused_answer = Some(new_idx);
-                        app.tab1_state.set_answer_focused_style(new_idx);
+            // Check if a malformed task is selected.
+            let selected_malformed_task_id = app
+                .selected_task()
+                .and_then(|id| app.task_store.get(id))
+                .filter(|t| t.is_malformed())
+                .map(|t| t.id.clone());
+
+            if let Some(task_id) = selected_malformed_task_id {
+                match key.code {
+                    KeyCode::Char('f') if key.modifiers == KeyModifiers::NONE => {
+                        return Some(AppMessage::RequestTaskFix { task_id });
                     }
-                } else if let Some(ta) = app.tab1_state.answer_inputs.get_mut(idx) {
-                    ta.input(Input::from(key));
+                    KeyCode::Enter => {
+                        // Only emit ApplyTaskFix if there is a suggestion ready.
+                        let has_fix = app
+                            .task_store
+                            .get(&task_id)
+                            .and_then(|t| t.parse_error.as_ref())
+                            .map(|e| e.suggested_fix.is_some())
+                            .unwrap_or(false);
+                        if has_fix {
+                            return Some(AppMessage::ApplyTaskFix { task_id });
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        app.tab1_state.scroll_desc_up();
+                        return None;
+                    }
+                    KeyCode::PageDown => {
+                        app.tab1_state.scroll_desc_down();
+                        return None;
+                    }
+                    _ => {}
                 }
-                return None;
-            }
-            // Enter focus on the supplemental prompt with 'i'.
-            if key.code == KeyCode::Char('i') && key.modifiers == KeyModifiers::NONE {
-                app.tab1_state.prompt_focused = true;
-                app.tab1_state.set_prompt_focused_style();
-                return None;
-            }
-            // Scroll the description paragraph with PgUp/PgDn (no textarea focused).
-            match key.code {
-                KeyCode::PageUp => {
-                    app.tab1_state.scroll_desc_up();
+                // Fall through to shared navigation handling below.
+            } else {
+                if app.tab1_state.prompt_focused {
+                    if key.code == KeyCode::Esc {
+                        app.tab1_state.prompt_focused = false;
+                        app.tab1_state.set_prompt_unfocused_style();
+                    } else {
+                        app.tab1_state.prompt_input.input(Input::from(key));
+                    }
                     return None;
                 }
-                KeyCode::PageDown => {
-                    app.tab1_state.scroll_desc_down();
+                if let Some(idx) = app.tab1_state.focused_answer {
+                    if key.code == KeyCode::Esc {
+                        app.tab1_state.set_answer_unfocused_style(idx);
+                        app.tab1_state.focused_answer = None;
+                    } else if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
+                        let len = app.tab1_state.answer_inputs.len();
+                        if len > 0 {
+                            let new_idx = (idx + 1) % len;
+                            app.tab1_state.set_answer_unfocused_style(idx);
+                            app.tab1_state.focused_answer = Some(new_idx);
+                            app.tab1_state.set_answer_focused_style(new_idx);
+                        }
+                    } else if let Some(ta) = app.tab1_state.answer_inputs.get_mut(idx) {
+                        ta.input(Input::from(key));
+                    }
                     return None;
                 }
-                _ => {}
+                // Enter focus on the supplemental prompt with 'i'.
+                if key.code == KeyCode::Char('i') && key.modifiers == KeyModifiers::NONE {
+                    app.tab1_state.prompt_focused = true;
+                    app.tab1_state.set_prompt_focused_style();
+                    return None;
+                }
+                // Scroll the description paragraph with PgUp/PgDn (no textarea focused).
+                match key.code {
+                    KeyCode::PageUp => {
+                        app.tab1_state.scroll_desc_up();
+                        return None;
+                    }
+                    KeyCode::PageDown => {
+                        app.tab1_state.scroll_desc_down();
+                        return None;
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -365,6 +412,7 @@ mod tests {
                     work_log: Vec::new(),
                     file_path: std::path::PathBuf::from("tasks/1.1.md"),
                     extra_sections: Vec::new(),
+                    parse_error: None,
                 }],
             },
             crate::tasks::Story {
@@ -405,6 +453,7 @@ mod tests {
                 work_log: Vec::new(),
                 file_path: std::path::PathBuf::from("tasks/1.1.md"),
                 extra_sections: Vec::new(),
+                parse_error: None,
             }],
         }];
         app.task_list_state.refresh(&stories);
@@ -439,6 +488,7 @@ mod tests {
             work_log: Vec::new(),
             file_path: std::path::PathBuf::from("tasks/1.1.md"),
             extra_sections: Vec::new(),
+            parse_error: None,
         });
         // Refresh cached stories and task list from the store.
         app.refresh_stories();
@@ -494,6 +544,7 @@ mod tests {
             work_log: Vec::new(),
             file_path: std::path::PathBuf::from("tasks/1.1.md"),
             extra_sections: Vec::new(),
+            parse_error: None,
         };
         app.task_store.insert(task);
         app.refresh_stories();
@@ -586,7 +637,7 @@ mod tests {
 
     #[test]
     fn test_footer_hints_normal_tab1() {
-        let text = footer_hint_text(false, 0, false, None);
+        let text = footer_hint_text(false, 0, false, None, false);
         assert!(text.contains("[i] prompt"), "got: {text}");
         assert!(text.contains("[a] answer"), "got: {text}");
         assert!(text.contains("PgUp/PgDn"), "got: {text}");
@@ -594,14 +645,14 @@ mod tests {
 
     #[test]
     fn test_footer_hints_prompt_focused() {
-        let text = footer_hint_text(false, 0, true, None);
+        let text = footer_hint_text(false, 0, true, None, false);
         assert!(text.contains("[Esc]"), "got: {text}");
         assert!(text.contains("Editing prompt"), "got: {text}");
     }
 
     #[test]
     fn test_footer_hints_other_tab() {
-        let text = footer_hint_text(false, 1, false, None);
+        let text = footer_hint_text(false, 1, false, None, false);
         assert!(text.contains("[Tab] next tab"), "got: {text}");
         assert!(text.contains("[q] quit"), "got: {text}");
         assert!(!text.contains("[i]"), "got: {text}");
@@ -609,9 +660,19 @@ mod tests {
 
     #[test]
     fn test_footer_hints_quit_confirm() {
-        let text = footer_hint_text(true, 0, false, None);
+        let text = footer_hint_text(true, 0, false, None, false);
         assert!(text.contains("[y/Enter]"), "got: {text}");
         assert!(text.contains("[n/Esc]"), "got: {text}");
+    }
+
+    #[test]
+    fn test_footer_hints_malformed_task() {
+        let text = footer_hint_text(false, 0, false, None, true);
+        assert!(text.contains("[f] request fix"), "got: {text}");
+        assert!(text.contains("[Enter] apply fix"), "got: {text}");
+        assert!(text.contains("PgUp/PgDn"), "got: {text}");
+        // Normal task hints should not appear for malformed tasks.
+        assert!(!text.contains("[i] prompt"), "got: {text}");
     }
 
     #[test]
@@ -661,5 +722,89 @@ mod tests {
         let result = handle_input(event, &mut app);
         assert!(result.is_none());
         assert!(app.show_quit_confirm); // dialog remains
+    }
+
+    /// Builds an App with a malformed task selected in Tab 0.
+    fn app_with_malformed_task() -> App {
+        use crate::tasks::models::{ParseErrorInfo, Task, TaskId, TaskStatus};
+
+        let mut app = App::new(crate::tasks::TaskStore::new());
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Alpha".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::Open,
+            assigned_to: None,
+            description: String::new(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: Some(ParseErrorInfo {
+                error_message: "missing Status".to_string(),
+                raw_content: "bad content".to_string(),
+                suggested_fix: None,
+                fix_in_progress: false,
+            }),
+        };
+        app.task_store.insert(task);
+        app.refresh_stories();
+        app.task_list_state
+            .expanded_stories
+            .insert("1. Alpha".to_string());
+        app.task_list_state.refresh(&app.cached_stories);
+        // Navigate down to select the task row.
+        let down = key_event(KeyCode::Down, KeyModifiers::NONE);
+        handle_input(down, &mut app);
+        app
+    }
+
+    #[test]
+    fn test_handle_input_f_on_malformed() {
+        let mut app = app_with_malformed_task();
+        let event = key_event(KeyCode::Char('f'), KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+        assert!(
+            matches!(result, Some(AppMessage::RequestTaskFix { .. })),
+            "expected RequestTaskFix, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_handle_input_enter_on_malformed_without_fix() {
+        // No suggested fix -- Enter should not emit ApplyTaskFix.
+        let mut app = app_with_malformed_task();
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+        assert!(
+            result.is_none(),
+            "Enter without a fix should return None, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_handle_input_enter_on_malformed_with_fix() {
+        use crate::tasks::models::{SuggestedFix, TaskId};
+
+        let mut app = app_with_malformed_task();
+        // Add a suggested fix to the task.
+        let id = TaskId::from_path("tasks/1.1.md");
+        if let Some(task) = app.task_store.get_mut(&id) {
+            if let Some(ref mut err_info) = task.parse_error {
+                err_info.suggested_fix = Some(SuggestedFix {
+                    corrected_content: "fixed content".to_string(),
+                    explanation: "Added Status line".to_string(),
+                });
+            }
+        }
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+        assert!(
+            matches!(result, Some(AppMessage::ApplyTaskFix { .. })),
+            "expected ApplyTaskFix, got: {result:?}"
+        );
     }
 }

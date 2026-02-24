@@ -97,6 +97,9 @@ impl TaskStore {
                 }
                 Err(e) => {
                     tracing::warn!("Failed to parse task file {}: {}", path.display(), e);
+                    let task = parser::create_malformed_task(&content, path, e.to_string());
+                    self.tasks.insert(task.id.clone(), task);
+                    loaded += 1;
                 }
             }
         }
@@ -195,7 +198,17 @@ impl TaskStore {
             .file_path
             .clone();
         let content = std::fs::read_to_string(&file_path)?;
-        let task = parser::parse_task(&content, file_path)?;
+        let task = match parser::parse_task(&content, file_path.clone()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to re-parse task file {}: {}",
+                    file_path.display(),
+                    e
+                );
+                parser::create_malformed_task(&content, file_path, e.to_string())
+            }
+        };
         self.tasks.insert(task.id.clone(), task);
         Ok(())
     }
@@ -398,7 +411,56 @@ mod tests {
         let mut store = TaskStore::new();
         let count = store.load_from_disk(tmp.path()).unwrap();
 
-        assert_eq!(count, 1);
-        assert_eq!(store.task_count(), 1);
+        // Both files are loaded now: valid as normal, invalid as a malformed stub.
+        assert_eq!(count, 2);
+        assert_eq!(store.task_count(), 2);
+
+        // The malformed file should appear as a stub with parse_error set.
+        let malformed = store
+            .tasks
+            .values()
+            .find(|t| t.is_malformed())
+            .expect("should have a malformed stub");
+        assert!(malformed.is_malformed());
+    }
+
+    #[test]
+    fn test_reload_malformed_becomes_valid() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        std::fs::create_dir(&tasks_dir).unwrap();
+
+        let file_path = write_file(&tasks_dir, "1.1.md", "this is bad content\n");
+
+        let mut store = TaskStore::new();
+        store.load_from_disk(tmp.path()).unwrap();
+
+        let id = store.tasks.keys().next().unwrap().clone();
+        assert!(store.get(&id).unwrap().is_malformed());
+
+        // Fix the file on disk.
+        std::fs::write(&file_path, &minimal_md("1. Story", "1.1")).unwrap();
+        store.reload(&id).unwrap();
+        assert!(!store.get(&id).unwrap().is_malformed());
+    }
+
+    #[test]
+    fn test_reload_valid_becomes_malformed() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        std::fs::create_dir(&tasks_dir).unwrap();
+
+        let file_path = write_file(&tasks_dir, "1.1.md", &minimal_md("1. Story", "1.1"));
+
+        let mut store = TaskStore::new();
+        store.load_from_disk(tmp.path()).unwrap();
+
+        let id = store.tasks.keys().next().unwrap().clone();
+        assert!(!store.get(&id).unwrap().is_malformed());
+
+        // Corrupt the file on disk.
+        std::fs::write(&file_path, "totally broken\n").unwrap();
+        store.reload(&id).unwrap();
+        assert!(store.get(&id).unwrap().is_malformed());
     }
 }

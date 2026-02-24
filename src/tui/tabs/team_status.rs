@@ -214,6 +214,7 @@ mod tests {
             work_log,
             file_path: PathBuf::from("tasks/1.1.md"),
             extra_sections: Vec::new(),
+            parse_error: None,
         }
     }
 

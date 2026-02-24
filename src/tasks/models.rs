@@ -109,6 +109,28 @@ pub struct WorkLogEntry {
     pub description: String,
 }
 
+/// A proposed correction for a malformed task file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuggestedFix {
+    /// The corrected markdown content to write back to disk.
+    pub corrected_content: String,
+    /// A brief explanation of what was changed.
+    pub explanation: String,
+}
+
+/// Parse error details for a task file that could not be fully parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseErrorInfo {
+    /// The error message from the parser.
+    pub error_message: String,
+    /// The raw file content that failed to parse.
+    pub raw_content: String,
+    /// An AI-generated fix suggestion, if one has been requested and returned.
+    pub suggested_fix: Option<SuggestedFix>,
+    /// `true` while an AI fix request is in flight.
+    pub fix_in_progress: bool,
+}
+
 /// A single task loaded from a markdown file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -141,6 +163,11 @@ pub struct Task {
     ///
     /// Each entry is `(heading_text, body_content)` where `heading_text` excludes the `## ` prefix.
     pub extra_sections: Vec<(String, String)>,
+    /// If this task could not be fully parsed, contains the parse error details.
+    ///
+    /// When `Some`, this is a stub task: metadata fields may be best-effort guesses
+    /// and the task should not be written back to disk via the normal serializer.
+    pub parse_error: Option<ParseErrorInfo>,
 }
 
 #[allow(dead_code)]
@@ -148,6 +175,11 @@ impl Task {
     /// Returns `true` if this task is currently being worked on by an agent.
     pub fn is_active(&self) -> bool {
         self.status == TaskStatus::InProgress
+    }
+
+    /// Returns `true` if this task failed to parse and is a best-effort stub.
+    pub fn is_malformed(&self) -> bool {
+        self.parse_error.is_some()
     }
 }
 
@@ -211,6 +243,7 @@ mod tests {
             work_log: Vec::new(),
             file_path: PathBuf::from(format!("tasks/{name}.md")),
             extra_sections: Vec::new(),
+            parse_error: None,
         }
     }
 

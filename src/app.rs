@@ -4,6 +4,7 @@
 //! the TUI layer, workflow engine, task store, and opencode client.
 
 use crate::messages::AppMessage;
+use crate::tasks::models::SuggestedFix;
 use crate::tasks::{Story, TaskId, TaskStore};
 use crate::tui::tabs::agent_activity::Tab2State;
 use crate::tui::tabs::task_details::Tab1State;
@@ -121,6 +122,87 @@ impl App {
                 self.tab2_state.push_tool(&task_id, tool, status);
                 vec![]
             }
+            AppMessage::RequestTaskFix { task_id } => {
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    if let Some(ref mut err_info) = task.parse_error {
+                        err_info.fix_in_progress = true;
+                        err_info.suggested_fix = None;
+                    }
+                }
+                vec![]
+            }
+            AppMessage::TaskFixReady {
+                task_id,
+                corrected_content,
+                explanation,
+            } => {
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    if let Some(ref mut err_info) = task.parse_error {
+                        err_info.fix_in_progress = false;
+                        err_info.suggested_fix = Some(SuggestedFix {
+                            corrected_content,
+                            explanation,
+                        });
+                    }
+                }
+                vec![]
+            }
+            AppMessage::TaskFixFailed { task_id, error } => {
+                tracing::warn!("AI fix request failed for task {}: {}", task_id, error);
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    if let Some(ref mut err_info) = task.parse_error {
+                        err_info.fix_in_progress = false;
+                    }
+                }
+                vec![]
+            }
+            AppMessage::ApplyTaskFix { task_id } => {
+                // Extract the corrected content and file path from the task.
+                let (corrected, file_path) = {
+                    let task = match self.task_store.get(&task_id) {
+                        Some(t) => t,
+                        None => return vec![],
+                    };
+                    let corrected = match task
+                        .parse_error
+                        .as_ref()
+                        .and_then(|e| e.suggested_fix.as_ref())
+                        .map(|f| f.corrected_content.clone())
+                    {
+                        Some(c) => c,
+                        None => return vec![],
+                    };
+                    (corrected, task.file_path.clone())
+                };
+
+                // Write corrected content to disk.
+                if let Err(e) = std::fs::write(&file_path, &corrected) {
+                    tracing::warn!("Failed to write fix for {}: {}", file_path.display(), e);
+                    return vec![];
+                }
+
+                // Re-parse the file. On success, replace the task (clears parse_error).
+                // On failure, insert a new malformed stub.
+                let new_task = match crate::tasks::parser::parse_task(&corrected, file_path.clone())
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Fix did not resolve parse error for {}: {}",
+                            file_path.display(),
+                            e
+                        );
+                        crate::tasks::parser::create_malformed_task(
+                            &corrected,
+                            file_path,
+                            e.to_string(),
+                        )
+                    }
+                };
+                self.task_store.insert(new_task);
+                self.refresh_stories();
+                vec![]
+            }
             other => {
                 tracing::debug!(?other, "unhandled message");
                 vec![]
@@ -184,5 +266,179 @@ mod tests {
         assert_eq!(app.active_tab, 0);
         assert!(app.selected_task().is_none());
         assert!(responses.is_empty());
+    }
+
+    fn make_malformed_task() -> crate::tasks::Task {
+        use crate::tasks::models::{ParseErrorInfo, Task, TaskId, TaskStatus};
+        Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::Open,
+            assigned_to: None,
+            description: String::new(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: Some(ParseErrorInfo {
+                error_message: "missing Status".to_string(),
+                raw_content: "bad content".to_string(),
+                suggested_fix: None,
+                fix_in_progress: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn test_handle_request_fix_sets_in_progress() {
+        use crate::tasks::TaskId;
+
+        let mut app = App::new(TaskStore::new());
+        app.task_store.insert(make_malformed_task());
+
+        let id = TaskId::from_path("tasks/1.1.md");
+        let responses = app.handle_message(AppMessage::RequestTaskFix {
+            task_id: id.clone(),
+        });
+        assert!(responses.is_empty());
+        let task = app.task_store.get(&id).unwrap();
+        let err_info = task.parse_error.as_ref().unwrap();
+        assert!(err_info.fix_in_progress);
+        assert!(err_info.suggested_fix.is_none());
+    }
+
+    #[test]
+    fn test_handle_fix_ready_stores_suggestion() {
+        use crate::tasks::TaskId;
+
+        let mut app = App::new(TaskStore::new());
+        app.task_store.insert(make_malformed_task());
+
+        let id = TaskId::from_path("tasks/1.1.md");
+        // First set fix_in_progress to simulate a pending request.
+        if let Some(t) = app.task_store.get_mut(&id) {
+            if let Some(ref mut e) = t.parse_error {
+                e.fix_in_progress = true;
+            }
+        }
+
+        let responses = app.handle_message(AppMessage::TaskFixReady {
+            task_id: id.clone(),
+            corrected_content: "fixed md".to_string(),
+            explanation: "Added Status".to_string(),
+        });
+        assert!(responses.is_empty());
+        let task = app.task_store.get(&id).unwrap();
+        let err_info = task.parse_error.as_ref().unwrap();
+        assert!(!err_info.fix_in_progress);
+        let fix = err_info.suggested_fix.as_ref().expect("fix should be set");
+        assert_eq!(fix.corrected_content, "fixed md");
+        assert_eq!(fix.explanation, "Added Status");
+    }
+
+    #[test]
+    fn test_handle_apply_fix_success() {
+        use crate::tasks::models::{ParseErrorInfo, SuggestedFix, Task, TaskId, TaskStatus};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("1.1.md");
+        std::fs::write(&file_path, "bad content").unwrap();
+
+        let corrected = "Story: 1. Story\nTask: 1.1\nStatus: OPEN\n\n## Description\n\ndesc\n";
+
+        let task = Task {
+            id: TaskId::from_path(file_path.clone()),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::Open,
+            assigned_to: None,
+            description: String::new(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: file_path.clone(),
+            extra_sections: Vec::new(),
+            parse_error: Some(ParseErrorInfo {
+                error_message: "missing Status".to_string(),
+                raw_content: "bad content".to_string(),
+                suggested_fix: Some(SuggestedFix {
+                    corrected_content: corrected.to_string(),
+                    explanation: "Added Status line".to_string(),
+                }),
+                fix_in_progress: false,
+            }),
+        };
+        let id = task.id.clone();
+        let mut app = App::new(TaskStore::new());
+        app.task_store.insert(task);
+
+        let responses = app.handle_message(AppMessage::ApplyTaskFix {
+            task_id: id.clone(),
+        });
+        assert!(responses.is_empty());
+        // Task should now be valid (no parse_error).
+        let updated = app.task_store.get(&id).unwrap();
+        assert!(
+            !updated.is_malformed(),
+            "task should be valid after applying fix"
+        );
+    }
+
+    #[test]
+    fn test_handle_apply_fix_still_broken() {
+        use crate::tasks::models::{ParseErrorInfo, SuggestedFix, Task, TaskId, TaskStatus};
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("1.1.md");
+        std::fs::write(&file_path, "bad content").unwrap();
+
+        // The "fix" is still broken.
+        let still_bad = "still not valid markdown for a task";
+
+        let task = Task {
+            id: TaskId::from_path(file_path.clone()),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::Open,
+            assigned_to: None,
+            description: String::new(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: file_path.clone(),
+            extra_sections: Vec::new(),
+            parse_error: Some(ParseErrorInfo {
+                error_message: "original error".to_string(),
+                raw_content: "bad content".to_string(),
+                suggested_fix: Some(SuggestedFix {
+                    corrected_content: still_bad.to_string(),
+                    explanation: "Attempted fix".to_string(),
+                }),
+                fix_in_progress: false,
+            }),
+        };
+        let id = task.id.clone();
+        let mut app = App::new(TaskStore::new());
+        app.task_store.insert(task);
+
+        app.handle_message(AppMessage::ApplyTaskFix {
+            task_id: id.clone(),
+        });
+        // Task should still be malformed since the fix didn't parse cleanly.
+        let updated = app.task_store.get(&id).unwrap();
+        assert!(
+            updated.is_malformed(),
+            "task should still be malformed when fix is also broken"
+        );
     }
 }

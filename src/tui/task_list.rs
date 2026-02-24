@@ -151,7 +151,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &TaskListState, stories: &[S
             }
             TaskListItem::Task { task_id } => {
                 let (icon, name_text) = if let Some(task) = task_map.get(task_id) {
-                    (status_icon(&task.status), task.name.clone())
+                    let icon = if task.is_malformed() {
+                        Span::styled("[E]", Style::default().fg(Color::Red))
+                    } else {
+                        status_icon(&task.status)
+                    };
+                    (icon, task.name.clone())
                 } else {
                     (
                         Span::styled("[?]", Style::default().fg(Color::DarkGray)),
@@ -208,6 +213,7 @@ mod tests {
             work_log: Vec::new(),
             file_path: PathBuf::from(format!("tasks/{task_name}.md")),
             extra_sections: Vec::new(),
+            parse_error: None,
         }
     }
 
@@ -307,6 +313,50 @@ mod tests {
         assert!(!state.expanded_stories.contains("1. Alpha"));
         // Items back to headers only.
         assert_eq!(state.items.len(), 2);
+    }
+
+    #[test]
+    fn test_malformed_task_shows_error_icon() {
+        use crate::tasks::models::ParseErrorInfo;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut malformed_task = make_task("1. Alpha", "1.1", TaskStatus::Open);
+        malformed_task.parse_error = Some(ParseErrorInfo {
+            error_message: "missing Status".to_string(),
+            raw_content: "bad content".to_string(),
+            suggested_fix: None,
+            fix_in_progress: false,
+        });
+
+        let stories = vec![Story {
+            name: "1. Alpha".to_string(),
+            tasks: vec![malformed_task],
+        }];
+
+        let mut state = TaskListState::new();
+        state.expanded_stories.insert("1. Alpha".to_string());
+        state.refresh(&stories);
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), &state, &stories);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect();
+        assert!(
+            content.contains("[E]"),
+            "malformed task should show [E] icon, got: {content:?}"
+        );
     }
 
     #[test]

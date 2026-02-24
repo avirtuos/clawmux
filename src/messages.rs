@@ -117,6 +117,20 @@ pub enum AppMessage {
     /// Signals that a task's markdown file changed on disk (from an external editor).
     TaskFileChanged { task_id: TaskId },
 
+    // --- Malformed task fix ---
+    /// Requests an AI-generated fix suggestion for a malformed task file.
+    RequestTaskFix { task_id: TaskId },
+    /// Delivers a successful AI-generated fix suggestion.
+    TaskFixReady {
+        task_id: TaskId,
+        corrected_content: String,
+        explanation: String,
+    },
+    /// Reports that an AI fix request failed.
+    TaskFixFailed { task_id: TaskId, error: String },
+    /// Applies the pending fix suggestion for a malformed task.
+    ApplyTaskFix { task_id: TaskId },
+
     // --- Application lifecycle ---
     /// Initiates a graceful application shutdown.
     Shutdown,

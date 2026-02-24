@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 
 use crate::error::ClawdMuxError;
-use crate::tasks::models::{Question, Task, TaskId, TaskStatus, WorkLogEntry};
+use crate::tasks::models::{ParseErrorInfo, Question, Task, TaskId, TaskStatus, WorkLogEntry};
 use crate::workflow::agents::AgentKind;
 
 /// Parses a task markdown file's content into a [`Task`] struct.
@@ -179,7 +179,70 @@ pub fn parse_task(content: &str, file_path: PathBuf) -> crate::error::Result<Tas
         work_log,
         file_path,
         extra_sections,
+        parse_error: None,
     })
+}
+
+/// Scans lines before the first `## ` heading for `Story:` and `Task:` values.
+///
+/// Best-effort; returns `(story_name, task_name)` with `None` for any field
+/// that is absent or cannot be extracted. No validation is performed.
+#[allow(dead_code)]
+pub fn extract_metadata_hints(content: &str) -> (Option<String>, Option<String>) {
+    let mut story_name: Option<String> = None;
+    let mut task_name: Option<String> = None;
+    for line in content.lines() {
+        if line.starts_with("## ") {
+            break;
+        }
+        if let Some((key, value)) = line.split_once(": ") {
+            match key.trim().to_lowercase().as_str() {
+                "story" => story_name = Some(value.trim().to_string()),
+                "task" => task_name = Some(value.trim().to_string()),
+                _ => {}
+            }
+        }
+    }
+    (story_name, task_name)
+}
+
+/// Builds a stub [`Task`] for a file that failed to parse.
+///
+/// Attempts to extract `Story:` and `Task:` values from the raw content for
+/// best-effort display. Falls back to `"Unknown Story"` / the file stem when
+/// those fields are absent. The returned task has `parse_error: Some(...)` set.
+#[allow(dead_code)]
+pub fn create_malformed_task(content: &str, file_path: PathBuf, error_message: String) -> Task {
+    let (story_hint, task_hint) = extract_metadata_hints(content);
+    let story_name = story_hint.unwrap_or_else(|| "Unknown Story".to_string());
+    let name = task_hint.unwrap_or_else(|| {
+        file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    });
+    Task {
+        id: TaskId::from_path(file_path.clone()),
+        story_name,
+        name,
+        status: TaskStatus::Open,
+        assigned_to: None,
+        description: String::new(),
+        starting_prompt: None,
+        questions: Vec::new(),
+        design: None,
+        implementation_plan: None,
+        work_log: Vec::new(),
+        file_path,
+        extra_sections: Vec::new(),
+        parse_error: Some(ParseErrorInfo {
+            error_message,
+            raw_content: content.to_string(),
+            suggested_fix: None,
+            fix_in_progress: false,
+        }),
+    }
 }
 
 /// Strips leading and trailing blank lines from a slice of lines, then joins
@@ -388,7 +451,7 @@ fn strip_brackets(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::models::TaskStatus;
+    use crate::tasks::models::{ParseErrorInfo, TaskStatus};
 
     /// Minimal valid task file with only the required metadata and a Description section.
     const MINIMAL: &str = "\
@@ -606,6 +669,84 @@ Q1 [Intake Agent]: An unanswered question?
         let content = "Story: S\nStatus: OPEN\n\n## Description\n\nx\n";
         let err = parse_task(content, path("t")).unwrap_err();
         assert!(matches!(&err, ClawdMuxError::Parse { message, .. } if message.contains("Task")));
+    }
+
+    #[test]
+    fn test_extract_metadata_hints_both_present() {
+        let content =
+            "Story: 1. My Story\nTask: 1.1 My Task\nStatus: OPEN\n\n## Description\n\nx\n";
+        let (story, task) = extract_metadata_hints(content);
+        assert_eq!(story.as_deref(), Some("1. My Story"));
+        assert_eq!(task.as_deref(), Some("1.1 My Task"));
+    }
+
+    #[test]
+    fn test_extract_metadata_hints_only_story() {
+        let content = "Story: 2. Story Only\nthis is garbage\n";
+        let (story, task) = extract_metadata_hints(content);
+        assert_eq!(story.as_deref(), Some("2. Story Only"));
+        assert!(task.is_none());
+    }
+
+    #[test]
+    fn test_extract_metadata_hints_stops_at_section_heading() {
+        // Story line appears after a ## heading — should not be captured.
+        let content = "## Description\n\nStory: Hidden\n";
+        let (story, task) = extract_metadata_hints(content);
+        assert!(story.is_none());
+        assert!(task.is_none());
+    }
+
+    #[test]
+    fn test_extract_metadata_hints_empty_content() {
+        let (story, task) = extract_metadata_hints("");
+        assert!(story.is_none());
+        assert!(task.is_none());
+    }
+
+    #[test]
+    fn test_create_malformed_task_with_hints() {
+        let content = "Story: 3. Big Story\nTask: 3.2 Fix Me\n\nbad content\n";
+        let fp = PathBuf::from("tasks/3.2-fix-me.md");
+        let task = create_malformed_task(content, fp.clone(), "missing Status".to_string());
+        assert_eq!(task.story_name, "3. Big Story");
+        assert_eq!(task.name, "3.2 Fix Me");
+        assert_eq!(task.file_path, fp);
+        let err_info = task
+            .parse_error
+            .as_ref()
+            .expect("parse_error should be set");
+        assert_eq!(err_info.error_message, "missing Status");
+        assert_eq!(err_info.raw_content, content);
+        assert!(err_info.suggested_fix.is_none());
+        assert!(!err_info.fix_in_progress);
+        assert!(task.is_malformed());
+    }
+
+    #[test]
+    fn test_create_malformed_task_no_hints_falls_back_to_file_stem() {
+        let content = "completely unparseable garbage";
+        let fp = PathBuf::from("tasks/7.3-my-task.md");
+        let task = create_malformed_task(content, fp, "missing Story".to_string());
+        assert_eq!(task.story_name, "Unknown Story");
+        assert_eq!(task.name, "7.3-my-task");
+    }
+
+    #[test]
+    fn test_create_malformed_task_is_malformed() {
+        let content = "no metadata at all";
+        let fp = PathBuf::from("tasks/bad.md");
+        let task = create_malformed_task(content, fp, "parse error".to_string());
+        assert!(task.is_malformed());
+        assert_eq!(
+            task.parse_error,
+            Some(ParseErrorInfo {
+                error_message: "parse error".to_string(),
+                raw_content: content.to_string(),
+                suggested_fix: None,
+                fix_in_progress: false,
+            })
+        );
     }
 
     #[test]

@@ -304,6 +304,7 @@ mod tests {
             ],
             file_path: PathBuf::from("tasks/6.2.md"),
             extra_sections: Vec::new(),
+            parse_error: None,
         }
     }
 

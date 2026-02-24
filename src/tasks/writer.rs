@@ -4,6 +4,7 @@
 //! verbatim to ensure round-trip fidelity for agent-added or user-added content.
 //! Task 2.2 implements the full serializer.
 
+use crate::error::ClawdMuxError;
 use crate::tasks::models::Task;
 
 /// Serializes a [`Task`] to a markdown string in the canonical task file format.
@@ -26,6 +27,12 @@ use crate::tasks::models::Task;
 /// infallible, but returns `Result` for API consistency with the rest of the codebase).
 #[allow(dead_code)]
 pub fn write_task(task: &Task) -> crate::error::Result<String> {
+    if task.parse_error.is_some() {
+        return Err(ClawdMuxError::Internal(format!(
+            "write_task: refusing to overwrite malformed task '{}' with stub defaults",
+            task.id
+        )));
+    }
     let mut out = String::new();
 
     // --- Metadata block ---
@@ -171,6 +178,7 @@ A1: Lets use rust, it is well suited to this.
             work_log: Vec::new(),
             file_path: PathBuf::from("tasks/1.1.md"),
             extra_sections: Vec::new(),
+            parse_error: None,
         }
     }
 
@@ -220,6 +228,7 @@ A1: Lets use rust, it is well suited to this.
             }],
             file_path: PathBuf::from("tasks/1.1.md"),
             extra_sections: Vec::new(),
+            parse_error: None,
         };
         let out = write_task(&task).unwrap();
 
@@ -276,6 +285,24 @@ bar content
         // Verify the round-trip also parses cleanly.
         let task2 = parse_task(&written, p).unwrap();
         assert_eq!(task1, task2);
+    }
+
+    #[test]
+    fn test_write_malformed_task_returns_error() {
+        use crate::tasks::models::ParseErrorInfo;
+
+        let mut task = minimal_task();
+        task.parse_error = Some(ParseErrorInfo {
+            error_message: "missing Status".to_string(),
+            raw_content: "bad content".to_string(),
+            suggested_fix: None,
+            fix_in_progress: false,
+        });
+        let result = write_task(&task);
+        assert!(
+            result.is_err(),
+            "write_task should refuse to write a malformed task"
+        );
     }
 
     #[test]
