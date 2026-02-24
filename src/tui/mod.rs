@@ -1,10 +1,10 @@
 //! Top-level TUI draw and input handling.
 //!
 //! Coordinates ratatui rendering across the layout, task list widget, and the
-//! 4-tab right pane. Dispatches keyboard events to the focused widget.
+//! 5-tab right pane. Dispatches keyboard events to the focused widget.
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -14,6 +14,7 @@ use tui_textarea::Input;
 use crate::app::App;
 use crate::messages::AppMessage;
 use crate::tasks::models::{status_to_index, TaskStatus, ALL_STATUSES};
+use crate::tasks::TaskId;
 
 pub mod layout;
 pub mod tabs;
@@ -38,21 +39,21 @@ pub fn draw_loading_screen(frame: &mut Frame, status: &str) {
 /// Syncs all tab states when the selected task changes after navigation.
 ///
 /// Compares the newly selected task against `tab1_state.current_task_id`.
-/// If different, calls [`Tab1State::reset_for_task`] to rebuild answer inputs
-/// and clear per-task focus state. Also updates the displayed task for Tab 2
-/// and Tab 3.
+/// If different, calls [`Tab1State::reset_for_task`] to clear per-task focus
+/// state. Also syncs `questions_state` and updates the displayed task for
+/// Tabs 2, 3, and 4.
 fn sync_tabs_on_nav(app: &mut App) {
     let new_id = app.task_list_state.selected_task_id().cloned();
+
     if new_id != app.tab1_state.current_task_id {
         match new_id {
             Some(ref id) => {
                 if let Some(task) = app.task_store.get(id) {
-                    // SAFETY: We clone task to avoid holding an immutable borrow
-                    // while mutating tab1_state.
+                    // Clone to release the immutable borrow before mutating tab1_state.
                     let task = task.clone();
                     app.tab1_state.reset_for_task(&task);
                 } else {
-                    app.tab1_state.current_task_id = new_id;
+                    app.tab1_state.current_task_id = new_id.clone();
                 }
             }
             None => {
@@ -60,6 +61,21 @@ fn sync_tabs_on_nav(app: &mut App) {
             }
         }
     }
+
+    if new_id != app.questions_state.current_task_id {
+        match new_id {
+            Some(ref id) => {
+                if let Some(task) = app.task_store.get(id) {
+                    let task = task.clone();
+                    app.questions_state.reset_for_task(&task);
+                }
+            }
+            None => {
+                app.questions_state.current_task_id = None;
+            }
+        }
+    }
+
     app.tab2_state
         .set_displayed_task(app.task_list_state.selected_task_id());
     app.tab3_state
@@ -68,21 +84,37 @@ fn sync_tabs_on_nav(app: &mut App) {
         .set_displayed_task(app.task_list_state.selected_task_id());
 }
 
-/// Returns a context-sensitive keybinding hint string for the footer.
+/// The focused input context for [`footer_hint_text`].
 ///
-/// - When the quit confirmation dialog is visible: shows confirm/cancel bindings.
-/// - When the status picker dialog is visible: shows picker navigation bindings.
-/// - When a textarea is focused: shows Esc / editing hint.
-/// - On Tab 1 with a malformed task selected: shows fix/apply bindings.
-/// - On Tab 1 with an OPEN task selected: shows Enter to start + other bindings.
-/// - On Tab 1 with no focus: shows all available bindings.
+/// When a textarea is active the footer shows editing hints instead of the
+/// normal per-tab shortcuts.
+pub enum FocusedInput {
+    /// No textarea is active.
+    None,
+    /// The supplemental-prompt textarea on Tab 0 is focused.
+    Prompt,
+    /// An answer textarea on the Questions tab (Tab 1) is focused.
+    Answer,
+    /// The comment textarea on the Code Review tab (Tab 4) is focused.
+    Comment,
+}
+
+/// Returns the footer hint string based on the current application state.
+///
+/// Priority (highest first):
+/// - Quit-confirm dialog visible.
+/// - Status picker visible.
+/// - A textarea input is focused (editing mode).
+/// - Tab 0 specific states (malformed task, startable task, normal).
+/// - Tab 1 (Questions): answer and navigation bindings.
+/// - Tabs 2-3: scroll bindings.
+/// - Tab 4 (Review): file navigation and review bindings.
 /// - On other tabs: shows minimal bindings.
 pub fn footer_hint_text(
     show_quit_confirm: bool,
     show_status_picker: bool,
     active_tab: usize,
-    prompt_focused: bool,
-    focused_answer: Option<usize>,
+    focused_input: FocusedInput,
     is_malformed_task: bool,
     is_startable_task: bool,
 ) -> &'static str {
@@ -90,18 +122,24 @@ pub fn footer_hint_text(
         "[y/Enter] confirm quit | [n/Esc] cancel"
     } else if show_status_picker {
         "[1-5] select | [Up/Down] navigate | [Enter] confirm | [Esc] cancel"
-    } else if prompt_focused {
+    } else if matches!(focused_input, FocusedInput::Prompt) {
         "[Esc] exit | Editing prompt"
-    } else if focused_answer.is_some() {
+    } else if matches!(focused_input, FocusedInput::Answer) {
         "[Esc] exit | [Tab] next answer | Editing answer"
+    } else if matches!(focused_input, FocusedInput::Comment) {
+        "[Esc] exit | Editing comment"
     } else if active_tab == 0 && is_malformed_task {
         "[f] request fix | [Enter] apply fix | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 0 && is_startable_task {
         "[Enter] start | [i] prompt | [s] status | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 0 {
-        "[i] prompt | [a] answer | [s] status | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
-    } else if active_tab == 1 || active_tab == 2 {
+        "[i] prompt | [s] status | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
+    } else if active_tab == 1 {
+        "[a] answer | [Alt+Enter] submit | [PgUp/PgDn] navigate | [Tab] next tab | [q] quit"
+    } else if active_tab == 2 || active_tab == 3 {
         "[PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
+    } else if active_tab == 4 {
+        "[</> arrows] file | [PgUp/PgDn] scroll | [c] comment | [Enter] add | [a] approve | [r] revisions | [Tab] next tab | [q] quit"
     } else {
         "[Tab] next tab | [q] quit"
     }
@@ -130,17 +168,45 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let is_startable_task = selected_task
         .map(|t| !t.is_malformed() && t.status == TaskStatus::Open)
         .unwrap_or(false);
+    let focused_input = if app.tab1_state.prompt_focused {
+        FocusedInput::Prompt
+    } else if app.questions_state.focused_answer.is_some() {
+        FocusedInput::Answer
+    } else if app.tab4_state.comment_focused {
+        FocusedInput::Comment
+    } else {
+        FocusedInput::None
+    };
     let hint = footer_hint_text(
         app.show_quit_confirm,
         app.show_status_picker.is_some(),
         app.active_tab,
-        app.tab1_state.prompt_focused,
-        app.tab1_state.focused_answer,
+        focused_input,
         is_malformed_task,
         is_startable_task,
     );
-    let footer = Paragraph::new(hint).block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, areas.footer);
+    let thinking = app.tab2_state.any_thinking_status();
+    let footer_block = Block::default().borders(Borders::TOP);
+    let footer_inner = footer_block.inner(areas.footer);
+    frame.render_widget(footer_block, areas.footer);
+    if let Some(ref thinking_text) = thinking {
+        let thinking_width = thinking_text.len() as u16 + 1;
+        let footer_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(thinking_width)])
+            .split(footer_inner);
+        frame.render_widget(Paragraph::new(hint), footer_layout[0]);
+        frame.render_widget(
+            Paragraph::new(thinking_text.as_str()).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            footer_layout[1],
+        );
+    } else {
+        frame.render_widget(Paragraph::new(hint), footer_inner);
+    }
 
     if app.show_quit_confirm {
         render_quit_confirm_dialog(frame, frame.area());
@@ -246,12 +312,54 @@ fn apply_status_change(app: &mut App, status_idx: usize) -> Option<AppMessage> {
     Some(AppMessage::TaskUpdated { task_id })
 }
 
+/// Maps an `answer_inputs` index to the corresponding `task.questions` index.
+///
+/// `answer_inputs` only covers unanswered questions in order. This function
+/// finds the `task.questions` position for the N-th unanswered question.
+fn map_answer_idx_to_question_idx(app: &App, task_id: &TaskId, answer_idx: usize) -> usize {
+    app.task_store
+        .get(task_id)
+        .map(|t| {
+            t.questions
+                .iter()
+                .enumerate()
+                .filter(|(_, q)| q.answer.is_none())
+                .nth(answer_idx)
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
+/// Finds the `answer_inputs` index for the currently selected question, if unanswered.
+///
+/// `selected_question` is a display index (0 = newest). This function converts it to
+/// the underlying `task.questions` index before computing the `answer_inputs` position.
+/// Returns `None` if the selected question is already answered or there is no task.
+fn find_answer_idx_for_selected(app: &App) -> Option<usize> {
+    let task = app.selected_task().and_then(|id| app.task_store.get(id))?;
+    let display_idx = app.questions_state.selected_question;
+    let total = task.questions.len();
+    let sel = tabs::questions::display_to_question_idx(display_idx, total);
+    let q = task.questions.get(sel)?;
+    if q.answer.is_some() {
+        return None;
+    }
+    // Count unanswered questions appearing before sel.
+    Some(
+        task.questions[..sel]
+            .iter()
+            .filter(|q| q.answer.is_none())
+            .count(),
+    )
+}
+
 /// Converts a crossterm event into an optional [`AppMessage`], mutating `app` for navigation.
 ///
 /// - `Up` / `k` -> move task list selection up
 /// - `Down` / `j` -> move task list selection down
 /// - `Enter` / `Space` -> toggle story expansion (no-op if a task is selected)
-/// - `Tab` -> cycle `app.active_tab` (0-3)
+/// - `Tab` -> cycle `app.active_tab` (0-4)
 /// - `q` (no modifiers) -> [`AppMessage::Shutdown`]
 /// - `Ctrl-C` -> [`AppMessage::Shutdown`]
 /// - Any other key -> `None`
@@ -299,7 +407,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             }
         }
 
-        // When Tab 1 is active and a textarea has focus, forward input to it.
+        // Tab 0 (Details): textarea focus and task actions.
         if app.active_tab == 0 {
             // Check if a malformed task is selected.
             let selected_malformed_task_id = app
@@ -346,23 +454,6 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     }
                     return None;
                 }
-                if let Some(idx) = app.tab1_state.focused_answer {
-                    if key.code == KeyCode::Esc {
-                        app.tab1_state.set_answer_unfocused_style(idx);
-                        app.tab1_state.focused_answer = None;
-                    } else if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
-                        let len = app.tab1_state.answer_inputs.len();
-                        if len > 0 {
-                            let new_idx = (idx + 1) % len;
-                            app.tab1_state.set_answer_unfocused_style(idx);
-                            app.tab1_state.focused_answer = Some(new_idx);
-                            app.tab1_state.set_answer_focused_style(new_idx);
-                        }
-                    } else if let Some(ta) = app.tab1_state.answer_inputs.get_mut(idx) {
-                        ta.input(Input::from(key));
-                    }
-                    return None;
-                }
                 // Enter focus on the supplemental prompt with 'i'.
                 if key.code == KeyCode::Char('i') && key.modifiers == KeyModifiers::NONE {
                     app.tab1_state.prompt_focused = true;
@@ -405,7 +496,73 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             }
         }
 
+        // Tab 1 (Questions): answer textarea input and question navigation.
         if app.active_tab == 1 {
+            if let Some(idx) = app.questions_state.focused_answer {
+                // A textarea is focused: forward most keys to it.
+                if key.code == KeyCode::Esc {
+                    app.questions_state.set_answer_unfocused_style(idx);
+                    app.questions_state.focused_answer = None;
+                } else if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::ALT {
+                    // Submit the answer.
+                    let answer_text: String =
+                        app.questions_state.answer_inputs[idx].lines().join("\n");
+                    if let Some(task_id) = app.selected_task().cloned() {
+                        let question_index = map_answer_idx_to_question_idx(app, &task_id, idx);
+                        app.questions_state.set_answer_unfocused_style(idx);
+                        app.questions_state.focused_answer = None;
+                        return Some(AppMessage::HumanAnswered {
+                            task_id,
+                            question_index,
+                            answer: answer_text,
+                        });
+                    }
+                } else if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
+                    // Cycle to next answer textarea.
+                    let len = app.questions_state.answer_inputs.len();
+                    if len > 0 {
+                        let new_idx = (idx + 1) % len;
+                        app.questions_state.set_answer_unfocused_style(idx);
+                        app.questions_state.focused_answer = Some(new_idx);
+                        app.questions_state.set_answer_focused_style(new_idx);
+                    }
+                } else if let Some(ta) = app.questions_state.answer_inputs.get_mut(idx) {
+                    ta.input(Input::from(key));
+                }
+                return None;
+            }
+
+            // No textarea focused: handle navigation and focus entry.
+            match key.code {
+                KeyCode::PageUp => {
+                    app.questions_state.select_prev();
+                    return None;
+                }
+                KeyCode::PageDown => {
+                    let total = app
+                        .selected_task()
+                        .and_then(|id| app.task_store.get(id))
+                        .map(|t| t.questions.len())
+                        .unwrap_or(0);
+                    app.questions_state.select_next(total);
+                    return None;
+                }
+                KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
+                    // Focus the answer textarea for the currently selected question.
+                    if !app.questions_state.answer_inputs.is_empty() {
+                        if let Some(answer_idx) = find_answer_idx_for_selected(app) {
+                            app.questions_state.focused_answer = Some(answer_idx);
+                            app.questions_state.set_answer_focused_style(answer_idx);
+                        }
+                    }
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
+        // Tab 2 (Agent Activity): scroll.
+        if app.active_tab == 2 {
             match key.code {
                 KeyCode::PageUp => {
                     app.tab2_state.scroll_up();
@@ -419,7 +576,8 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             }
         }
 
-        if app.active_tab == 2 {
+        // Tab 3 (Team Status): scroll.
+        if app.active_tab == 3 {
             match key.code {
                 KeyCode::PageUp => {
                     app.tab3_state.scroll_up();
@@ -437,17 +595,63 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             }
         }
 
-        // Enter focus on the first answer textarea with 'a' (Tab 1, no focus, task selected).
-        if app.active_tab == 0
-            && app.tab1_state.focused_answer.is_none()
-            && !app.tab1_state.prompt_focused
-            && key.code == KeyCode::Char('a')
-            && key.modifiers == KeyModifiers::NONE
-            && !app.tab1_state.answer_inputs.is_empty()
-        {
-            app.tab1_state.focused_answer = Some(0);
-            app.tab1_state.set_answer_focused_style(0);
-            return None;
+        // Tab 4 (Code Review): file navigation, diff scroll, comment input, approve/revisions.
+        if app.active_tab == 4 {
+            if app.tab4_state.comment_focused {
+                // Comment textarea is focused: forward most keys to it.
+                if key.code == KeyCode::Esc {
+                    app.tab4_state.set_comment_unfocused();
+                } else {
+                    app.tab4_state.comment_input.input(Input::from(key));
+                }
+                return None;
+            }
+
+            // Not focused: handle navigation, submit, and actions.
+            match key.code {
+                KeyCode::Left if key.modifiers == KeyModifiers::NONE => {
+                    app.tab4_state.select_prev_file();
+                    return None;
+                }
+                KeyCode::Right if key.modifiers == KeyModifiers::NONE => {
+                    let count = app
+                        .selected_task()
+                        .map(|id| app.tab4_state.diffs_for(id).len())
+                        .unwrap_or(0);
+                    app.tab4_state.select_next_file(count);
+                    return None;
+                }
+                KeyCode::PageUp => {
+                    app.tab4_state.scroll_up();
+                    return None;
+                }
+                KeyCode::PageDown => {
+                    app.tab4_state.scroll_down();
+                    return None;
+                }
+                KeyCode::Char('c') if key.modifiers == KeyModifiers::NONE => {
+                    app.tab4_state.set_comment_focused();
+                    return None;
+                }
+                KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
+                    app.tab4_state.submit_comment();
+                    return None;
+                }
+                KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
+                    if let Some(task_id) = app.selected_task().cloned() {
+                        return Some(AppMessage::HumanApprovedReview { task_id });
+                    }
+                    return None;
+                }
+                KeyCode::Char('r') if key.modifiers == KeyModifiers::NONE => {
+                    if let Some(task_id) = app.selected_task().cloned() {
+                        let comments = app.tab4_state.take_comments();
+                        return Some(AppMessage::HumanRequestedRevisions { task_id, comments });
+                    }
+                    return None;
+                }
+                _ => {}
+            }
         }
 
         match key.code {
@@ -472,7 +676,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                 }
             }
             KeyCode::Tab => {
-                app.active_tab = (app.active_tab + 1) % 4;
+                app.active_tab = (app.active_tab + 1) % 5;
             }
             _ => {}
         }
@@ -651,6 +855,9 @@ mod tests {
         assert_eq!(app.active_tab, 3);
 
         handle_input(tab.clone(), &mut app);
+        assert_eq!(app.active_tab, 4);
+
+        handle_input(tab.clone(), &mut app);
         assert_eq!(app.active_tab, 0);
     }
 
@@ -709,16 +916,88 @@ mod tests {
     #[test]
     fn test_handle_input_a_focuses_answer() {
         let mut app = app_with_task_and_question();
-        assert_eq!(app.active_tab, 0);
-        // After navigating to the task, answer_inputs should be populated.
-        assert_eq!(app.tab1_state.answer_inputs.len(), 1);
-        assert!(app.tab1_state.focused_answer.is_none());
+        // Switch to Questions tab (tab 1) where answer focus is handled.
+        app.active_tab = 1;
+        // After navigating to the task, questions_state.answer_inputs should be populated.
+        assert_eq!(app.questions_state.answer_inputs.len(), 1);
+        assert!(app.questions_state.focused_answer.is_none());
 
         let event = key_event(KeyCode::Char('a'), KeyModifiers::NONE);
         let result = handle_input(event, &mut app);
 
         assert!(result.is_none());
-        assert_eq!(app.tab1_state.focused_answer, Some(0));
+        assert_eq!(app.questions_state.focused_answer, Some(0));
+    }
+
+    #[test]
+    fn test_handle_input_ctrl_enter_submits_answer() {
+        let mut app = app_with_task_and_question();
+        app.active_tab = 1;
+        // Focus the answer textarea.
+        app.questions_state.focused_answer = Some(0);
+
+        let event = key_event(KeyCode::Enter, KeyModifiers::ALT);
+        let result = handle_input(event, &mut app);
+
+        assert!(
+            matches!(
+                result,
+                Some(AppMessage::HumanAnswered {
+                    question_index: 0,
+                    ..
+                })
+            ),
+            "expected HumanAnswered with question_index=0, got: {result:?}"
+        );
+        assert!(
+            app.questions_state.focused_answer.is_none(),
+            "focused_answer should be cleared after submit"
+        );
+    }
+
+    #[test]
+    fn test_questions_pgup_pgdn_navigates() {
+        let mut app = app_with_task_and_question();
+        // Add a second question to make navigation meaningful.
+        {
+            use crate::tasks::models::Question;
+            use crate::workflow::agents::AgentKind;
+            let id = crate::tasks::TaskId::from_path("tasks/1.1.md");
+            if let Some(task) = app.task_store.get_mut(&id) {
+                task.questions.push(Question {
+                    agent: AgentKind::Design,
+                    text: "Architecture choice?".to_string(),
+                    answer: None,
+                });
+            }
+        }
+        // Reset questions_state to pick up the second question.
+        {
+            let id = crate::tasks::TaskId::from_path("tasks/1.1.md");
+            if let Some(task) = app.task_store.get(&id) {
+                let task = task.clone();
+                app.questions_state.reset_for_task(&task);
+            }
+        }
+
+        app.active_tab = 1;
+        assert_eq!(app.questions_state.selected_question, 0);
+
+        // PgDn advances.
+        handle_input(key_event(KeyCode::PageDown, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.questions_state.selected_question, 1);
+
+        // PgDn at last clamps.
+        handle_input(key_event(KeyCode::PageDown, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.questions_state.selected_question, 1);
+
+        // PgUp retreats.
+        handle_input(key_event(KeyCode::PageUp, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.questions_state.selected_question, 0);
+
+        // PgUp at first clamps.
+        handle_input(key_event(KeyCode::PageUp, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.questions_state.selected_question, 0);
     }
 
     #[test]
@@ -760,6 +1039,7 @@ mod tests {
 
     #[test]
     fn test_handle_input_pgdn_no_scroll_on_other_tab() {
+        // Tab 1 is now Questions; PgDn navigates questions, not description scroll.
         let mut app = App::test_default();
         app.active_tab = 1;
 
@@ -770,39 +1050,194 @@ mod tests {
     }
 
     #[test]
-    fn test_footer_hints_normal_tab1() {
-        let text = footer_hint_text(false, false, 0, false, None, false, false);
+    fn test_review_tab_left_right_navigate_files() {
+        use crate::opencode::types::{DiffStatus, FileDiff};
+
+        let mut app = App::test_default();
+        app.active_tab = 4;
+        // Simulate two diffs loaded for the selected task.
+        // We don't need a real task selected; directly mutate tab4_state.
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        let diffs = vec![
+            FileDiff {
+                path: "a.rs".to_string(),
+                status: DiffStatus::Modified,
+                hunks: vec![],
+            },
+            FileDiff {
+                path: "b.rs".to_string(),
+                status: DiffStatus::Added,
+                hunks: vec![],
+            },
+        ];
+        app.tab4_state.set_diffs(&task_id, diffs);
+        assert_eq!(app.tab4_state.selected_file, 0);
+
+        // Right arrow advances to file 2 -- but we need a selected task.
+        // Without a selected task, diffs_for returns 0, so next_file is noop.
+        // Just test scroll directly.
+        app.tab4_state.select_next_file(2);
+        assert_eq!(app.tab4_state.selected_file, 1);
+
+        // Left arrow goes back.
+        handle_input(key_event(KeyCode::Left, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.tab4_state.selected_file, 0);
+
+        // Left at 0 clamps.
+        handle_input(key_event(KeyCode::Left, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.tab4_state.selected_file, 0);
+    }
+
+    #[test]
+    fn test_review_tab_pgup_pgdn_scrolls_diff() {
+        let mut app = App::test_default();
+        app.active_tab = 4;
+        assert_eq!(app.tab4_state.diff_scroll, 0);
+
+        handle_input(key_event(KeyCode::PageDown, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.tab4_state.diff_scroll, 3);
+
+        handle_input(key_event(KeyCode::PageUp, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.tab4_state.diff_scroll, 0);
+    }
+
+    #[test]
+    fn test_review_tab_c_focuses_comment() {
+        let mut app = App::test_default();
+        app.active_tab = 4;
+        assert!(!app.tab4_state.comment_focused);
+
+        handle_input(key_event(KeyCode::Char('c'), KeyModifiers::NONE), &mut app);
+        assert!(app.tab4_state.comment_focused);
+
+        // Esc unfocuses.
+        handle_input(key_event(KeyCode::Esc, KeyModifiers::NONE), &mut app);
+        assert!(!app.tab4_state.comment_focused);
+    }
+
+    #[test]
+    fn test_review_tab_a_emits_approved() {
+        use crate::tasks::models::{Task, TaskStatus};
+        use std::path::PathBuf;
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: None,
+            description: String::new(),
+            starting_prompt: None,
+            questions: vec![],
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        app.task_store.insert(task);
+        app.refresh_stories();
+        app.task_list_state
+            .expanded_stories
+            .insert("1. Story".to_string());
+        app.task_list_state.refresh(&app.cached_stories);
+        app.task_list_state.selected_index = 1;
+        app.active_tab = 4;
+
+        let result = handle_input(key_event(KeyCode::Char('a'), KeyModifiers::NONE), &mut app);
+        assert!(
+            matches!(result, Some(AppMessage::HumanApprovedReview { .. })),
+            "pressing 'a' on Tab 4 should emit HumanApprovedReview; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_review_tab_enter_submits_comment() {
+        let mut app = App::test_default();
+        app.active_tab = 4;
+        app.tab4_state.comment_input.insert_str("needs work");
+        assert!(app.tab4_state.comments.is_empty());
+
+        handle_input(key_event(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.tab4_state.comments.len(), 1, "comment should be added");
+        assert_eq!(app.tab4_state.comments[0], "needs work");
+        assert_eq!(
+            app.tab4_state.comment_input.lines().join(""),
+            "",
+            "textarea should be cleared after submit"
+        );
+    }
+
+    #[test]
+    fn test_footer_hints_normal_tab0() {
+        let text = footer_hint_text(false, false, 0, FocusedInput::None, false, false);
         assert!(text.contains("[i] prompt"), "got: {text}");
-        assert!(text.contains("[a] answer"), "got: {text}");
+        assert!(!text.contains("[a] answer"), "got: {text}"); // moved to Questions tab
         assert!(text.contains("[s] status"), "got: {text}");
         assert!(text.contains("PgUp/PgDn"), "got: {text}");
     }
 
     #[test]
+    fn test_footer_hints_questions_tab() {
+        let text = footer_hint_text(false, false, 1, FocusedInput::None, false, false);
+        assert!(text.contains("[a] answer"), "got: {text}");
+        assert!(text.contains("[Alt+Enter] submit"), "got: {text}");
+        assert!(text.contains("PgUp/PgDn"), "got: {text}");
+        assert!(text.contains("[Tab] next tab"), "got: {text}");
+        assert!(text.contains("[q] quit"), "got: {text}");
+    }
+
+    #[test]
     fn test_footer_hints_prompt_focused() {
-        let text = footer_hint_text(false, false, 0, true, None, false, false);
+        let text = footer_hint_text(false, false, 0, FocusedInput::Prompt, false, false);
         assert!(text.contains("[Esc]"), "got: {text}");
         assert!(text.contains("Editing prompt"), "got: {text}");
     }
 
     #[test]
-    fn test_footer_hints_other_tab() {
-        let text = footer_hint_text(false, false, 1, false, None, false, false);
+    fn test_footer_hints_answer_focused() {
+        let text = footer_hint_text(false, false, 1, FocusedInput::Answer, false, false);
+        assert!(text.contains("[Esc] exit"), "got: {text}");
+        assert!(text.contains("Editing answer"), "got: {text}");
+    }
+
+    #[test]
+    fn test_footer_hints_comment_focused() {
+        let text = footer_hint_text(false, false, 4, FocusedInput::Comment, false, false);
+        assert!(text.contains("[Esc] exit"), "got: {text}");
+        assert!(text.contains("Editing comment"), "got: {text}");
+    }
+
+    #[test]
+    fn test_footer_hints_agent_activity_tab() {
+        // Tab 2 is Agent Activity.
+        let text = footer_hint_text(false, false, 2, FocusedInput::None, false, false);
         assert!(text.contains("[Tab] next tab"), "got: {text}");
         assert!(text.contains("[q] quit"), "got: {text}");
         assert!(!text.contains("[i]"), "got: {text}");
     }
 
     #[test]
+    fn test_footer_hints_review_tab() {
+        let text = footer_hint_text(false, false, 4, FocusedInput::None, false, false);
+        assert!(text.contains("[a] approve"), "got: {text}");
+        assert!(text.contains("[r] revisions"), "got: {text}");
+        assert!(text.contains("[c] comment"), "got: {text}");
+        assert!(text.contains("[Tab] next tab"), "got: {text}");
+    }
+
+    #[test]
     fn test_footer_hints_quit_confirm() {
-        let text = footer_hint_text(true, false, 0, false, None, false, false);
+        let text = footer_hint_text(true, false, 0, FocusedInput::None, false, false);
         assert!(text.contains("[y/Enter]"), "got: {text}");
         assert!(text.contains("[n/Esc]"), "got: {text}");
     }
 
     #[test]
     fn test_footer_hints_malformed_task() {
-        let text = footer_hint_text(false, false, 0, false, None, true, false);
+        let text = footer_hint_text(false, false, 0, FocusedInput::None, true, false);
         assert!(text.contains("[f] request fix"), "got: {text}");
         assert!(text.contains("[Enter] apply fix"), "got: {text}");
         assert!(text.contains("PgUp/PgDn"), "got: {text}");
@@ -812,7 +1247,7 @@ mod tests {
 
     #[test]
     fn test_footer_hints_status_picker() {
-        let text = footer_hint_text(false, true, 0, false, None, false, false);
+        let text = footer_hint_text(false, true, 0, FocusedInput::None, false, false);
         assert!(text.contains("[1-5] select"), "got: {text}");
         assert!(text.contains("[Up/Down] navigate"), "got: {text}");
         assert!(text.contains("[Enter] confirm"), "got: {text}");
@@ -821,11 +1256,11 @@ mod tests {
 
     #[test]
     fn test_footer_hints_startable_task() {
-        let text = footer_hint_text(false, false, 0, false, None, false, true);
+        let text = footer_hint_text(false, false, 0, FocusedInput::None, false, true);
         assert!(text.contains("[Enter] start"), "got: {text}");
         assert!(text.contains("[s] status"), "got: {text}");
         assert!(text.contains("PgUp/PgDn"), "got: {text}");
-        // Should not show [a] answer when task is startable (it's OPEN, no questions yet).
+        // Should not show [a] answer (moved to Questions tab).
         assert!(!text.contains("[a] answer"), "got: {text}");
     }
 

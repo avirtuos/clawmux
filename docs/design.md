@@ -32,7 +32,7 @@ OpenCode (`anomalyco/opencode`) is an open-source AI coding agent with a client-
 - **Backward-kick workflow**: Later agents can send tasks back to earlier stages
 - **Human-in-the-loop**: Questions, approval gates, code review with comments
 - **Orchestration**: Defining custom opencode agents (one per pipeline stage) and composing user messages from task context + prior work
-- **Unified TUI**: Left pane task navigation + 4-tab right pane (details, activity, team status, review)
+- **Unified TUI**: Left pane task navigation + 5-tab right pane (details, questions, activity, team status, review)
 
 ### What We No Longer Need
 
@@ -219,7 +219,8 @@ clawdmux/
       task_list.rs             # Left pane: story/task tree widget
       tabs/
         mod.rs                 # Tab bar and tab dispatch
-        task_details.rs        # Tab 1: task markdown, prompt input, Q&A
+        task_details.rs        # Tab 0: task markdown and prompt input
+        questions.rs           # Tab 1: question/answer display and navigation
         agent_activity.rs      # Tab 2: streaming agent activity view
         team_status.rs         # Tab 3: agent pipeline visualization + work log
         code_review.rs         # Tab 4: diff view + comment input
@@ -437,7 +438,7 @@ Pipeline: Intake -> Design -> Planning -> Implementation -> CodeQuality -> Secur
 4. SSE events stream back: tool activity, message parts, completion -> mapped to `StreamingUpdate`, `ToolActivity` messages
 5. Agent response is parsed for structured output (JSON schema) indicating completion, questions, or kickback
 6. On completion -> `AgentCompleted` -> workflow advances to next agent (new session or forked session)
-7. On question -> `AgentAskedQuestion` -> pauses workflow, shows question in Tab 1
+7. On question -> `AgentAskedQuestion` -> pauses workflow, shows question in Tab 1 (Questions)
 8. On kickback -> `AgentKickedBack` -> workflow aborts session, restarts at target agent with kickback context
 9. On session error -> `SessionError` -> workflow pauses and presents the user with a choice: retry the current agent, mark the task as errored, or skip to the next agent
 10. `CodeReview` agent performs an independent review of the code, checking for bugs, maintainability concerns, and adherence to project standards
@@ -630,10 +631,11 @@ This is far more reliable than parsing terminal output for text markers. opencod
 
 - Left pane (25%): Story/task tree with collapsible stories
 - Right pane (75%): 4 tabs
-- Tab 1 (Details): Task markdown (top), supplemental prompt input (middle), Q&A section (bottom)
+- Tab 0 (Details): Task markdown (top), supplemental prompt input (bottom); questions moved to Tab 1
+- Tab 1 (Questions): One question at a time with answer textarea; tab title shows `*` when unanswered questions exist
 - Tab 2 (Agent Activity): Streaming text/markdown of agent work, tool execution activity, agent reasoning
 - Tab 3 (Team Status): Agent pipeline progress bar + scrollable work log
-- Tab 4 (Review): Unified diff view + comment input area
+- Tab 4 (Review): Unified diff view with colored +/-/space prefixed lines (green/red/dim), file carousel navigation (Left/Right), scrollable diff (PgUp/PgDn), comment textarea (`c` to focus, Enter to add), accumulated comments sent on `r` (request revisions) or discarded on `a` (approve)
 
 **Tab 2** shows streaming content from SSE message events rather than an embedded terminal, eliminating VT emulation complexity while providing more structured visibility into agent activity.
 
@@ -711,6 +713,7 @@ File discovery at startup: scan `./tasks/` then `./docs/tasks/` for `*.md` files
 - Task 6.1 (Workflow State Machine): COMPLETED. `WorkflowEngine` pure state machine implemented in `src/workflow/transitions.rs`. `WorkflowPhase` (`Idle`, `Running`, `AwaitingAnswer`, `PendingReview`, `Completed`, `Errored`) and `WorkflowState` drive per-task lifecycle. `process(AppMessage) -> Vec<AppMessage>` handles all workflow transitions: `StartTask`, `SessionCreated`, `SessionCompleted`, `AgentCompleted`, `AgentKickedBack` (with kickback validation), `AgentAskedQuestion`, `HumanAnswered`, `HumanApprovedReview`, `HumanRequestedRevisions`, `SessionError`. Placeholder prompt helper marked `//TODO: Wire compose_user_message`. TOCTOU race in `EventStreamConsumer::handle_event()` fixed with 3-attempt/50ms retry on `SessionCreated`. 12 unit tests added (185 total). Re-exported via `workflow::{WorkflowEngine, WorkflowPhase, WorkflowState}`.
 - Task 6.2 (Prompt Composer): COMPLETED. `compose_user_message(agent, task, kickback_reason) -> String` implemented in `src/workflow/prompt_composer.rs`. Builds per-agent user messages with sections gated by pipeline index: Task Context and Description (all agents); Prior Q&A (Design+, index >= 1); Design, Implementation Plan, Work Log last 10 entries (Planning+, index >= 2); Kickback Context (when reason provided); Your Role (all agents). Private section builders each return `Option<String>` and are omitted when content is empty. Work log truncation shows a `(showing last 10 of N entries)` note when truncated. 6 unit tests added (195 total).
 - Task 8.1 (App::handle_message Dispatcher): COMPLETED. All 25 `AppMessage` variants are now fully dispatched in `App::handle_message`. Workflow messages (`StartTask`, `AgentCompleted`, `AgentKickedBack`, `AgentAskedQuestion`, `HumanAnswered`, `HumanApprovedReview`, `HumanRequestedRevisions`, `SessionCreated`, `SessionCompleted`, `SessionError`) forward to `WorkflowEngine::process`. Async session ops (`CreateSession`, `SendPrompt`, `AbortSession`) spawn tokio tasks that call the `OpenCodeClient` and route results back through `async_tx`. Task persistence (`TaskUpdated`, `TaskFileChanged`) calls `TaskStore::persist`/`reload`. `DiffReady` stores diffs in the new `Tab4State`. `Tick` drains `pending_messages`. `App` gained 5 fields: `opencode_client: Option<Arc<OpenCodeClient>>`, `session_map: SessionMap`, `async_tx: mpsc::Sender<AppMessage>`, `pending_messages: Vec<AppMessage>`, `tab4_state: Tab4State`. `Tab4State` implemented in `src/tui/tabs/code_review.rs` with `set_diffs`, `diffs_for`, `set_displayed_task`. `EventStreamConsumer` spawned in `main.rs` when server is available. Channel widened to 64 slots and renamed from `fix_tx`/`fix_rx` to `async_tx`/`async_rx`. All test helper calls updated to pass new `App::new()` parameters. 5 required tests added. 237 tests total, all passing.
+- Task 9.1 (Code Review Tab): COMPLETED. Full `Tab4State` implementation in `src/tui/tabs/code_review.rs`. Expanded `Tab4State` with `selected_file: usize`, `diff_scroll: u16`, `comment_input: TextArea`, `comments: Vec<String>`, `comment_focused: bool`. Added methods: `reset_for_diffs`, `select_prev_file`, `select_next_file`, `scroll_up`, `scroll_down`, `set_comment_focused`, `set_comment_unfocused`, `submit_comment`, `take_comments`. `render()` shows a file carousel header `< N/M: path [status] >`, scrollable diff view with colored +/-/space prefixed hunk lines, comment textarea, and hint bar with accumulated comment count. `DiffReady` handler now also switches to Tab 4 (`active_tab = 4`) and resets navigation. Keybindings on Tab 4: Left/Right navigate files, PgUp/PgDn scroll diff, `c` focuses comment textarea, Esc unfocuses, Enter appends comment to list, `a` emits `HumanApprovedReview`, `r` emits `HumanRequestedRevisions` with accumulated comments. `FocusedInput` enum added to `tui/mod.rs` to consolidate prompt/answer/comment focus state for the footer hint. `footer_hint_text` refactored from 8 params to 6 (resolving clippy too-many-arguments). 13 new tests in code_review.rs, 7 new tests in tui/mod.rs. 378 tests total, all passing.
 
 ---
 
