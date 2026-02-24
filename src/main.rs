@@ -11,16 +11,20 @@ mod tasks;
 mod tui;
 mod workflow;
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::App;
 use crate::config::AppConfig;
 use crate::messages::AppMessage;
+use crate::opencode::events::EventStreamConsumer;
 use crate::opencode::server::OpenCodeServer;
 use crate::opencode::types::{MessagePart, OpenCodeEvent};
 use crate::opencode::OpenCodeClient;
@@ -159,11 +163,40 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     // Drop startup_events so the main loop's EventStream can take over stdin.
     drop(startup_events);
 
-    let mut app = App::new(task_store);
+    // 6. Build the shared channel (64-slot), session map, and optional OpenCodeClient.
+    let (async_tx, mut async_rx) = mpsc::channel::<AppMessage>(64);
+    let session_map = Arc::new(RwLock::new(HashMap::new()));
+
+    let opencode_client: Option<Arc<OpenCodeClient>> = server.as_ref().map(|s| {
+        let base_url = s.base_url().to_string();
+        let auth = if config.has_explicit_password() {
+            Some(("clawdmux".to_string(), config.effective_opencode_password()))
+        } else {
+            None
+        };
+        Arc::new(OpenCodeClient::new(base_url, auth))
+    });
+
+    // 7. Spawn the EventStreamConsumer if the server is available.
+    if let Some(ref s) = server {
+        let base_url = s.base_url().to_string();
+        let consumer = EventStreamConsumer::new(async_tx.clone(), Arc::clone(&session_map));
+        tokio::spawn(async move {
+            if let Err(e) = consumer.run(base_url).await {
+                tracing::warn!("EventStreamConsumer exited: {}", e);
+            }
+        });
+    }
+
+    let mut app = App::new(
+        task_store,
+        opencode_client,
+        Arc::clone(&session_map),
+        async_tx.clone(),
+    );
     let mut event_stream = crossterm::event::EventStream::new();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(250));
     tick_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let (fix_tx, mut fix_rx) = tokio::sync::mpsc::channel::<AppMessage>(8);
 
     loop {
         terminal.draw(|frame| tui::draw(frame, &app))?;
@@ -182,8 +215,8 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
             _ = tokio::signal::ctrl_c() => {
                 app.handle_message(AppMessage::Shutdown)
             }
-            Some(fix_msg) = fix_rx.recv() => {
-                app.handle_message(fix_msg)
+            Some(async_msg) = async_rx.recv() => {
+                app.handle_message(async_msg)
             }
         };
 
@@ -193,7 +226,7 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(msg) = queue.pop_front() {
             // Intercept RequestTaskFix to spawn an async fix task.
             if let AppMessage::RequestTaskFix { ref task_id } = msg {
-                spawn_fix_request(task_id, &app, &server, &config, fix_tx.clone());
+                spawn_fix_request(task_id, &app, &server, &config, async_tx.clone());
             }
             queue.extend(app.handle_message(msg));
         }
@@ -218,7 +251,7 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Extracts the raw content and error from the task store, then spawns a tokio
 /// task that creates an OpenCode session, sends a fix prompt, collects the
-/// response via SSE, and sends the result back through `fix_tx`.
+/// response via SSE, and sends the result back through `async_tx`.
 ///
 /// If the OpenCode server is unavailable or the task data cannot be found,
 /// sends a [`AppMessage::TaskFixFailed`] immediately.
@@ -227,14 +260,14 @@ fn spawn_fix_request(
     app: &App,
     server: &Option<OpenCodeServer>,
     config: &AppConfig,
-    fix_tx: tokio::sync::mpsc::Sender<AppMessage>,
+    async_tx: tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     let base_url = match server {
         Some(s) => s.base_url().to_string(),
         None => {
             let task_id = task_id.clone();
             tokio::spawn(async move {
-                let _ = fix_tx
+                let _ = async_tx
                     .send(AppMessage::TaskFixFailed {
                         task_id,
                         error: "OpenCode server unavailable".to_string(),
@@ -266,7 +299,7 @@ fn spawn_fix_request(
         let session = match client.create_session().await {
             Ok(s) => s,
             Err(e) => {
-                let _ = fix_tx
+                let _ = async_tx
                     .send(AppMessage::TaskFixFailed {
                         task_id,
                         error: format!("Failed to create session: {}", e),
@@ -281,7 +314,7 @@ fn spawn_fix_request(
             .send_prompt_async(&session.id, &AgentKind::Implementation, &prompt)
             .await
         {
-            let _ = fix_tx
+            let _ = async_tx
                 .send(AppMessage::TaskFixFailed {
                     task_id,
                     error: format!("Failed to send fix prompt: {}", e),
@@ -296,7 +329,7 @@ fn spawn_fix_request(
         let mut es = match reqwest_eventsource::EventSource::new(request) {
             Ok(es) => es,
             Err(e) => {
-                let _ = fix_tx
+                let _ = async_tx
                     .send(AppMessage::TaskFixFailed {
                         task_id,
                         error: format!("Failed to open SSE stream: {}", e),
@@ -328,7 +361,7 @@ fn spawn_fix_request(
                         Ok(OpenCodeEvent::SessionError { session_id, error })
                             if session_id == session.id =>
                         {
-                            let _ = fix_tx
+                            let _ = async_tx
                                 .send(AppMessage::TaskFixFailed {
                                     task_id,
                                     error: format!("Session error: {}", error),
@@ -340,7 +373,7 @@ fn spawn_fix_request(
                     }
                 }
                 Err(e) => {
-                    let _ = fix_tx
+                    let _ = async_tx
                         .send(AppMessage::TaskFixFailed {
                             task_id,
                             error: format!("SSE stream error: {}", e),
@@ -353,7 +386,7 @@ fn spawn_fix_request(
         }
 
         if collected_text.is_empty() {
-            let _ = fix_tx
+            let _ = async_tx
                 .send(AppMessage::TaskFixFailed {
                     task_id,
                     error: "No fix content received from AI".to_string(),
@@ -362,7 +395,7 @@ fn spawn_fix_request(
             return;
         }
 
-        let _ = fix_tx
+        let _ = async_tx
             .send(AppMessage::TaskFixReady {
                 task_id,
                 corrected_content: collected_text,
