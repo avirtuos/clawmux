@@ -398,6 +398,7 @@ impl App {
                     .map(|s| s.current_agent)
                     .unwrap_or(AgentKind::Intake);
                 self.tab2_state.clear_awaiting(&task_id);
+                self.tab2_state.clear_thinking(&task_id);
                 self.tab2_state.push_banner(
                     &task_id,
                     format!("ERROR ({}): {}", current_agent.display_name(), error),
@@ -469,6 +470,7 @@ impl App {
                 response_text,
             } => {
                 self.tab2_state.clear_awaiting(&task_id);
+                self.tab2_state.clear_thinking(&task_id);
                 let current_agent = self
                     .workflow_engine
                     .state(&task_id)
@@ -525,6 +527,11 @@ impl App {
                                 text: question.clone(),
                                 answer: None,
                             });
+                        }
+                        // Sync answer textareas so the new question gets an input widget.
+                        if let Some(task) = self.task_store.get(&task_id) {
+                            let task = task.clone();
+                            self.questions_state.sync_answer_inputs(&task);
                         }
                         self.tab2_state.push_banner(
                             &task_id,
@@ -1365,6 +1372,48 @@ mod tests {
         let task = app.task_store.get(&task_id).expect("task should exist");
         assert_eq!(task.questions.len(), 1, "question should be recorded");
         assert_eq!(task.questions[0].text, "What is scope?");
+    }
+
+    /// Verifies that a Question response syncs answer_inputs so the new question gets a textarea.
+    #[test]
+    fn test_handle_session_completed_question_syncs_answer_inputs() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        assert_eq!(
+            app.questions_state.answer_inputs.len(),
+            0,
+            "no answer inputs before any questions"
+        );
+
+        let response_json =
+            r#"{"action":"question","question":"What is scope?","context":"Need clarity"}"#;
+        app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-1".to_string(),
+            response_text: response_json.to_string(),
+        });
+
+        assert_eq!(
+            app.questions_state.answer_inputs.len(),
+            1,
+            "answer_inputs should have one entry for the new unanswered question"
+        );
+
+        // A second question should extend answer_inputs to 2.
+        let response_json2 =
+            r#"{"action":"question","question":"Which file?","context":"Need file"}"#;
+        app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-2".to_string(),
+            response_text: response_json2.to_string(),
+        });
+
+        assert_eq!(
+            app.questions_state.answer_inputs.len(),
+            2,
+            "answer_inputs should have two entries after two unanswered questions"
+        );
     }
 
     #[test]

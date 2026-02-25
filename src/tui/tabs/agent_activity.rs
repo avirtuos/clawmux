@@ -77,6 +77,11 @@ pub struct Tab2State {
     prompt_sent_at: HashMap<TaskId, Instant>,
     /// The currently active agent name per task, shown in the status line.
     active_agent: HashMap<TaskId, String>,
+    /// Tracks tasks where an agent is actively working (from PromptSent until SessionCompleted/Error).
+    ///
+    /// Unlike `prompt_sent_at`/`active_agent` which are cleared on first `StreamingUpdate`,
+    /// this persists through streaming and is only cleared when the session truly ends.
+    thinking_tasks: HashMap<TaskId, (Instant, String)>,
 }
 
 impl Tab2State {
@@ -90,6 +95,7 @@ impl Tab2State {
             current_task_id: None,
             prompt_sent_at: HashMap::new(),
             active_agent: HashMap::new(),
+            thinking_tasks: HashMap::new(),
         }
     }
 
@@ -177,19 +183,32 @@ impl Tab2State {
     /// Records that a prompt was sent for `task_id` by `agent_name`, starting the elapsed timer.
     ///
     /// Call this after a prompt has been successfully dispatched so the status line
-    /// shows the elapsed wait time.
+    /// shows the elapsed wait time. Also starts the thinking indicator which persists
+    /// until [`clear_thinking`] is called on session completion or error.
     pub fn set_awaiting_response(&mut self, task_id: &TaskId, agent_name: String) {
         self.prompt_sent_at.insert(task_id.clone(), Instant::now());
-        self.active_agent.insert(task_id.clone(), agent_name);
+        self.active_agent
+            .insert(task_id.clone(), agent_name.clone());
+        self.thinking_tasks
+            .insert(task_id.clone(), (Instant::now(), agent_name));
     }
 
     /// Clears the "awaiting response" state for `task_id`.
     ///
-    /// Call this on the first `StreamingUpdate` or on session completion/error so the
-    /// elapsed status line disappears.
+    /// Call this on the first `StreamingUpdate` so the elapsed status line disappears.
+    /// Does NOT clear the thinking indicator; use [`clear_thinking`] for that.
     pub fn clear_awaiting(&mut self, task_id: &TaskId) {
         self.prompt_sent_at.remove(task_id);
         self.active_agent.remove(task_id);
+    }
+
+    /// Clears the "thinking" indicator for `task_id`.
+    ///
+    /// Call this when the agent session is truly done (on `SessionCompleted` or `SessionError`)
+    /// so the footer indicator disappears. Unlike [`clear_awaiting`], this is not called on
+    /// `StreamingUpdate` because the agent is still working during streaming.
+    pub fn clear_thinking(&mut self, task_id: &TaskId) {
+        self.thinking_tasks.remove(task_id);
     }
 
     /// Returns task IDs whose awaiting state has exceeded `timeout`.
@@ -303,19 +322,21 @@ impl Tab2State {
             .unwrap_or_default()
     }
 
-    /// Returns a thinking status string for any task currently awaiting a response.
+    /// Returns a thinking status string for any task where an agent is actively working.
     ///
-    /// Scans all tasks in the awaiting state and returns a formatted string for the
-    /// first one found, or `None` if no tasks are awaiting. Intended for display in
-    /// the global footer so the user knows an agent is working regardless of active tab.
+    /// Scans all tasks in the thinking state and returns a formatted string for the
+    /// first one found, or `None` if no agents are active. The thinking state persists
+    /// through streaming (unlike the awaiting state) and is only cleared on session
+    /// completion or error. Intended for display in the global footer so the user knows
+    /// an agent is working regardless of active tab.
     pub fn any_thinking_status(&self) -> Option<String> {
-        for (task_id, sent_at) in &self.prompt_sent_at {
-            if let Some(agent_name) = self.active_agent.get(task_id) {
-                let elapsed = sent_at.elapsed().as_secs();
-                return Some(format!("{} is thinking... ({}s)", agent_name, elapsed));
-            }
-        }
-        None
+        self.thinking_tasks
+            .values()
+            .next()
+            .map(|(started, agent_name)| {
+                let elapsed = started.elapsed().as_secs();
+                format!("{} is thinking... ({}s)", agent_name, elapsed)
+            })
     }
 
     /// Enables follow-tail mode so the next render tracks the bottom of the buffer.
@@ -1015,16 +1036,29 @@ mod tests {
         );
     }
 
-    /// Verifies that `any_thinking_status` returns None after clear_awaiting.
+    /// Verifies that `any_thinking_status` persists after clear_awaiting (agent still working).
     #[test]
-    fn test_any_thinking_status_clears_after_clear_awaiting() {
+    fn test_any_thinking_status_persists_after_clear_awaiting() {
         let mut state = Tab2State::new();
         let id = task_id();
         state.set_awaiting_response(&id, "Intake Agent".to_string());
         state.clear_awaiting(&id);
         assert!(
+            state.any_thinking_status().is_some(),
+            "any_thinking_status should persist after clear_awaiting (agent still streaming)"
+        );
+    }
+
+    /// Verifies that `any_thinking_status` returns None after clear_thinking.
+    #[test]
+    fn test_any_thinking_status_clears_after_clear_thinking() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.set_awaiting_response(&id, "Intake Agent".to_string());
+        state.clear_thinking(&id);
+        assert!(
             state.any_thinking_status().is_none(),
-            "any_thinking_status should be None after clear_awaiting"
+            "any_thinking_status should be None after clear_thinking"
         );
     }
 
