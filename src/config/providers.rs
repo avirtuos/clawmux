@@ -39,7 +39,7 @@ impl fmt::Debug for ProviderConfig {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ProviderSection {
-    /// Name of the active provider (e.g., `"anthropic"`, `"openai"`, `"google"`).
+    /// Name of the active provider (e.g., `"anthropic"`, `"openai"`, `"google"`, `"openrouter"`).
     #[serde(default)]
     pub default: String,
     /// Anthropic provider credentials.
@@ -48,6 +48,8 @@ pub struct ProviderSection {
     pub openai: Option<ProviderConfig>,
     /// Google provider credentials.
     pub google: Option<ProviderConfig>,
+    /// OpenRouter provider credentials.
+    pub openrouter: Option<ProviderConfig>,
 }
 
 /// Global ClawdMux configuration stored in `~/.config/clawdmux/config.toml`.
@@ -107,6 +109,7 @@ impl GlobalConfig {
             "anthropic" => ("ANTHROPIC_API_KEY", "ANTHROPIC_DEFAULT_MODEL"),
             "openai" => ("OPENAI_API_KEY", "OPENAI_DEFAULT_MODEL"),
             "google" => ("GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_DEFAULT_MODEL"),
+            "openrouter" => ("OPENROUTER_API_KEY", "OPENROUTER_DEFAULT_MODEL"),
             _ => unreachable!("active_provider() only returns Some for known providers"),
         };
         vec![
@@ -124,6 +127,7 @@ impl GlobalConfig {
             "anthropic" => self.provider.anthropic.as_ref(),
             "openai" => self.provider.openai.as_ref(),
             "google" => self.provider.google.as_ref(),
+            "openrouter" => self.provider.openrouter.as_ref(),
             _ => None,
         }
     }
@@ -145,6 +149,7 @@ mod tests {
                 }),
                 openai: None,
                 google: None,
+                openrouter: None,
             },
             opencode_password: None,
         }
@@ -261,6 +266,7 @@ default_model = "claude-opus-4-6"
                     default_model: "gpt-4o".to_string(),
                 }),
                 google: None,
+                openrouter: None,
             },
             opencode_password: None,
         };
@@ -281,6 +287,7 @@ default_model = "claude-opus-4-6"
                     api_key: "google-api-key".to_string(),
                     default_model: "gemini-pro".to_string(),
                 }),
+                openrouter: None,
             },
             opencode_password: None,
         };
@@ -291,6 +298,30 @@ default_model = "claude-opus-4-6"
             "google-api-key".to_string()
         )));
         assert!(vars.contains(&("GOOGLE_DEFAULT_MODEL".to_string(), "gemini-pro".to_string())));
+    }
+
+    #[test]
+    fn test_env_vars_openrouter() {
+        let config = GlobalConfig {
+            provider: ProviderSection {
+                default: "openrouter".to_string(),
+                anthropic: None,
+                openai: None,
+                google: None,
+                openrouter: Some(ProviderConfig {
+                    api_key: "sk-or-test".to_string(),
+                    default_model: "openrouter/openrouter/auto".to_string(),
+                }),
+            },
+            opencode_password: None,
+        };
+        let vars = config.env_vars_for_opencode();
+        assert_eq!(vars.len(), 2);
+        assert!(vars.contains(&("OPENROUTER_API_KEY".to_string(), "sk-or-test".to_string())));
+        assert!(vars.contains(&(
+            "OPENROUTER_DEFAULT_MODEL".to_string(),
+            "openrouter/openrouter/auto".to_string()
+        )));
     }
 
     #[test]
@@ -308,6 +339,7 @@ default_model = "claude-opus-4-6"
                 anthropic: None,
                 openai: None,
                 google: None,
+                openrouter: None,
             },
             opencode_password: None,
         };
