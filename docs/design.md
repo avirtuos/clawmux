@@ -115,7 +115,7 @@ Reads `~/.config/clawdmux/config.toml`. If no provider is configured:
 
 ```
 No LLM provider configured. Let's set one up.
-Provider: [1] Anthropic  [2] OpenAI  [3] Google  [4] Other
+Provider: [1] Anthropic  [2] OpenAI  [3] Google  [4] OpenRouter
 > 1
 API key: ****
 Default model [claude-sonnet-4-5]:
@@ -136,6 +136,10 @@ default_model = "claude-sonnet-4-5"
 # [provider.openai]
 # api_key = "sk-..."
 # default_model = "gpt-4.1"
+
+# [provider.openrouter]
+# api_key = "sk-or-..."
+# default_model = "openrouter/openrouter/auto"
 ```
 
 Credentials are stored only in ClawdMux's own config file -- they are never written to opencode's config. ClawdMux passes them to opencode via environment variables at process spawn time.
@@ -635,7 +639,7 @@ This is far more reliable than parsing terminal output for text markers. opencod
 - Tab 1 (Questions): One question at a time with answer textarea; tab title shows `*` when unanswered questions exist
 - Tab 2 (Agent Activity): Streaming text/markdown of agent work, tool execution activity, agent reasoning
 - Tab 3 (Team Status): Agent pipeline progress bar + scrollable work log
-- Tab 4 (Review): Unified diff view with colored +/-/space prefixed lines (green/red/dim), file carousel navigation (Left/Right), scrollable diff (PgUp/PgDn), comment textarea (`c` to focus, Enter to add), accumulated comments sent on `r` (request revisions) or discarded on `a` (approve)
+- Tab 4 (Review): Unified diff view with colored +/-/space prefixed lines (green/red/dim). Press `r` to enter review mode: Up/Down move the cursor line; PageUp/PageDown navigate between files; Space marks a line-range selection (git diff hunk coordinates); Enter in comment-input mode attaches an inline comment after the selected range; Esc cancels and exits review mode. `a` approves, `R` (Shift+R) emits HumanRequestedRevisions with all accumulated inline comments formatted as `path:start-end: text`.
 
 **Tab 2** shows streaming content from SSE message events rather than an embedded terminal, eliminating VT emulation complexity while providing more structured visibility into agent activity.
 

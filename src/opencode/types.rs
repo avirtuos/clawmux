@@ -149,6 +149,11 @@ pub enum OpenCodeEvent {
     SessionCreated {
         #[serde(alias = "sessionId")]
         session_id: String,
+        /// Parent session ID, present when OpenCode spawns a child session from an
+        /// existing one (e.g. for parallel agents or sub-tasks). Used to inherit
+        /// the parent's task mapping in the session map.
+        #[serde(default)]
+        parent_id: Option<String>,
     },
     /// A new message was created in a session.
     MessageCreated {
@@ -367,7 +372,7 @@ mod tests {
         let json = r#"{"type":"sessionCreated","session_id":"s1"}"#;
         let event: OpenCodeEvent = serde_json::from_str(json).expect("deserialize");
         assert!(
-            matches!(event, OpenCodeEvent::SessionCreated { ref session_id } if session_id == "s1"),
+            matches!(event, OpenCodeEvent::SessionCreated { ref session_id, .. } if session_id == "s1"),
             "unexpected variant: {event:?}"
         );
     }
@@ -389,7 +394,7 @@ mod tests {
         let json = r#"{"type":"sessionCreated","sessionId":"s1"}"#;
         let event: OpenCodeEvent = serde_json::from_str(json).expect("deserialize");
         assert!(
-            matches!(event, OpenCodeEvent::SessionCreated { ref session_id } if session_id == "s1"),
+            matches!(event, OpenCodeEvent::SessionCreated { ref session_id, .. } if session_id == "s1"),
             "unexpected variant: {event:?}"
         );
     }

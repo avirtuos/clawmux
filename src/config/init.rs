@@ -184,8 +184,11 @@ pub(crate) fn configure_provider_from_reader<R: BufRead, W: Write>(
 
     writeln!(writer, "No LLM provider configured. Let us set one up.")
         .map_err(ClawdMuxError::Io)?;
-    writeln!(writer, "Provider: [1] Anthropic  [2] OpenAI  [3] Google")
-        .map_err(ClawdMuxError::Io)?;
+    writeln!(
+        writer,
+        "Provider: [1] Anthropic  [2] OpenAI  [3] Google  [4] OpenRouter"
+    )
+    .map_err(ClawdMuxError::Io)?;
     write!(writer, "> ").map_err(ClawdMuxError::Io)?;
     writer.flush().map_err(ClawdMuxError::Io)?;
 
@@ -196,6 +199,7 @@ pub(crate) fn configure_provider_from_reader<R: BufRead, W: Write>(
         "1" => ("anthropic", "claude-sonnet-4-5"),
         "2" => ("openai", "gpt-4o"),
         "3" => ("google", "gemini-2.0-flash"),
+        "4" => ("openrouter", "openrouter/openrouter/auto"),
         other => {
             return Err(ClawdMuxError::Internal(format!(
                 "invalid provider choice: {}",
@@ -253,6 +257,11 @@ pub(crate) fn configure_provider_from_reader<R: BufRead, W: Write>(
             None
         },
         google: if provider_name == "google" {
+            Some(provider_config.clone())
+        } else {
+            None
+        },
+        openrouter: if provider_name == "openrouter" {
             Some(provider_config)
         } else {
             None
@@ -371,6 +380,7 @@ mod tests {
                 }),
                 openai: None,
                 google: None,
+                openrouter: None,
             },
             opencode_password: None,
         };
@@ -445,6 +455,27 @@ mod tests {
         let oai = config.provider.openai.unwrap();
         assert_eq!(oai.default_model, "gpt-4o");
         assert_eq!(oai.api_key, "sk-openai-key");
+    }
+
+    #[test]
+    fn test_configure_provider_happy_path_openrouter() {
+        let dir = TempDir::new().unwrap();
+        let global_path = dir.path().join("config.toml");
+        // provider=4 (openrouter), empty model line -> should use default, api_key set
+        let mut reader =
+            io::Cursor::new(b"4\nopenrouter/openrouter/auto\nsk-or-test-key\n".as_ref());
+        let mut writer = io::Cursor::new(Vec::new());
+
+        configure_provider_from_reader(&global_path, &mut reader, &mut writer).unwrap();
+
+        let config = GlobalConfig::load(&global_path).unwrap();
+        assert_eq!(config.provider.default, "openrouter");
+        let or_cfg = config.provider.openrouter.unwrap();
+        assert_eq!(or_cfg.api_key, "sk-or-test-key");
+        assert_eq!(or_cfg.default_model, "openrouter/openrouter/auto");
+        assert!(config.provider.anthropic.is_none());
+        assert!(config.provider.openai.is_none());
+        assert!(config.provider.google.is_none());
     }
 
     #[test]

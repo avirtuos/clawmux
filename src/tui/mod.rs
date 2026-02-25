@@ -86,16 +86,18 @@ fn sync_tabs_on_nav(app: &mut App) {
 
 /// The focused input context for [`footer_hint_text`].
 ///
-/// When a textarea is active the footer shows editing hints instead of the
-/// normal per-tab shortcuts.
+/// When a textarea is active or a review pane is focused, the footer shows
+/// context-specific hints instead of the normal per-tab shortcuts.
 pub enum FocusedInput {
-    /// No textarea is active.
+    /// No textarea or pane is focused.
     None,
     /// The supplemental-prompt textarea on Tab 0 is focused.
     Prompt,
     /// An answer textarea on the Questions tab (Tab 1) is focused.
     Answer,
-    /// The comment textarea on the Code Review tab (Tab 4) is focused.
+    /// The review pane on Tab 4 is focused for cursor browsing and line selection.
+    Review,
+    /// The comment draft textarea on the Code Review tab (Tab 4) is active.
     Comment,
 }
 
@@ -104,11 +106,11 @@ pub enum FocusedInput {
 /// Priority (highest first):
 /// - Quit-confirm dialog visible.
 /// - Status picker visible.
-/// - A textarea input is focused (editing mode).
+/// - A textarea or review pane is focused (editing/browsing mode).
 /// - Tab 0 specific states (malformed task, startable task, normal).
 /// - Tab 1 (Questions): answer and navigation bindings.
 /// - Tabs 2-3: scroll bindings.
-/// - Tab 4 (Review): file navigation and review bindings.
+/// - Tab 4 (Review): review mode bindings.
 /// - On other tabs: shows minimal bindings.
 pub fn footer_hint_text(
     show_quit_confirm: bool,
@@ -126,8 +128,10 @@ pub fn footer_hint_text(
         "[Esc] exit | Editing prompt"
     } else if matches!(focused_input, FocusedInput::Answer) {
         "[Esc] exit | [Tab] next answer | Editing answer"
+    } else if matches!(focused_input, FocusedInput::Review) {
+        "[Esc] exit | [Up/Down] cursor | [PgUp/PgDn] files | [Space] select | [a] approve"
     } else if matches!(focused_input, FocusedInput::Comment) {
-        "[Esc] exit | Editing comment"
+        "[Esc] cancel | [Enter] save | Editing comment"
     } else if active_tab == 0 && is_malformed_task {
         "[f] request fix | [Enter] apply fix | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 0 && is_startable_task {
@@ -139,7 +143,7 @@ pub fn footer_hint_text(
     } else if active_tab == 2 || active_tab == 3 {
         "[PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 4 {
-        "[</> arrows] file | [PgUp/PgDn] scroll | [c] comment | [Enter] add | [a] approve | [r] revisions | [Tab] next tab | [q] quit"
+        "[r] review | [a] approve | [R] revisions | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
     } else {
         "[Tab] next tab | [q] quit"
     }
@@ -172,8 +176,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         FocusedInput::Prompt
     } else if app.questions_state.focused_answer.is_some() {
         FocusedInput::Answer
-    } else if app.tab4_state.comment_focused {
+    } else if app.tab4_state.comment_mode {
         FocusedInput::Comment
+    } else if app.tab4_state.review_focused {
+        FocusedInput::Review
     } else {
         FocusedInput::None
     };
@@ -595,30 +601,99 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             }
         }
 
-        // Tab 4 (Code Review): file navigation, diff scroll, comment input, approve/revisions.
+        // Tab 4 (Code Review): review pane focus, line cursor navigation, selection, comments.
         if app.active_tab == 4 {
-            if app.tab4_state.comment_focused {
-                // Comment textarea is focused: forward most keys to it.
-                if key.code == KeyCode::Esc {
-                    app.tab4_state.set_comment_unfocused();
-                } else {
-                    app.tab4_state.comment_input.input(Input::from(key));
+            // Comment mode: user is typing a comment draft.
+            if app.tab4_state.comment_mode {
+                match key.code {
+                    KeyCode::Esc => {
+                        app.tab4_state.cancel_review();
+                        return None;
+                    }
+                    KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
+                        let (file_idx, path) = {
+                            let diffs = app.tab4_state.current_diffs();
+                            let idx = app
+                                .tab4_state
+                                .selected_file
+                                .min(diffs.len().saturating_sub(1));
+                            let path = diffs.get(idx).map(|d| d.path.clone()).unwrap_or_default();
+                            (idx, path)
+                        };
+                        app.tab4_state.submit_draft_comment(file_idx, &path);
+                        return None;
+                    }
+                    _ => {
+                        app.tab4_state.comment_draft.input(Input::from(key));
+                        return None;
+                    }
                 }
-                return None;
             }
 
-            // Not focused: handle navigation, submit, and actions.
-            match key.code {
-                KeyCode::Left if key.modifiers == KeyModifiers::NONE => {
-                    app.tab4_state.select_prev_file();
-                    return None;
+            // Review focused: cursor navigation, line selection, file navigation.
+            if app.tab4_state.review_focused {
+                match key.code {
+                    KeyCode::Up => {
+                        app.tab4_state.move_cursor_up();
+                        return None;
+                    }
+                    KeyCode::Down => {
+                        let flat_count = app
+                            .tab4_state
+                            .current_diffs()
+                            .get(app.tab4_state.selected_file)
+                            .map(|d| {
+                                use crate::tui::tabs::code_review::flatten_file_diff;
+                                flatten_file_diff(d).len()
+                            })
+                            .unwrap_or(0);
+                        app.tab4_state.move_cursor_down(flat_count);
+                        return None;
+                    }
+                    KeyCode::PageUp => {
+                        app.tab4_state.select_prev_file();
+                        return None;
+                    }
+                    KeyCode::PageDown => {
+                        let count = app.tab4_state.current_diffs().len();
+                        app.tab4_state.select_next_file(count);
+                        return None;
+                    }
+                    KeyCode::Char(' ') => {
+                        let flat_lines = app
+                            .tab4_state
+                            .current_diffs()
+                            .get(app.tab4_state.selected_file)
+                            .map(|d| {
+                                use crate::tui::tabs::code_review::flatten_file_diff;
+                                flatten_file_diff(d)
+                            })
+                            .unwrap_or_default();
+                        app.tab4_state.press_space(&flat_lines);
+                        return None;
+                    }
+                    KeyCode::Esc => {
+                        app.tab4_state.cancel_review();
+                        return None;
+                    }
+                    KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
+                        if let Some(task_id) = app.selected_task().cloned() {
+                            return Some(AppMessage::HumanApprovedReview { task_id });
+                        }
+                        return None;
+                    }
+                    _ => {
+                        // Consume all other keys while review pane is focused so they
+                        // don't bleed through to global handlers (e.g. Up/Down task nav).
+                        return None;
+                    }
                 }
-                KeyCode::Right if key.modifiers == KeyModifiers::NONE => {
-                    let count = app
-                        .selected_task()
-                        .map(|id| app.tab4_state.diffs_for(id).len())
-                        .unwrap_or(0);
-                    app.tab4_state.select_next_file(count);
+            }
+
+            // Review pane not focused: global Tab 4 shortcuts.
+            match key.code {
+                KeyCode::Char('r') if key.modifiers == KeyModifiers::NONE => {
+                    app.tab4_state.focus_review();
                     return None;
                 }
                 KeyCode::PageUp => {
@@ -629,21 +704,14 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     app.tab4_state.scroll_down();
                     return None;
                 }
-                KeyCode::Char('c') if key.modifiers == KeyModifiers::NONE => {
-                    app.tab4_state.set_comment_focused();
-                    return None;
-                }
-                KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
-                    app.tab4_state.submit_comment();
-                    return None;
-                }
                 KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
                     if let Some(task_id) = app.selected_task().cloned() {
                         return Some(AppMessage::HumanApprovedReview { task_id });
                     }
                     return None;
                 }
-                KeyCode::Char('r') if key.modifiers == KeyModifiers::NONE => {
+                // Shift+R: request revisions using accumulated inline comments.
+                KeyCode::Char('R') => {
                     if let Some(task_id) = app.selected_task().cloned() {
                         let comments = app.tab4_state.take_comments();
                         return Some(AppMessage::HumanRequestedRevisions { task_id, comments });
@@ -1050,19 +1118,67 @@ mod tests {
     }
 
     #[test]
-    fn test_review_tab_left_right_navigate_files() {
-        use crate::opencode::types::{DiffStatus, FileDiff};
+    fn test_review_tab_r_focuses_review_pane() {
+        let mut app = App::test_default();
+        app.active_tab = 4;
+        assert!(!app.tab4_state.review_focused);
+
+        // 'r' focuses the review pane.
+        handle_input(key_event(KeyCode::Char('r'), KeyModifiers::NONE), &mut app);
+        assert!(
+            app.tab4_state.review_focused,
+            "pressing 'r' should focus the review pane"
+        );
+
+        // Esc exits review mode.
+        handle_input(key_event(KeyCode::Esc, KeyModifiers::NONE), &mut app);
+        assert!(
+            !app.tab4_state.review_focused,
+            "Esc should exit review mode"
+        );
+    }
+
+    #[test]
+    fn test_review_tab_pgup_pgdn_scrolls_diff_when_unfocused() {
+        let mut app = App::test_default();
+        app.active_tab = 4;
+        assert!(!app.tab4_state.review_focused);
+        assert_eq!(app.tab4_state.diff_scroll, 0);
+
+        handle_input(key_event(KeyCode::PageDown, KeyModifiers::NONE), &mut app);
+        assert_eq!(
+            app.tab4_state.diff_scroll, 3,
+            "PgDn should scroll diff when not in review mode"
+        );
+
+        handle_input(key_event(KeyCode::PageUp, KeyModifiers::NONE), &mut app);
+        assert_eq!(
+            app.tab4_state.diff_scroll, 0,
+            "PgUp should scroll diff when not in review mode"
+        );
+    }
+
+    #[test]
+    fn test_review_tab_pgup_pgdn_navigate_files_when_focused() {
+        use crate::opencode::types::{DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff};
 
         let mut app = App::test_default();
         app.active_tab = 4;
-        // Simulate two diffs loaded for the selected task.
-        // We don't need a real task selected; directly mutate tab4_state.
+
+        // Load two diffs via current_task_id path so current_diffs() works.
         let task_id = TaskId::from_path("tasks/1.1.md");
         let diffs = vec![
             FileDiff {
                 path: "a.rs".to_string(),
                 status: DiffStatus::Modified,
-                hunks: vec![],
+                hunks: vec![DiffHunk {
+                    old_start: 1,
+                    new_start: 1,
+                    lines: vec![DiffLine {
+                        kind: DiffLineKind::Added,
+                        content: "x".to_string(),
+                    }],
+                }],
             },
             FileDiff {
                 path: "b.rs".to_string(),
@@ -1071,48 +1187,62 @@ mod tests {
             },
         ];
         app.tab4_state.set_diffs(&task_id, diffs);
+        app.tab4_state.set_displayed_task(Some(&task_id));
+        app.tab4_state.focus_review();
+
         assert_eq!(app.tab4_state.selected_file, 0);
 
-        // Right arrow advances to file 2 -- but we need a selected task.
-        // Without a selected task, diffs_for returns 0, so next_file is noop.
-        // Just test scroll directly.
-        app.tab4_state.select_next_file(2);
-        assert_eq!(app.tab4_state.selected_file, 1);
-
-        // Left arrow goes back.
-        handle_input(key_event(KeyCode::Left, KeyModifiers::NONE), &mut app);
-        assert_eq!(app.tab4_state.selected_file, 0);
-
-        // Left at 0 clamps.
-        handle_input(key_event(KeyCode::Left, KeyModifiers::NONE), &mut app);
-        assert_eq!(app.tab4_state.selected_file, 0);
-    }
-
-    #[test]
-    fn test_review_tab_pgup_pgdn_scrolls_diff() {
-        let mut app = App::test_default();
-        app.active_tab = 4;
-        assert_eq!(app.tab4_state.diff_scroll, 0);
-
+        // PgDn navigates to next file.
         handle_input(key_event(KeyCode::PageDown, KeyModifiers::NONE), &mut app);
-        assert_eq!(app.tab4_state.diff_scroll, 3);
+        assert_eq!(
+            app.tab4_state.selected_file, 1,
+            "PgDn in review mode should go to next file"
+        );
 
+        // PgUp goes back.
         handle_input(key_event(KeyCode::PageUp, KeyModifiers::NONE), &mut app);
-        assert_eq!(app.tab4_state.diff_scroll, 0);
+        assert_eq!(
+            app.tab4_state.selected_file, 0,
+            "PgUp in review mode should go to prev file"
+        );
     }
 
     #[test]
-    fn test_review_tab_c_focuses_comment() {
+    fn test_review_tab_up_down_moves_cursor_when_focused() {
+        use crate::opencode::types::{DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff};
+
         let mut app = App::test_default();
         app.active_tab = 4;
-        assert!(!app.tab4_state.comment_focused);
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        // Three-line diff → three flat lines (hunk header + 2 content lines).
+        let diffs = vec![FileDiff {
+            path: "x.rs".to_string(),
+            status: DiffStatus::Modified,
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    DiffLine {
+                        kind: DiffLineKind::Added,
+                        content: "a".to_string(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Removed,
+                        content: "b".to_string(),
+                    },
+                ],
+            }],
+        }];
+        app.tab4_state.set_diffs(&task_id, diffs);
+        app.tab4_state.set_displayed_task(Some(&task_id));
+        app.tab4_state.focus_review();
+        assert_eq!(app.tab4_state.cursor_line, 0);
 
-        handle_input(key_event(KeyCode::Char('c'), KeyModifiers::NONE), &mut app);
-        assert!(app.tab4_state.comment_focused);
+        handle_input(key_event(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.tab4_state.cursor_line, 1, "Down should advance cursor");
 
-        // Esc unfocuses.
-        handle_input(key_event(KeyCode::Esc, KeyModifiers::NONE), &mut app);
-        assert!(!app.tab4_state.comment_focused);
+        handle_input(key_event(KeyCode::Up, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.tab4_state.cursor_line, 0, "Up should retreat cursor");
     }
 
     #[test]
@@ -1154,20 +1284,56 @@ mod tests {
     }
 
     #[test]
-    fn test_review_tab_enter_submits_comment() {
+    fn test_review_tab_enter_submits_inline_comment() {
+        use crate::opencode::types::{DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff};
+        use crate::tui::tabs::code_review::flatten_file_diff;
+
         let mut app = App::test_default();
         app.active_tab = 4;
-        app.tab4_state.comment_input.insert_str("needs work");
-        assert!(app.tab4_state.comments.is_empty());
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        let diffs = vec![FileDiff {
+            path: "x.rs".to_string(),
+            status: DiffStatus::Modified,
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    DiffLine {
+                        kind: DiffLineKind::Added,
+                        content: "a".to_string(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Added,
+                        content: "b".to_string(),
+                    },
+                ],
+            }],
+        }];
+        app.tab4_state.set_diffs(&task_id, diffs.clone());
+        app.tab4_state.set_displayed_task(Some(&task_id));
+        app.tab4_state.focus_review();
 
+        // Select range: Space at line 0, move to line 1, Space again.
+        let flat = flatten_file_diff(&diffs[0]);
+        app.tab4_state.cursor_line = 0;
+        app.tab4_state.press_space(&flat);
+        app.tab4_state.cursor_line = 1;
+        app.tab4_state.press_space(&flat);
+        assert!(app.tab4_state.comment_mode);
+
+        // Type and submit.
+        app.tab4_state.comment_draft.insert_str("needs work");
         handle_input(key_event(KeyCode::Enter, KeyModifiers::NONE), &mut app);
-        assert_eq!(app.tab4_state.comments.len(), 1, "comment should be added");
-        assert_eq!(app.tab4_state.comments[0], "needs work");
-        assert_eq!(
-            app.tab4_state.comment_input.lines().join(""),
-            "",
-            "textarea should be cleared after submit"
+        assert!(
+            !app.tab4_state.comment_mode,
+            "comment mode should exit after Enter"
         );
+        assert_eq!(
+            app.tab4_state.inline_comments.len(),
+            1,
+            "inline comment should be added"
+        );
+        assert_eq!(app.tab4_state.inline_comments[0].text, "needs work");
     }
 
     #[test]
@@ -1204,9 +1370,17 @@ mod tests {
     }
 
     #[test]
+    fn test_footer_hints_review_focused() {
+        let text = footer_hint_text(false, false, 4, FocusedInput::Review, false, false);
+        assert!(text.contains("[Esc] exit"), "got: {text}");
+        assert!(text.contains("[Up/Down] cursor"), "got: {text}");
+        assert!(text.contains("[Space] select"), "got: {text}");
+    }
+
+    #[test]
     fn test_footer_hints_comment_focused() {
         let text = footer_hint_text(false, false, 4, FocusedInput::Comment, false, false);
-        assert!(text.contains("[Esc] exit"), "got: {text}");
+        assert!(text.contains("[Esc] cancel"), "got: {text}");
         assert!(text.contains("Editing comment"), "got: {text}");
     }
 
@@ -1223,8 +1397,8 @@ mod tests {
     fn test_footer_hints_review_tab() {
         let text = footer_hint_text(false, false, 4, FocusedInput::None, false, false);
         assert!(text.contains("[a] approve"), "got: {text}");
-        assert!(text.contains("[r] revisions"), "got: {text}");
-        assert!(text.contains("[c] comment"), "got: {text}");
+        assert!(text.contains("[r] review"), "got: {text}");
+        assert!(text.contains("[R] revisions"), "got: {text}");
         assert!(text.contains("[Tab] next tab"), "got: {text}");
     }
 

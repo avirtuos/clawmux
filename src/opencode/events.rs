@@ -42,6 +42,11 @@ pub struct EventStreamConsumer {
     /// Each delta is appended here so the full text can be emitted on every chunk.
     /// Drained when the session completes or errors.
     accumulated_deltas: HashMap<(String, String), String>,
+    /// The ID of the most recently successfully-registered top-level session.
+    ///
+    /// Used as a fallback parent when OpenCode spawns a child session without
+    /// including a parent reference in its `session.created` SSE event.
+    last_registered_session: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -58,6 +63,7 @@ impl EventStreamConsumer {
             session_map,
             accumulated_text: HashMap::new(),
             accumulated_deltas: HashMap::new(),
+            last_registered_session: None,
         }
     }
 
@@ -136,7 +142,10 @@ impl EventStreamConsumer {
     /// `MessageCreated` and `Unknown` variants are always ignored.
     pub(crate) async fn handle_event(&mut self, event: OpenCodeEvent) -> Result<()> {
         match event {
-            OpenCodeEvent::SessionCreated { session_id } => {
+            OpenCodeEvent::SessionCreated {
+                session_id,
+                parent_id,
+            } => {
                 // Retry up to 3 times with a 50ms sleep to handle the TOCTOU
                 // race where the SSE event arrives before the session map is
                 // populated by the caller that initiated the CreateSession.
@@ -154,6 +163,52 @@ impl EventStreamConsumer {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 }
+                // Remember this as the most recent top-level session so that
+                // child sessions without a parent reference can inherit from it.
+                if task_id.is_some() {
+                    self.last_registered_session = Some(session_id.clone());
+                }
+                // If the session is not directly registered, check whether this is a
+                // child session spawned by OpenCode from a known parent (e.g. for
+                // parallel agents or sub-tasks). Inherit the parent's task mapping and
+                // register the child so all its events reach the UI.
+                if task_id.is_none() {
+                    if let Some(ref pid) = parent_id {
+                        let entry = {
+                            let map = self.session_map.read().await;
+                            map.get(pid.as_str()).cloned()
+                        };
+                        if let Some(entry) = entry {
+                            debug!(
+                                "SSE session.created: child session {} inherits from parent {}",
+                                session_id, pid
+                            );
+                            task_id = Some(entry.0.clone());
+                            let mut map = self.session_map.write().await;
+                            map.insert(session_id.clone(), entry);
+                        }
+                    }
+                }
+                // Last resort: OpenCode sometimes spawns child sessions without any
+                // parent reference in the event. Fall back to the most recently
+                // registered top-level session so the child's events reach the UI.
+                if task_id.is_none() {
+                    if let Some(ref last) = self.last_registered_session.clone() {
+                        let entry = {
+                            let map = self.session_map.read().await;
+                            map.get(last.as_str()).cloned()
+                        };
+                        if let Some(entry) = entry {
+                            debug!(
+                                "SSE session.created: adopting unknown session {} under last session {}",
+                                session_id, last
+                            );
+                            task_id = Some(entry.0.clone());
+                            let mut map = self.session_map.write().await;
+                            map.insert(session_id.clone(), entry);
+                        }
+                    }
+                }
                 if let Some(task_id) = task_id {
                     self.send(AppMessage::SessionCreated {
                         task_id,
@@ -162,8 +217,8 @@ impl EventStreamConsumer {
                     .await?;
                 } else {
                     warn!(
-                        "SessionCreated for unknown session_id after retries: {}",
-                        session_id
+                        "SessionCreated for unknown session_id after retries: {} (parent={:?})",
+                        session_id, parent_id
                     );
                 }
             }
@@ -375,9 +430,19 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
     match event_type {
         "session.created" => {
             if let Some(id) = props["info"]["id"].as_str() {
-                debug!("SSE session.created: session_id={}", id);
+                let parent_id = props["info"]["parent"]
+                    .as_str()
+                    .or_else(|| props["info"]["parentId"].as_str())
+                    .map(|s| s.to_string());
+                // Log full info object so parent field name can be identified if
+                // OpenCode uses a different key than "parent"/"parentId".
+                debug!(
+                    "SSE session.created: session_id={}, parent={:?}, info={}",
+                    id, parent_id, props["info"]
+                );
                 OpenCodeEvent::SessionCreated {
                     session_id: id.to_string(),
+                    parent_id,
                 }
             } else {
                 warn!("session.created missing info.id: {}", json_data);
@@ -387,8 +452,13 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
         "session.error" => {
             let session_id = props["info"]["id"]
                 .as_str()
+                .or_else(|| props["sessionID"].as_str())
                 .or_else(|| props["sessionId"].as_str());
-            let error = props["error"].as_str().unwrap_or("unknown error");
+            let error = props["error"]
+                .as_str()
+                .or_else(|| props["error"]["data"]["message"].as_str())
+                .or_else(|| props["error"]["message"].as_str())
+                .unwrap_or("unknown error");
             match session_id {
                 Some(sid) => OpenCodeEvent::SessionError {
                     session_id: sid.to_string(),
@@ -403,6 +473,7 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
         "session.completed" => {
             let session_id = props["info"]["id"]
                 .as_str()
+                .or_else(|| props["sessionID"].as_str())
                 .or_else(|| props["sessionId"].as_str());
             match session_id {
                 Some(sid) => OpenCodeEvent::SessionCompleted {
@@ -588,6 +659,7 @@ mod tests {
         consumer
             .handle_event(OpenCodeEvent::SessionCreated {
                 session_id: "sess-abc".to_string(),
+                parent_id: None,
             })
             .await
             .expect("handle_event");
@@ -678,6 +750,7 @@ mod tests {
         consumer
             .handle_event(OpenCodeEvent::SessionCreated {
                 session_id: session_id.clone(),
+                parent_id: None,
             })
             .await
             .expect("handle_event");
@@ -687,6 +760,138 @@ mod tests {
             .expect("SessionCreated message should be received after retry");
         assert!(
             matches!(msg, AppMessage::SessionCreated { ref session_id, .. } if session_id == "sess-race")
+        );
+    }
+
+    /// Verifies that a child session with a known parent inherits the parent's task mapping.
+    #[tokio::test]
+    async fn test_session_created_child_inherits_parent_mapping() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-parent".to_string(),
+                (task_id.clone(), AgentKind::Intake),
+            );
+        }
+
+        // A child session with parent_id pointing to a registered parent should
+        // inherit the parent's task mapping and emit SessionCreated.
+        consumer
+            .handle_event(OpenCodeEvent::SessionCreated {
+                session_id: "sess-child".to_string(),
+                parent_id: Some("sess-parent".to_string()),
+            })
+            .await
+            .expect("handle_event");
+
+        // The child session should now be registered in the session map.
+        {
+            let map = session_map.read().await;
+            assert!(
+                map.contains_key("sess-child"),
+                "child session should be registered in session_map"
+            );
+        }
+
+        // A SessionCreated message should be emitted for the child session.
+        let msg = rx
+            .try_recv()
+            .expect("SessionCreated message should be emitted for child session");
+        assert!(
+            matches!(msg, AppMessage::SessionCreated { ref session_id, .. } if session_id == "sess-child"),
+            "unexpected: {msg:?}"
+        );
+    }
+
+    /// Verifies that a child session with an unknown parent is still dropped.
+    #[tokio::test]
+    async fn test_session_created_child_unknown_parent_dropped() {
+        let (mut consumer, mut rx, _session_map) = make_consumer();
+
+        consumer
+            .handle_event(OpenCodeEvent::SessionCreated {
+                session_id: "sess-child".to_string(),
+                parent_id: Some("sess-unknown-parent".to_string()),
+            })
+            .await
+            .expect("handle_event");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "child of unknown parent should not emit a message"
+        );
+    }
+
+    /// Verifies that when OpenCode spawns a child session with no parent reference,
+    /// it is adopted under the most recently registered top-level session.
+    #[tokio::test]
+    async fn test_session_created_no_parent_adopts_last_registered() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-toplevel".to_string(),
+                (task_id.clone(), AgentKind::Intake),
+            );
+        }
+
+        // Register the top-level session so last_registered_session is set.
+        consumer
+            .handle_event(OpenCodeEvent::SessionCreated {
+                session_id: "sess-toplevel".to_string(),
+                parent_id: None,
+            })
+            .await
+            .expect("handle_event");
+        // Drain the SessionCreated message for the top-level session.
+        rx.try_recv().expect("top-level SessionCreated");
+
+        // Now a child session fires with no parent reference at all.
+        consumer
+            .handle_event(OpenCodeEvent::SessionCreated {
+                session_id: "sess-orphan".to_string(),
+                parent_id: None,
+            })
+            .await
+            .expect("handle_event");
+
+        // The orphan should have been adopted under the top-level session's task.
+        {
+            let map = session_map.read().await;
+            assert!(
+                map.contains_key("sess-orphan"),
+                "orphan session should be adopted into session_map"
+            );
+        }
+        let msg = rx
+            .try_recv()
+            .expect("SessionCreated message should be emitted for adopted orphan");
+        assert!(
+            matches!(msg, AppMessage::SessionCreated { ref session_id, .. } if session_id == "sess-orphan"),
+            "unexpected: {msg:?}"
+        );
+    }
+
+    /// Verifies that a no-parent session is still dropped when there is no
+    /// previously registered session to adopt it.
+    #[tokio::test]
+    async fn test_session_created_no_parent_no_fallback_dropped() {
+        let (mut consumer, mut rx, _session_map) = make_consumer();
+
+        consumer
+            .handle_event(OpenCodeEvent::SessionCreated {
+                session_id: "sess-orphan".to_string(),
+                parent_id: None,
+            })
+            .await
+            .expect("handle_event");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "orphan with no fallback should not emit a message"
         );
     }
 
@@ -837,7 +1042,31 @@ mod tests {
         let json = r#"{"payload":{"type":"session.created","properties":{"info":{"id":"ses_abc","slug":"eager-rocket"}}}}"#;
         let event = parse_wire_event(json);
         assert!(
-            matches!(event, OpenCodeEvent::SessionCreated { ref session_id } if session_id == "ses_abc"),
+            matches!(event, OpenCodeEvent::SessionCreated { ref session_id, .. } if session_id == "ses_abc"),
+            "unexpected: {event:?}"
+        );
+    }
+
+    /// Verifies that session.created extracts the parent field when present.
+    #[test]
+    fn test_parse_wire_event_session_created_with_parent() {
+        let json = r#"{"payload":{"type":"session.created","properties":{"info":{"id":"ses_child","slug":"eager-rocket","parent":"ses_parent"}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::SessionCreated { ref session_id, ref parent_id }
+                if session_id == "ses_child" && parent_id.as_deref() == Some("ses_parent")),
+            "unexpected: {event:?}"
+        );
+    }
+
+    /// Verifies that session.created without a parent field sets parent_id to None.
+    #[test]
+    fn test_parse_wire_event_session_created_no_parent() {
+        let json = r#"{"payload":{"type":"session.created","properties":{"info":{"id":"ses_abc","slug":"eager-rocket"}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::SessionCreated { ref parent_id, .. }
+                if parent_id.is_none()),
             "unexpected: {event:?}"
         );
     }
@@ -853,10 +1082,22 @@ mod tests {
         );
     }
 
-    /// Verifies that session.error is mapped correctly.
+    /// Verifies that session.error is mapped correctly with the real wire format.
     #[test]
     fn test_parse_wire_event_session_error() {
-        let json = r#"{"payload":{"type":"session.error","properties":{"info":{"id":"ses_abc"},"error":"rate limit"}}}"#;
+        let json = r#"{"payload":{"type":"session.error","properties":{"sessionID":"ses_abc","error":{"name":"APIError","data":{"message":"rate limit"}}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::SessionError { ref session_id, ref error }
+                if session_id == "ses_abc" && error == "rate limit"),
+            "unexpected: {event:?}"
+        );
+    }
+
+    /// Verifies that session.error handles the legacy plain-string error format.
+    #[test]
+    fn test_parse_wire_event_session_error_legacy_string() {
+        let json = r#"{"payload":{"type":"session.error","properties":{"sessionID":"ses_abc","error":"rate limit"}}}"#;
         let event = parse_wire_event(json);
         assert!(
             matches!(event, OpenCodeEvent::SessionError { ref session_id, ref error }
