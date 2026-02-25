@@ -15,6 +15,8 @@ use crate::tasks::models::{status_to_index, Question, SuggestedFix, TaskStatus, 
 use crate::tasks::{Story, TaskId, TaskStore};
 use crate::tui::tabs::agent_activity::Tab2State;
 use crate::tui::tabs::code_review::Tab4State;
+use crate::tui::tabs::design::DesignTabState;
+use crate::tui::tabs::plan::PlanTabState;
 use crate::tui::tabs::questions::QuestionsTabState;
 use crate::tui::tabs::task_details::Tab1State;
 use crate::tui::tabs::team_status::Tab3State;
@@ -48,7 +50,11 @@ pub struct App {
     pub tab1_state: Tab1State,
     /// UI state for Tab 1 (Questions): question navigation and answer inputs.
     pub questions_state: QuestionsTabState,
-    /// UI state for Tab 2 (Agent Activity): per-task activity lines and scroll.
+    /// UI state for Tab 2 (Design): design document scroll.
+    pub design_state: DesignTabState,
+    /// UI state for Tab 3 (Plan): implementation plan scroll.
+    pub plan_state: PlanTabState,
+    /// UI state for Tab 4 (Agent Activity): per-task activity lines and scroll.
     pub tab2_state: Tab2State,
     /// Pure state machine driving tasks through the 7-agent pipeline.
     pub workflow_engine: WorkflowEngine,
@@ -96,6 +102,8 @@ impl App {
             task_list_state,
             tab1_state: Tab1State::new(),
             questions_state: QuestionsTabState::new(),
+            design_state: DesignTabState::new(),
+            plan_state: PlanTabState::new(),
             tab2_state: Tab2State::new(),
             workflow_engine: WorkflowEngine::new(),
             tab3_state: Tab3State::new(),
@@ -824,7 +832,7 @@ impl App {
                 self.tab4_state.set_diffs(&task_id, diffs);
                 self.tab4_state.set_displayed_task(Some(&task_id));
                 self.tab4_state.reset_for_diffs();
-                self.active_tab = 4;
+                self.active_tab = 6;
                 vec![]
             }
         }
@@ -1757,7 +1765,7 @@ mod tests {
         });
 
         assert!(msgs.is_empty());
-        assert_eq!(app.active_tab, 4, "should switch to Tab 4 (Review)");
+        assert_eq!(app.active_tab, 6, "should switch to Tab 6 (Review)");
         assert_eq!(
             app.tab4_state.diffs_for(&task_id).len(),
             1,
