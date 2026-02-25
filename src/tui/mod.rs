@@ -116,7 +116,7 @@ pub enum FocusedInput {
 /// - Tab 0 specific states (malformed task, startable task, normal).
 /// - Tab 1 (Questions): answer and navigation bindings.
 /// - Tabs 2-3 (Design/Plan): scroll bindings.
-/// - Tab 4 (Agent Activity): steer and scroll bindings.
+/// - Tab 4 (Agent Activity): permission pending, steer and scroll bindings.
 /// - Tab 5 (Team Status): scroll bindings.
 /// - Tab 6 (Review): review mode bindings.
 /// - On other tabs: shows minimal bindings.
@@ -127,6 +127,7 @@ pub fn footer_hint_text(
     focused_input: FocusedInput,
     is_malformed_task: bool,
     is_startable_task: bool,
+    pending_permission: bool,
 ) -> &'static str {
     if show_quit_confirm {
         "[y/Enter] confirm quit | [n/Esc] cancel"
@@ -152,6 +153,8 @@ pub fn footer_hint_text(
         "[a] answer | [Alt+Enter] submit | [PgUp/PgDn] navigate | [Tab] next tab | [q] quit"
     } else if active_tab == 2 || active_tab == 3 {
         "[PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
+    } else if active_tab == 4 && pending_permission {
+        "[y] approve | [a] always | [n] reject | [Tab] next tab | [q] quit"
     } else if active_tab == 4 {
         "[p] steer | [Enter] send | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 5 {
@@ -199,6 +202,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
     } else {
         FocusedInput::None
     };
+    let pending_permission = app
+        .selected_task()
+        .map(|id| {
+            app.tab2_state
+                .pending_permission
+                .as_ref()
+                .map(|(tid, _)| tid == id)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
     let hint = footer_hint_text(
         app.show_quit_confirm,
         app.show_status_picker.is_some(),
@@ -206,6 +219,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         focused_input,
         is_malformed_task,
         is_startable_task,
+        pending_permission,
     );
     let thinking = app.tab2_state.any_thinking_status();
     let footer_block = Block::default().borders(Borders::TOP);
@@ -659,6 +673,40 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                 app.tab2_state.steering_input.input(Input::from(key));
                 return None;
             }
+            // Permission pending: intercept y/a/n to resolve it.
+            let has_pending = app
+                .selected_task()
+                .map(|id| {
+                    app.tab2_state
+                        .pending_permission
+                        .as_ref()
+                        .map(|(tid, _)| tid == id)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if has_pending {
+                let response = match key.code {
+                    KeyCode::Char('y') if key.modifiers == KeyModifiers::NONE => {
+                        Some("once".to_string())
+                    }
+                    KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
+                        Some("always".to_string())
+                    }
+                    KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
+                        Some("reject".to_string())
+                    }
+                    _ => None,
+                };
+                if let Some(resp) = response {
+                    if let Some((task_id, request)) = app.tab2_state.pending_permission.clone() {
+                        return Some(AppMessage::PermissionResolved {
+                            task_id,
+                            request,
+                            response: resp,
+                        });
+                    }
+                }
+            }
             // Unfocused mode.
             match key.code {
                 KeyCode::Char('p') if key.modifiers == KeyModifiers::NONE => {
@@ -1059,6 +1107,7 @@ mod tests {
                 agent: AgentKind::Intake,
                 text: "Clarify scope?".to_string(),
                 answer: None,
+                opencode_request_id: None,
             }],
             design: None,
             implementation_plan: None,
@@ -1148,6 +1197,7 @@ mod tests {
                     agent: AgentKind::Design,
                     text: "Architecture choice?".to_string(),
                     answer: None,
+                    opencode_request_id: None,
                 });
             }
         }
@@ -1476,7 +1526,7 @@ mod tests {
 
     #[test]
     fn test_footer_hints_normal_tab0() {
-        let text = footer_hint_text(false, false, 0, FocusedInput::None, false, false);
+        let text = footer_hint_text(false, false, 0, FocusedInput::None, false, false, false);
         assert!(text.contains("[i] prompt"), "got: {text}");
         assert!(!text.contains("[a] answer"), "got: {text}"); // moved to Questions tab
         assert!(text.contains("[s] status"), "got: {text}");
@@ -1485,7 +1535,7 @@ mod tests {
 
     #[test]
     fn test_footer_hints_questions_tab() {
-        let text = footer_hint_text(false, false, 1, FocusedInput::None, false, false);
+        let text = footer_hint_text(false, false, 1, FocusedInput::None, false, false, false);
         assert!(text.contains("[a] answer"), "got: {text}");
         assert!(text.contains("[Alt+Enter] submit"), "got: {text}");
         assert!(text.contains("PgUp/PgDn"), "got: {text}");
@@ -1495,21 +1545,21 @@ mod tests {
 
     #[test]
     fn test_footer_hints_prompt_focused() {
-        let text = footer_hint_text(false, false, 0, FocusedInput::Prompt, false, false);
+        let text = footer_hint_text(false, false, 0, FocusedInput::Prompt, false, false, false);
         assert!(text.contains("[Esc]"), "got: {text}");
         assert!(text.contains("Editing prompt"), "got: {text}");
     }
 
     #[test]
     fn test_footer_hints_answer_focused() {
-        let text = footer_hint_text(false, false, 1, FocusedInput::Answer, false, false);
+        let text = footer_hint_text(false, false, 1, FocusedInput::Answer, false, false, false);
         assert!(text.contains("[Esc] exit"), "got: {text}");
         assert!(text.contains("Editing answer"), "got: {text}");
     }
 
     #[test]
     fn test_footer_hints_review_focused() {
-        let text = footer_hint_text(false, false, 6, FocusedInput::Review, false, false);
+        let text = footer_hint_text(false, false, 6, FocusedInput::Review, false, false, false);
         assert!(text.contains("[Esc] exit"), "got: {text}");
         assert!(text.contains("[Up/Down] cursor"), "got: {text}");
         assert!(text.contains("[Space] select"), "got: {text}");
@@ -1517,7 +1567,7 @@ mod tests {
 
     #[test]
     fn test_footer_hints_comment_focused() {
-        let text = footer_hint_text(false, false, 6, FocusedInput::Comment, false, false);
+        let text = footer_hint_text(false, false, 6, FocusedInput::Comment, false, false, false);
         assert!(text.contains("[Esc] cancel"), "got: {text}");
         assert!(text.contains("Editing comment"), "got: {text}");
     }
@@ -1525,7 +1575,7 @@ mod tests {
     #[test]
     fn test_footer_hints_design_tab() {
         // Tab 2 is Design.
-        let text = footer_hint_text(false, false, 2, FocusedInput::None, false, false);
+        let text = footer_hint_text(false, false, 2, FocusedInput::None, false, false, false);
         assert!(text.contains("[PgUp/PgDn] scroll"), "got: {text}");
         assert!(text.contains("[Tab] next tab"), "got: {text}");
         assert!(text.contains("[q] quit"), "got: {text}");
@@ -1535,7 +1585,7 @@ mod tests {
     #[test]
     fn test_footer_hints_plan_tab() {
         // Tab 3 is Plan.
-        let text = footer_hint_text(false, false, 3, FocusedInput::None, false, false);
+        let text = footer_hint_text(false, false, 3, FocusedInput::None, false, false, false);
         assert!(text.contains("[PgUp/PgDn] scroll"), "got: {text}");
         assert!(text.contains("[Tab] next tab"), "got: {text}");
         assert!(text.contains("[q] quit"), "got: {text}");
@@ -1545,7 +1595,7 @@ mod tests {
     #[test]
     fn test_footer_hints_agent_activity_tab() {
         // Tab 4 is Agent Activity.
-        let text = footer_hint_text(false, false, 4, FocusedInput::None, false, false);
+        let text = footer_hint_text(false, false, 4, FocusedInput::None, false, false, false);
         assert!(text.contains("[p] steer"), "got: {text}");
         assert!(text.contains("[Enter] send"), "got: {text}");
         assert!(text.contains("[PgUp/PgDn] scroll"), "got: {text}");
@@ -1556,7 +1606,7 @@ mod tests {
 
     #[test]
     fn test_footer_hints_steering_focused() {
-        let text = footer_hint_text(false, false, 4, FocusedInput::Steering, false, false);
+        let text = footer_hint_text(false, false, 4, FocusedInput::Steering, false, false, false);
         assert!(text.contains("[Esc] exit"), "got: {text}");
         assert!(text.contains("[Ctrl+Enter] send"), "got: {text}");
         assert!(text.contains("Editing steering prompt"), "got: {text}");
@@ -1663,7 +1713,7 @@ mod tests {
 
     #[test]
     fn test_footer_hints_review_tab() {
-        let text = footer_hint_text(false, false, 6, FocusedInput::None, false, false);
+        let text = footer_hint_text(false, false, 6, FocusedInput::None, false, false, false);
         assert!(text.contains("[a] approve"), "got: {text}");
         assert!(text.contains("[r] review"), "got: {text}");
         assert!(text.contains("[R] revisions"), "got: {text}");
@@ -1671,15 +1721,27 @@ mod tests {
     }
 
     #[test]
+    fn test_footer_hints_permission_pending() {
+        // When a permission is pending on Tab 4, show approve/reject hints.
+        let text = footer_hint_text(false, false, 4, FocusedInput::None, false, false, true);
+        assert!(text.contains("[y] approve"), "got: {text}");
+        assert!(text.contains("[a] always"), "got: {text}");
+        assert!(text.contains("[n] reject"), "got: {text}");
+        assert!(text.contains("[Tab] next tab"), "got: {text}");
+        // Should NOT show steer hints when permission is pending.
+        assert!(!text.contains("[p] steer"), "got: {text}");
+    }
+
+    #[test]
     fn test_footer_hints_quit_confirm() {
-        let text = footer_hint_text(true, false, 0, FocusedInput::None, false, false);
+        let text = footer_hint_text(true, false, 0, FocusedInput::None, false, false, false);
         assert!(text.contains("[y/Enter]"), "got: {text}");
         assert!(text.contains("[n/Esc]"), "got: {text}");
     }
 
     #[test]
     fn test_footer_hints_malformed_task() {
-        let text = footer_hint_text(false, false, 0, FocusedInput::None, true, false);
+        let text = footer_hint_text(false, false, 0, FocusedInput::None, true, false, false);
         assert!(text.contains("[f] request fix"), "got: {text}");
         assert!(text.contains("[Enter] apply fix"), "got: {text}");
         assert!(text.contains("PgUp/PgDn"), "got: {text}");
@@ -1689,7 +1751,7 @@ mod tests {
 
     #[test]
     fn test_footer_hints_status_picker() {
-        let text = footer_hint_text(false, true, 0, FocusedInput::None, false, false);
+        let text = footer_hint_text(false, true, 0, FocusedInput::None, false, false, false);
         assert!(text.contains("[1-5] select"), "got: {text}");
         assert!(text.contains("[Up/Down] navigate"), "got: {text}");
         assert!(text.contains("[Enter] confirm"), "got: {text}");
@@ -1698,7 +1760,7 @@ mod tests {
 
     #[test]
     fn test_footer_hints_startable_task() {
-        let text = footer_hint_text(false, false, 0, FocusedInput::None, false, true);
+        let text = footer_hint_text(false, false, 0, FocusedInput::None, false, true, false);
         assert!(text.contains("[Enter] start"), "got: {text}");
         assert!(text.contains("[s] status"), "got: {text}");
         assert!(text.contains("PgUp/PgDn"), "got: {text}");
@@ -2020,6 +2082,84 @@ mod tests {
             app.task_store.get(&id).unwrap().status,
             TaskStatus::Completed,
             "task status should be Completed after picker selection"
+        );
+    }
+
+    #[test]
+    fn test_permission_y_emits_once() {
+        use crate::opencode::types::PermissionRequest;
+
+        let mut app = app_with_normal_task();
+        app.active_tab = 4;
+        let id = crate::tasks::TaskId::from_path("tasks/1.1.md");
+        let request = PermissionRequest {
+            id: "perm-1".to_string(),
+            session_id: "sess-1".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["cargo build".to_string()],
+            always: vec![],
+        };
+        app.tab2_state.push_permission(id.clone(), request);
+
+        let result = handle_input(key_event(KeyCode::Char('y'), KeyModifiers::NONE), &mut app);
+        assert!(
+            matches!(
+                result,
+                Some(AppMessage::PermissionResolved { ref response, .. }) if response == "once"
+            ),
+            "expected PermissionResolved with 'once', got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_permission_a_emits_always() {
+        use crate::opencode::types::PermissionRequest;
+
+        let mut app = app_with_normal_task();
+        app.active_tab = 4;
+        let id = crate::tasks::TaskId::from_path("tasks/1.1.md");
+        let request = PermissionRequest {
+            id: "perm-1".to_string(),
+            session_id: "sess-1".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["cargo build".to_string()],
+            always: vec![],
+        };
+        app.tab2_state.push_permission(id.clone(), request);
+
+        let result = handle_input(key_event(KeyCode::Char('a'), KeyModifiers::NONE), &mut app);
+        assert!(
+            matches!(
+                result,
+                Some(AppMessage::PermissionResolved { ref response, .. }) if response == "always"
+            ),
+            "expected PermissionResolved with 'always', got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_permission_n_emits_reject() {
+        use crate::opencode::types::PermissionRequest;
+
+        let mut app = app_with_normal_task();
+        app.active_tab = 4;
+        let id = crate::tasks::TaskId::from_path("tasks/1.1.md");
+        let request = PermissionRequest {
+            id: "perm-1".to_string(),
+            session_id: "sess-1".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["cargo build".to_string()],
+            always: vec![],
+        };
+        app.tab2_state.push_permission(id.clone(), request);
+
+        let result = handle_input(key_event(KeyCode::Char('n'), KeyModifiers::NONE), &mut app);
+        assert!(
+            matches!(
+                result,
+                Some(AppMessage::PermissionResolved { ref response, .. }) if response == "reject"
+            ),
+            "expected PermissionResolved with 'reject', got: {result:?}"
         );
     }
 

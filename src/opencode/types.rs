@@ -137,6 +137,24 @@ pub struct OpenCodeMessage {
     pub parts: Vec<MessagePart>,
 }
 
+/// A pending permission request from OpenCode.
+///
+/// Sent when the agent needs approval to execute a tool operation
+/// (e.g. running a shell command). Resolved via `POST /session/:id/permissions/:id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRequest {
+    /// The permission request ID, used when calling the resolve endpoint.
+    pub id: String,
+    /// The session that owns this request.
+    pub session_id: String,
+    /// The permission type being requested (e.g. "bash").
+    pub permission: String,
+    /// The specific command patterns being requested (e.g. ["cargo build 2>&1"]).
+    pub patterns: Vec<String>,
+    /// Patterns already permanently allowed for this permission type.
+    pub always: Vec<String>,
+}
+
 /// An SSE event emitted by the opencode server during a session.
 ///
 /// Unknown event types received from the server are silently ignored via the
@@ -204,6 +222,19 @@ pub enum OpenCodeEvent {
         session_id: String,
         error: String,
     },
+    /// An OpenCode agent is requesting permission to execute a tool operation.
+    PermissionAsked {
+        session_id: String,
+        request: PermissionRequest,
+    },
+    /// An OpenCode agent asked a question via the `question.asked` SSE event.
+    QuestionAsked {
+        session_id: String,
+        request_id: String,
+        question: String,
+    },
+    /// Session diffs have changed; use as a trigger to poll the diff endpoint.
+    SessionDiff { session_id: String },
     /// An unrecognized event type; ignored gracefully for forward compatibility.
     #[serde(other)]
     Unknown,
@@ -572,6 +603,39 @@ mod tests {
             entry.info.error.as_ref().and_then(|e| e.message.as_deref()),
             Some("agent.model on undefined")
         );
+    }
+
+    // --- PermissionRequest ---
+
+    #[test]
+    fn test_permission_request_deserialize() {
+        let json = r#"{
+            "id": "perm-1",
+            "session_id": "sess-abc",
+            "permission": "bash",
+            "patterns": ["cargo build 2>&1"],
+            "always": ["cargo fmt"]
+        }"#;
+        let req: PermissionRequest = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(req.id, "perm-1");
+        assert_eq!(req.session_id, "sess-abc");
+        assert_eq!(req.permission, "bash");
+        assert_eq!(req.patterns, vec!["cargo build 2>&1"]);
+        assert_eq!(req.always, vec!["cargo fmt"]);
+    }
+
+    #[test]
+    fn test_permission_request_empty_patterns() {
+        let json = r#"{
+            "id": "perm-2",
+            "session_id": "sess-abc",
+            "permission": "write",
+            "patterns": [],
+            "always": []
+        }"#;
+        let req: PermissionRequest = serde_json::from_str(json).expect("deserialize");
+        assert!(req.patterns.is_empty());
+        assert!(req.always.is_empty());
     }
 
     #[test]

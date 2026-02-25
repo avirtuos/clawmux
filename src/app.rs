@@ -443,10 +443,39 @@ impl App {
             } => {
                 self.tab2_state
                     .push_banner(&task_id, format!("[You] {}", answer));
-                // Record the answer on the question model.
-                if let Some(task) = self.task_store.get_mut(&task_id) {
+                // Record the answer and check for OpenCode request ID.
+                let opencode_request_id = if let Some(task) = self.task_store.get_mut(&task_id) {
                     if let Some(q) = task.questions.get_mut(question_index) {
                         q.answer = Some(answer.clone());
+                        q.opencode_request_id.clone()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                // If this question came from OpenCode, send the reply back.
+                if let Some(req_id) = opencode_request_id {
+                    if let Some(client) = self.opencode_client.clone() {
+                        let async_tx = self.async_tx.clone();
+                        let answer_clone = answer.clone();
+                        let task_id_clone = task_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = client.reply_question(&req_id, &answer_clone).await {
+                                tracing::warn!(
+                                    "Failed to reply to OpenCode question {}: {}",
+                                    req_id,
+                                    e
+                                );
+                                let _ = async_tx
+                                    .send(AppMessage::SessionError {
+                                        task_id: task_id_clone,
+                                        session_id: String::new(),
+                                        error: format!("Question reply failed: {}", e),
+                                    })
+                                    .await;
+                            }
+                        });
                     }
                 }
                 // Rebuild answer textareas so the answered question's textarea is removed.
@@ -534,6 +563,7 @@ impl App {
                                 agent,
                                 text: question.clone(),
                                 answer: None,
+                                opencode_request_id: None,
                             });
                         }
                         // Sync answer textareas so the new question gets an input widget.
@@ -824,6 +854,136 @@ impl App {
                     tracing::warn!("Failed to reload task {}: {}", task_id, e);
                 }
                 self.refresh_stories();
+                vec![]
+            }
+
+            // --- Permission handling ---
+            AppMessage::PermissionAsked { task_id, request } => {
+                self.tab2_state.push_banner(
+                    &task_id,
+                    format!("[Permission] {} requested", request.permission),
+                );
+                self.tab2_state.push_permission(task_id, request);
+                vec![]
+            }
+
+            AppMessage::PermissionResolved {
+                task_id,
+                request,
+                response,
+            } => {
+                self.tab2_state.resolve_permission(&task_id);
+                let decision = match response.as_str() {
+                    "once" => "approved once",
+                    "always" => "always allowed",
+                    "reject" => "rejected",
+                    other => other,
+                };
+                self.tab2_state.push_banner(
+                    &task_id,
+                    format!("[Permission] {} {}", request.permission, decision),
+                );
+                let client = match self.opencode_client.clone() {
+                    Some(c) => c,
+                    None => {
+                        tracing::warn!("Cannot resolve permission: OpenCode client unavailable");
+                        return vec![];
+                    }
+                };
+                let async_tx = self.async_tx.clone();
+                let session_id = request.session_id.clone();
+                let permission_id = request.id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = client
+                        .resolve_permission(&session_id, &permission_id, &response)
+                        .await
+                    {
+                        tracing::warn!("Failed to resolve permission {}: {}", permission_id, e);
+                        let _ = async_tx
+                            .send(AppMessage::PermissionAsked {
+                                task_id,
+                                request: crate::opencode::types::PermissionRequest {
+                                    id: permission_id,
+                                    session_id,
+                                    permission: "unknown".to_string(),
+                                    patterns: vec![],
+                                    always: vec![],
+                                },
+                            })
+                            .await;
+                    }
+                });
+                vec![]
+            }
+
+            AppMessage::OpenCodeQuestionAsked {
+                task_id,
+                request_id,
+                question,
+            } => {
+                // Determine which agent is currently running.
+                let agent = self
+                    .workflow_engine
+                    .state(&task_id)
+                    .map(|s| s.current_agent)
+                    .unwrap_or(AgentKind::Intake);
+                // Add the question to the task model with the opencode request ID.
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    task.questions.push(Question {
+                        agent,
+                        text: question.clone(),
+                        answer: None,
+                        opencode_request_id: Some(request_id.clone()),
+                    });
+                }
+                // Sync answer textareas so the new question gets an input widget.
+                if let Some(task) = self.task_store.get(&task_id) {
+                    let task = task.clone();
+                    self.questions_state.sync_answer_inputs(&task);
+                }
+                self.tab2_state.push_banner(
+                    &task_id,
+                    format!(
+                        "{} has a question (see Questions tab)",
+                        agent.display_name()
+                    ),
+                );
+                let mut msgs = self
+                    .workflow_engine
+                    .process(AppMessage::AgentAskedQuestion {
+                        task_id: task_id.clone(),
+                        agent,
+                        question,
+                    });
+                msgs.push(AppMessage::TaskUpdated { task_id });
+                msgs
+            }
+
+            AppMessage::SessionDiffChanged {
+                task_id,
+                session_id,
+            } => {
+                let client = match self.opencode_client.clone() {
+                    Some(c) => c,
+                    None => return vec![],
+                };
+                let async_tx = self.async_tx.clone();
+                tokio::spawn(async move {
+                    match client.get_session_diffs(&session_id).await {
+                        Ok(diffs) => {
+                            let _ = async_tx
+                                .send(AppMessage::DiffReady { task_id, diffs })
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to fetch diffs for session {}: {}",
+                                session_id,
+                                e
+                            );
+                        }
+                    }
+                });
                 vec![]
             }
 
@@ -1609,6 +1769,7 @@ mod tests {
                 agent: AgentKind::Intake,
                 text: "What is the scope?".to_string(),
                 answer: None,
+                opencode_request_id: None,
             }],
             design: None,
             implementation_plan: None,
@@ -1660,11 +1821,13 @@ mod tests {
                     agent: AgentKind::Intake,
                     text: "Q1?".to_string(),
                     answer: None,
+                    opencode_request_id: None,
                 },
                 Question {
                     agent: AgentKind::Intake,
                     text: "Q2?".to_string(),
                     answer: None,
+                    opencode_request_id: None,
                 },
             ],
             design: None,
@@ -1717,6 +1880,7 @@ mod tests {
                 agent: AgentKind::Intake,
                 text: "What is the scope?".to_string(),
                 answer: None,
+                opencode_request_id: None,
             }],
             design: None,
             implementation_plan: None,

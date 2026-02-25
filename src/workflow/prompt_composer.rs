@@ -291,11 +291,13 @@ mod tests {
                     agent: AgentKind::Intake,
                     text: "What is the scope?".to_string(),
                     answer: Some("Full pipeline.".to_string()),
+                    opencode_request_id: None,
                 },
                 Question {
                     agent: AgentKind::Design,
                     text: "Unanswered question.".to_string(),
                     answer: None,
+                    opencode_request_id: None,
                 },
             ],
             design: Some("Use a SectionConfig struct.".to_string()),

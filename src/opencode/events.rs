@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::{ClawdMuxError, Result};
 use crate::messages::AppMessage;
-use crate::opencode::types::{MessagePart, OpenCodeEvent};
+use crate::opencode::types::{MessagePart, OpenCodeEvent, PermissionRequest};
 use crate::tasks::models::TaskId;
 use crate::workflow::agents::AgentKind;
 
@@ -362,6 +362,56 @@ impl EventStreamConsumer {
                     debug!("SessionError for unknown session_id: {}", session_id);
                 }
             }
+            OpenCodeEvent::PermissionAsked {
+                session_id,
+                request,
+            } => {
+                let task_id = {
+                    let map = self.session_map.read().await;
+                    map.get(&session_id).map(|(task_id, _)| task_id.clone())
+                };
+                if let Some(task_id) = task_id {
+                    self.send(AppMessage::PermissionAsked { task_id, request })
+                        .await?;
+                } else {
+                    debug!("PermissionAsked for unknown session_id: {}", session_id);
+                }
+            }
+            OpenCodeEvent::QuestionAsked {
+                session_id,
+                request_id,
+                question,
+            } => {
+                let task_id = {
+                    let map = self.session_map.read().await;
+                    map.get(&session_id).map(|(task_id, _)| task_id.clone())
+                };
+                if let Some(task_id) = task_id {
+                    self.send(AppMessage::OpenCodeQuestionAsked {
+                        task_id,
+                        request_id,
+                        question,
+                    })
+                    .await?;
+                } else {
+                    debug!("QuestionAsked for unknown session_id: {}", session_id);
+                }
+            }
+            OpenCodeEvent::SessionDiff { session_id } => {
+                let task_id = {
+                    let map = self.session_map.read().await;
+                    map.get(&session_id).map(|(task_id, _)| task_id.clone())
+                };
+                if let Some(task_id) = task_id {
+                    self.send(AppMessage::SessionDiffChanged {
+                        task_id,
+                        session_id,
+                    })
+                    .await?;
+                } else {
+                    debug!("SessionDiff for unknown session_id: {}", session_id);
+                }
+            }
             OpenCodeEvent::MessageCreated { .. } => {
                 // Ignored -- redundant with MessageUpdated
             }
@@ -522,6 +572,87 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
                 }
             }
         }
+        "permission.asked" => {
+            let id = props["id"].as_str();
+            let session_id = props["sessionID"]
+                .as_str()
+                .or_else(|| props["sessionId"].as_str());
+            let permission = props["permission"].as_str().unwrap_or("unknown");
+            let patterns: Vec<String> = props["patterns"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let always: Vec<String> = props["always"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            match (id, session_id) {
+                (Some(id), Some(sid)) => OpenCodeEvent::PermissionAsked {
+                    session_id: sid.to_string(),
+                    request: PermissionRequest {
+                        id: id.to_string(),
+                        session_id: sid.to_string(),
+                        permission: permission.to_string(),
+                        patterns,
+                        always,
+                    },
+                },
+                _ => {
+                    warn!("permission.asked missing required fields; props: {}", props);
+                    OpenCodeEvent::Unknown
+                }
+            }
+        }
+        "question.asked" => {
+            let request_id = props["id"]
+                .as_str()
+                .or_else(|| props["requestID"].as_str())
+                .or_else(|| props["requestId"].as_str());
+            let session_id = props["sessionID"]
+                .as_str()
+                .or_else(|| props["sessionId"].as_str());
+            // Question text may be in properties.question, properties.text, or properties.message.
+            let question = props["question"]
+                .as_str()
+                .or_else(|| props["text"].as_str())
+                .or_else(|| props["message"].as_str());
+            match (request_id, session_id, question) {
+                (Some(rid), Some(sid), Some(q)) => OpenCodeEvent::QuestionAsked {
+                    session_id: sid.to_string(),
+                    request_id: rid.to_string(),
+                    question: q.to_string(),
+                },
+                _ => {
+                    warn!("question.asked missing required fields; props: {}", props);
+                    OpenCodeEvent::Unknown
+                }
+            }
+        }
+        "session.diff" => {
+            let session_id = props["sessionID"]
+                .as_str()
+                .or_else(|| props["sessionId"].as_str());
+            match session_id {
+                Some(sid) => {
+                    debug!("SSE session.diff: session_id={}", sid);
+                    OpenCodeEvent::SessionDiff {
+                        session_id: sid.to_string(),
+                    }
+                }
+                None => {
+                    warn!("session.diff missing session id: {}", json_data);
+                    OpenCodeEvent::Unknown
+                }
+            }
+        }
         // Known events we intentionally do not act on.
         // message.updated and message.part.updated are superseded by message.part.delta
         // (OpenCode >= 1.2). Ignoring them prevents accumulated delta text from being
@@ -532,14 +663,13 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
         | "project.updated"
         | "message.created"
         | "session.status"
-        | "session.diff"
         | "message.updated"
         | "message.part.updated" => {
-            debug!("SSE event '{}': ignoring", event_type);
+            debug!("SSE event '{}': ignoring (props: {})", event_type, props);
             OpenCodeEvent::Unknown
         }
         _ => {
-            info!("Unhandled SSE event type '{}': {}", event_type, props);
+            warn!("Unhandled SSE event type '{}': {}", event_type, props);
             OpenCodeEvent::Unknown
         }
     }
@@ -1222,14 +1352,169 @@ mod tests {
         );
     }
 
-    /// Verifies that session.diff is treated as a known-ignored event.
+    /// Verifies that session.diff now produces a SessionDiff event.
     #[test]
-    fn test_parse_wire_event_session_diff_ignored() {
+    fn test_parse_wire_event_session_diff_routes() {
         let json = r#"{"payload":{"type":"session.diff","properties":{"sessionID":"ses_abc"}}}"#;
         let event = parse_wire_event(json);
         assert!(
+            matches!(event, OpenCodeEvent::SessionDiff { ref session_id } if session_id == "ses_abc"),
+            "session.diff should produce SessionDiff, got: {event:?}"
+        );
+    }
+
+    /// Verifies that permission.asked is parsed to PermissionAsked.
+    #[test]
+    fn test_parse_permission_asked() {
+        let json = r#"{"payload":{"type":"permission.asked","properties":{"id":"perm-1","sessionID":"ses_abc","permission":"bash","patterns":["cargo build 2>&1"],"always":[]}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(
+                &event,
+                OpenCodeEvent::PermissionAsked { ref session_id, ref request }
+                    if session_id == "ses_abc"
+                    && request.id == "perm-1"
+                    && request.permission == "bash"
+                    && request.patterns == vec!["cargo build 2>&1"]
+            ),
+            "unexpected: {event:?}"
+        );
+    }
+
+    /// Verifies that permission.asked with missing fields returns Unknown.
+    #[test]
+    fn test_parse_permission_asked_missing_fields() {
+        let json =
+            r#"{"payload":{"type":"permission.asked","properties":{"sessionID":"ses_abc"}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
             matches!(event, OpenCodeEvent::Unknown),
-            "session.diff should return Unknown, got: {event:?}"
+            "expected Unknown when id missing, got: {event:?}"
+        );
+    }
+
+    /// Verifies that question.asked is parsed to QuestionAsked.
+    #[test]
+    fn test_parse_question_asked() {
+        let json = r#"{"payload":{"type":"question.asked","properties":{"id":"req-1","sessionID":"ses_abc","question":"What is the target environment?"}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(
+                &event,
+                OpenCodeEvent::QuestionAsked { ref session_id, ref request_id, ref question }
+                    if session_id == "ses_abc"
+                    && request_id == "req-1"
+                    && question == "What is the target environment?"
+            ),
+            "unexpected: {event:?}"
+        );
+    }
+
+    /// Verifies that question.asked with missing fields returns Unknown.
+    #[test]
+    fn test_parse_question_asked_missing_fields() {
+        let json = r#"{"payload":{"type":"question.asked","properties":{"sessionID":"ses_abc"}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "expected Unknown when question missing, got: {event:?}"
+        );
+    }
+
+    /// Verifies that handle_event routes PermissionAsked to AppMessage::PermissionAsked.
+    #[tokio::test]
+    async fn test_handle_permission_asked_routes_to_app() {
+        use crate::opencode::types::PermissionRequest;
+
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-abc".to_string(),
+                (task_id.clone(), AgentKind::Implementation),
+            );
+        }
+
+        let request = PermissionRequest {
+            id: "perm-1".to_string(),
+            session_id: "sess-abc".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["cargo build".to_string()],
+            always: vec![],
+        };
+
+        consumer
+            .handle_event(OpenCodeEvent::PermissionAsked {
+                session_id: "sess-abc".to_string(),
+                request: request.clone(),
+            })
+            .await
+            .expect("handle_event");
+
+        let msg = rx.try_recv().expect("PermissionAsked message");
+        assert!(
+            matches!(&msg, AppMessage::PermissionAsked { task_id: ref tid, request: ref r }
+                if *tid == task_id && r.id == "perm-1"),
+            "unexpected: {msg:?}"
+        );
+    }
+
+    /// Verifies that handle_event routes QuestionAsked to AppMessage::OpenCodeQuestionAsked.
+    #[tokio::test]
+    async fn test_handle_question_asked_routes_to_app() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-abc".to_string(),
+                (task_id.clone(), AgentKind::Implementation),
+            );
+        }
+
+        consumer
+            .handle_event(OpenCodeEvent::QuestionAsked {
+                session_id: "sess-abc".to_string(),
+                request_id: "req-1".to_string(),
+                question: "What is the target environment?".to_string(),
+            })
+            .await
+            .expect("handle_event");
+
+        let msg = rx.try_recv().expect("OpenCodeQuestionAsked message");
+        assert!(
+            matches!(&msg, AppMessage::OpenCodeQuestionAsked { ref request_id, ref question, .. }
+                if request_id == "req-1" && question == "What is the target environment?"),
+            "unexpected: {msg:?}"
+        );
+    }
+
+    /// Verifies that SessionDiff routes to AppMessage::SessionDiffChanged.
+    #[tokio::test]
+    async fn test_handle_session_diff_routes_to_app() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-abc".to_string(),
+                (task_id.clone(), AgentKind::Implementation),
+            );
+        }
+
+        consumer
+            .handle_event(OpenCodeEvent::SessionDiff {
+                session_id: "sess-abc".to_string(),
+            })
+            .await
+            .expect("handle_event");
+
+        let msg = rx.try_recv().expect("SessionDiffChanged message");
+        assert!(
+            matches!(&msg, AppMessage::SessionDiffChanged { ref session_id, .. }
+                if session_id == "sess-abc"),
+            "unexpected: {msg:?}"
         );
     }
 
