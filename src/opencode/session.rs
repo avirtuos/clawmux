@@ -180,6 +180,55 @@ impl OpenCodeClient {
         Ok(statuses)
     }
 
+    /// Resolves a pending permission request from an OpenCode agent.
+    ///
+    /// Sends `POST /session/{session_id}/permissions/{permission_id}` with a response
+    /// of `"once"`, `"always"`, or `"reject"`.
+    ///
+    /// # Arguments
+    ///
+    /// * `session_id` - The ID of the session that owns the permission request.
+    /// * `permission_id` - The ID of the permission request to resolve.
+    /// * `response` - One of `"once"`, `"always"`, or `"reject"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClawdMuxError::Http`] on transport failure or [`ClawdMuxError::Api`]
+    /// on a non-2xx response.
+    pub async fn resolve_permission(
+        &self,
+        session_id: &str,
+        permission_id: &str,
+        response: &str,
+    ) -> Result<()> {
+        let path = format!("/session/{session_id}/permissions/{permission_id}");
+        let body = serde_json::json!({ "response": response });
+        let resp = self.request(Method::POST, &path).json(&body).send().await?;
+        self.check_response(resp).await?;
+        Ok(())
+    }
+
+    /// Sends an answer to an OpenCode `question.asked` request.
+    ///
+    /// Sends `POST /question/{request_id}/reply` with the answer text.
+    ///
+    /// # Arguments
+    ///
+    /// * `request_id` - The ID of the question request to reply to.
+    /// * `answer` - The human-provided answer text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClawdMuxError::Http`] on transport failure or [`ClawdMuxError::Api`]
+    /// on a non-2xx response.
+    pub async fn reply_question(&self, request_id: &str, answer: &str) -> Result<()> {
+        let path = format!("/question/{request_id}/reply");
+        let body = serde_json::json!({ "answers": [[answer]] });
+        let resp = self.request(Method::POST, &path).json(&body).send().await?;
+        self.check_response(resp).await?;
+        Ok(())
+    }
+
     /// Retrieves all messages for a session.
     ///
     /// Sends `GET /session/{session_id}/message` and returns the message list.
@@ -487,6 +536,78 @@ mod tests {
             messages[1].info.role,
             crate::opencode::types::MessageRole::Assistant
         );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_resolve_permission_once() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/session/sess-1/permissions/perm-1")
+            .match_body(r#"{"response":"once"}"#)
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        client
+            .resolve_permission("sess-1", "perm-1", "once")
+            .await
+            .expect("should succeed");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_resolve_permission_always() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/session/sess-1/permissions/perm-2")
+            .match_body(r#"{"response":"always"}"#)
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        client
+            .resolve_permission("sess-1", "perm-2", "always")
+            .await
+            .expect("should succeed");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_resolve_permission_reject() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/session/sess-1/permissions/perm-3")
+            .match_body(r#"{"response":"reject"}"#)
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        client
+            .resolve_permission("sess-1", "perm-3", "reject")
+            .await
+            .expect("should succeed");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_reply_question() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/question/req-1/reply")
+            .match_body(r#"{"answers":[["The answer."]]}"#)
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let client = make_client(&server.url());
+        client
+            .reply_question("req-1", "The answer.")
+            .await
+            .expect("should succeed");
         mock.assert_async().await;
     }
 

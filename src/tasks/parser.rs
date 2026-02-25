@@ -347,6 +347,7 @@ fn parse_questions(body: &str, file: &str) -> crate::error::Result<Vec<Question>
                 agent,
                 text,
                 answer,
+                opencode_request_id: None,
             });
         }
         i += 1;

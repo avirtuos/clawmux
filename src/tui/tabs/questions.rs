@@ -261,6 +261,7 @@ mod tests {
             agent: AgentKind::Intake,
             text: text.to_string(),
             answer: answer.map(|s| s.to_string()),
+            opencode_request_id: None,
         }
     }
 

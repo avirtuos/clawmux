@@ -6,7 +6,7 @@
 
 use crossterm::event::Event;
 
-use crate::opencode::types::{FileDiff, MessagePart};
+use crate::opencode::types::{FileDiff, MessagePart, PermissionRequest};
 use crate::tasks::models::TaskId;
 use crate::workflow::agents::AgentKind;
 
@@ -128,6 +128,30 @@ pub enum AppMessage {
     },
     /// Requests the OpenCode client to abort an active session.
     AbortSession { task_id: TaskId, session_id: String },
+
+    // --- Permission events ---
+    /// An OpenCode agent is requesting permission for a tool operation.
+    PermissionAsked {
+        task_id: TaskId,
+        request: PermissionRequest,
+    },
+    /// The human has resolved a pending permission request.
+    PermissionResolved {
+        task_id: TaskId,
+        request: PermissionRequest,
+        /// One of "once", "always", or "reject".
+        response: String,
+    },
+    /// An OpenCode agent asked a question via the `question.asked` SSE event.
+    ///
+    /// Wired into the existing Questions tab (Tab 1).
+    OpenCodeQuestionAsked {
+        task_id: TaskId,
+        request_id: String,
+        question: String,
+    },
+    /// OpenCode reported that session diffs changed; poll the diff endpoint.
+    SessionDiffChanged { task_id: TaskId, session_id: String },
 
     // --- Diff events ---
     /// Carries file diffs fetched from the opencode `/session/:id/diff` endpoint.

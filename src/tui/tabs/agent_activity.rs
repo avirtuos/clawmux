@@ -8,13 +8,14 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use tui_textarea::TextArea;
 
-use crate::opencode::types::MessagePart;
+use crate::opencode::types::{MessagePart, PermissionRequest};
 use crate::tasks::TaskId;
 
 /// Maximum number of buffer entries per task before old entries are trimmed.
@@ -29,6 +30,21 @@ pub enum ActivityLine {
     ToolActivity { tool: String, status: String },
     /// A banner message from the agent (e.g. session start/complete).
     AgentBanner { message: String },
+    /// A pending or resolved permission request from the agent.
+    PermissionRequest {
+        /// The permission request ID (used to resolve the permission via the API).
+        #[allow(dead_code)]
+        id: String,
+        /// The permission type (e.g. "bash").
+        permission: String,
+        /// The specific command patterns being requested.
+        patterns: Vec<String>,
+        /// Patterns already permanently allowed (stored for display/future use).
+        #[allow(dead_code)]
+        always: Vec<String>,
+        /// Whether the user has already responded to this request.
+        resolved: bool,
+    },
 }
 
 /// An entry in a task's per-task activity buffer.
@@ -82,11 +98,25 @@ pub struct Tab2State {
     /// Unlike `prompt_sent_at`/`active_agent` which are cleared on first `StreamingUpdate`,
     /// this persists through streaming and is only cleared when the session truly ends.
     thinking_tasks: HashMap<TaskId, (Instant, String)>,
+    /// Steering prompt textarea for injecting guidance to the active agent.
+    pub steering_input: TextArea<'static>,
+    /// Whether the steering textarea currently has keyboard focus.
+    pub steering_focused: bool,
+    /// The currently pending permission request for the displayed task, if any.
+    ///
+    /// Set when a `PermissionAsked` message arrives; cleared when the user responds.
+    pub pending_permission: Option<(TaskId, PermissionRequest)>,
 }
 
 impl Tab2State {
     /// Creates a new `Tab2State` with empty buffers and no task selected.
     pub fn new() -> Self {
+        let mut steering_input = TextArea::default();
+        steering_input.set_block(
+            Block::default()
+                .title("Steering Prompt")
+                .borders(Borders::ALL),
+        );
         Tab2State {
             buffers: HashMap::new(),
             scroll_offset: 0,
@@ -96,6 +126,9 @@ impl Tab2State {
             prompt_sent_at: HashMap::new(),
             active_agent: HashMap::new(),
             thinking_tasks: HashMap::new(),
+            steering_input,
+            steering_focused: false,
+            pending_permission: None,
         }
     }
 
@@ -343,6 +376,89 @@ impl Tab2State {
     fn scroll_to_bottom(&mut self, _task_id: &TaskId) {
         self.follow_tail = true;
     }
+
+    /// Returns whether an agent is actively working on the given task.
+    ///
+    /// Based on the `thinking_tasks` map which persists from prompt-sent to session completion.
+    pub fn is_agent_active(&self, task_id: &TaskId) -> bool {
+        self.thinking_tasks.contains_key(task_id)
+    }
+
+    /// Sets the steering textarea to the focused (yellow border) style.
+    pub fn set_steering_focused_style(&mut self) {
+        self.steering_input.set_block(
+            Block::default()
+                .title("Steering Prompt")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+    }
+
+    /// Sets the steering textarea to the unfocused (default border) style.
+    pub fn set_steering_unfocused_style(&mut self) {
+        self.steering_input.set_block(
+            Block::default()
+                .title("Steering Prompt")
+                .borders(Borders::ALL),
+        );
+    }
+
+    /// Stores a pending permission request and appends a `PermissionRequest` activity line.
+    ///
+    /// Call this when a `PermissionAsked` message is received. The pending permission
+    /// is stored so keybinding handlers can reference it, and a UI line is added to the
+    /// activity buffer for the task.
+    pub fn push_permission(&mut self, task_id: TaskId, request: PermissionRequest) {
+        let line = ActivityLine::PermissionRequest {
+            id: request.id.clone(),
+            permission: request.permission.clone(),
+            patterns: request.patterns.clone(),
+            always: request.always.clone(),
+            resolved: false,
+        };
+        let buffer = self.buffers.entry(task_id.clone()).or_default();
+        buffer.push(BufferEntry::Banner(line));
+        self.trim_buffer(&task_id);
+        if self.current_task_id.as_ref() == Some(&task_id) {
+            self.scroll_to_bottom(&task_id);
+        }
+        self.pending_permission = Some((task_id, request));
+    }
+
+    /// Clears the pending permission request and marks the activity line as resolved.
+    ///
+    /// Call this after the user has responded to a permission request. This updates
+    /// the existing `PermissionRequest` activity line to show `resolved: true`.
+    pub fn resolve_permission(&mut self, task_id: &TaskId) {
+        self.pending_permission = None;
+        if let Some(buffer) = self.buffers.get_mut(task_id) {
+            // Mark the last unresolved PermissionRequest line as resolved.
+            for entry in buffer.iter_mut().rev() {
+                if let BufferEntry::Banner(ActivityLine::PermissionRequest {
+                    ref mut resolved,
+                    ..
+                }) = entry
+                {
+                    if !*resolved {
+                        *resolved = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resets the steering textarea to empty with unfocused style.
+    pub fn reset_steering(&mut self) {
+        let mut ta = TextArea::default();
+        ta.set_block(
+            Block::default()
+                .title("Steering Prompt")
+                .borders(Borders::ALL),
+        );
+        self.steering_input = ta;
+        self.steering_focused = false;
+    }
 }
 
 impl Default for Tab2State {
@@ -544,6 +660,47 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ))],
+            ActivityLine::PermissionRequest {
+                permission,
+                patterns,
+                resolved,
+                ..
+            } => {
+                let mut result = vec![Line::from(vec![
+                    Span::styled(
+                        "[Permission Request] ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        permission,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])];
+                for pattern in &patterns {
+                    result.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(format!("cmd: {pattern}"), Style::default().fg(Color::White)),
+                    ]));
+                }
+                if resolved {
+                    result.push(Line::from(Span::styled(
+                        "  (resolved)",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    result.push(Line::from(Span::styled(
+                        "  [y] approve once | [a] always allow | [n] reject",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                }
+                result
+            }
         })
         .collect();
 
@@ -556,10 +713,25 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
         )));
     }
 
+    // Determine whether the steering textarea should be shown.
+    let show_steering = state.is_agent_active(task_id);
+
+    // Compute the activity area: when steering is shown, split off 6 rows at the bottom
+    // (4 text rows + 2 border rows). When not shown, use the full area.
+    let (activity_area, steering_area_opt) = if show_steering {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(6)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
+
     // Compute the effective scroll offset using visual (wrapped) line counts.
     // Subtract 2 from each dimension to account for the surrounding border.
-    let content_width = area.width.saturating_sub(2);
-    let viewport_height = area.height.saturating_sub(2) as usize;
+    let content_width = activity_area.width.saturating_sub(2);
+    let viewport_height = activity_area.height.saturating_sub(2) as usize;
     let total_visual = visual_line_count(&lines, content_width);
     let max_scroll = total_visual.saturating_sub(viewport_height);
     state.last_max_scroll.set(max_scroll);
@@ -575,7 +747,11 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
         .wrap(Wrap { trim: false })
         .scroll((effective_scroll as u16, 0));
 
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, activity_area);
+
+    if let Some(steering_area) = steering_area_opt {
+        frame.render_widget(&state.steering_input, steering_area);
+    }
 }
 
 #[cfg(test)]
@@ -1059,6 +1235,106 @@ mod tests {
         assert!(
             state.any_thinking_status().is_none(),
             "any_thinking_status should be None after clear_thinking"
+        );
+    }
+
+    /// Verifies that is_agent_active returns true when an agent is active for the task.
+    #[test]
+    fn test_tab2_steering_textarea_visible_when_active() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.set_awaiting_response(&id, "Intake Agent".to_string());
+        assert!(
+            state.is_agent_active(&id),
+            "is_agent_active should return true when thinking_tasks has an entry"
+        );
+    }
+
+    /// Verifies that is_agent_active returns false when no agent is active for the task.
+    #[test]
+    fn test_tab2_steering_textarea_hidden_when_idle() {
+        let state = Tab2State::new();
+        let id = task_id();
+        assert!(
+            !state.is_agent_active(&id),
+            "is_agent_active should return false with no thinking_tasks entry"
+        );
+    }
+
+    /// Verifies that push_permission stores the pending permission and adds an activity line.
+    #[test]
+    fn test_push_permission_adds_activity_line() {
+        use crate::opencode::types::PermissionRequest;
+
+        let mut state = Tab2State::new();
+        let id = task_id();
+        let request = PermissionRequest {
+            id: "perm-1".to_string(),
+            session_id: "sess-abc".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["cargo build".to_string()],
+            always: vec![],
+        };
+        state.push_permission(id.clone(), request.clone());
+
+        // The pending permission should be stored.
+        assert!(
+            state.pending_permission.is_some(),
+            "pending_permission should be set after push_permission"
+        );
+        let (stored_task_id, stored_req) = state.pending_permission.as_ref().unwrap();
+        assert_eq!(*stored_task_id, id);
+        assert_eq!(stored_req.id, "perm-1");
+
+        // An activity line should have been added.
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), 1, "one activity line should be added");
+        assert!(
+            matches!(
+                &lines[0],
+                ActivityLine::PermissionRequest { id, permission, resolved, .. }
+                    if id == "perm-1" && permission == "bash" && !resolved
+            ),
+            "activity line should be an unresolved PermissionRequest, got: {:?}",
+            lines[0]
+        );
+    }
+
+    /// Verifies that resolve_permission clears the pending permission and marks the line resolved.
+    #[test]
+    fn test_resolve_permission_marks_resolved() {
+        use crate::opencode::types::PermissionRequest;
+
+        let mut state = Tab2State::new();
+        let id = task_id();
+        let request = PermissionRequest {
+            id: "perm-1".to_string(),
+            session_id: "sess-abc".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["cargo build".to_string()],
+            always: vec![],
+        };
+        state.push_permission(id.clone(), request);
+        assert!(state.pending_permission.is_some());
+
+        state.resolve_permission(&id);
+
+        // Pending permission should be cleared.
+        assert!(
+            state.pending_permission.is_none(),
+            "pending_permission should be None after resolve_permission"
+        );
+
+        // The activity line should be marked as resolved.
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            matches!(
+                &lines[0],
+                ActivityLine::PermissionRequest { resolved, .. } if *resolved
+            ),
+            "activity line should be resolved, got: {:?}",
+            lines[0]
         );
     }
 

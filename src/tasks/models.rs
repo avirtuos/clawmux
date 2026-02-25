@@ -113,6 +113,9 @@ pub struct Question {
     pub text: String,
     /// The human-provided answer, if one has been given.
     pub answer: Option<String>,
+    /// If this question came from an OpenCode `question.asked` event,
+    /// the request ID needed to reply via the OpenCode API.
+    pub opencode_request_id: Option<String>,
 }
 
 /// A single entry in the task's work log.

@@ -576,6 +576,7 @@ mod tests {
             agent: crate::workflow::agents::AgentKind::Intake,
             text: "What is scope?".to_string(),
             answer: None,
+            opencode_request_id: None,
         });
         let state = Tab1State::new();
 

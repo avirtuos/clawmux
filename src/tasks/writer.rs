@@ -230,6 +230,7 @@ A1: Lets use rust, it is well suited to this.
                 agent: AgentKind::Intake,
                 text: "What is your name?".to_string(),
                 answer: Some("Alice.".to_string()),
+                opencode_request_id: None,
             }],
             design: Some("Design notes.".to_string()),
             implementation_plan: Some("Plan notes.".to_string()),
@@ -371,16 +372,19 @@ bar content
                 agent: AgentKind::Intake,
                 text: "First?".to_string(),
                 answer: Some("Yes.".to_string()),
+                opencode_request_id: None,
             },
             Question {
                 agent: AgentKind::Design,
                 text: "Second?".to_string(),
                 answer: Some("No.".to_string()),
+                opencode_request_id: None,
             },
             Question {
                 agent: AgentKind::Planning,
                 text: "Third?".to_string(),
                 answer: None,
+                opencode_request_id: None,
             },
         ];
 
