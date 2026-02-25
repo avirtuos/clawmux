@@ -1,6 +1,6 @@
 //! Tab bar and tab dispatch.
 //!
-//! Renders the 5-tab right pane (Details, Questions, Agent Activity, Team Status, Review)
+//! Renders the 7-tab right pane (Details, Questions, Design, Plan, Agent Activity, Team Status, Review)
 //! and dispatches input events to the currently active tab.
 
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -12,11 +12,13 @@ use crate::app::App;
 
 pub mod agent_activity;
 pub mod code_review;
+pub mod design;
+pub mod plan;
 pub mod questions;
 pub mod task_details;
 pub mod team_status;
 
-/// Returns tab titles for the five right-pane tabs.
+/// Returns tab titles for the seven right-pane tabs.
 ///
 /// Appends `*` to "Questions" when the selected task has any unanswered questions,
 /// so the user can see at a glance that input is needed.
@@ -34,6 +36,8 @@ pub fn tab_titles(app: &App) -> Vec<&'static str> {
         } else {
             "Questions"
         },
+        "Design",
+        "Plan",
         "Agent Activity",
         "Team Status",
         "Review",
@@ -84,16 +88,24 @@ pub fn render(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             questions::render(frame, content_area, task, &app.questions_state);
         }
         2 => {
+            let task = app.selected_task().and_then(|id| app.task_store.get(id));
+            design::render(frame, content_area, task, &app.design_state);
+        }
+        3 => {
+            let task = app.selected_task().and_then(|id| app.task_store.get(id));
+            plan::render(frame, content_area, task, &app.plan_state);
+        }
+        4 => {
             let task_id = app.selected_task();
             agent_activity::render(frame, content_area, task_id, &app.tab2_state);
         }
-        3 => {
+        5 => {
             let task_id = app.selected_task();
             let task = task_id.and_then(|id| app.task_store.get(id));
             let wf_state = task_id.and_then(|id| app.workflow_engine.state(id));
             team_status::render(frame, content_area, task, wf_state, &app.tab3_state);
         }
-        4 => {
+        6 => {
             let task_id = app.selected_task();
             code_review::render(frame, content_area, task_id, &app.tab4_state);
         }
@@ -117,7 +129,7 @@ mod tests {
     use crate::app::App;
 
     #[test]
-    fn test_tab_bar_renders_five_tabs() {
+    fn test_tab_bar_renders_seven_tabs() {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::test_default();
@@ -142,6 +154,14 @@ mod tests {
         assert!(
             content.contains("Questions"),
             "Buffer should contain 'Questions' tab label"
+        );
+        assert!(
+            content.contains("Design"),
+            "Buffer should contain 'Design' tab label"
+        );
+        assert!(
+            content.contains("Plan"),
+            "Buffer should contain 'Plan' tab label"
         );
         assert!(
             content.contains("Agent Activity"),
