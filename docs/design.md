@@ -394,6 +394,7 @@ pub enum AppMessage {
 
     // --- Workflow commands ---
     StartTask { task_id: TaskId },
+    ResumeTask { task_id: TaskId },
     AgentCompleted { task_id: TaskId, agent: AgentKind, summary: String },
     AgentKickedBack { task_id: TaskId, from: AgentKind, to: AgentKind, reason: String },
     AgentAskedQuestion { task_id: TaskId, agent: AgentKind, question: String },
@@ -475,6 +476,21 @@ approval_gate = false
 ```
 
 When disabled, the pipeline advances automatically without pausing between agents (original behavior).
+
+### Resume Interrupted Tasks
+
+When a task is interrupted — by a session error or an app crash/restart — it is left in `InProgress` with no active pipeline. Pressing **Enter** on an `InProgress` task in Tab 0 re-enters the pipeline at the correct agent without discarding history.
+
+**Agent resolution priority (highest first):**
+1. **Workflow engine `Errored` state** — if the engine has an `Errored` entry for the task, use `current_agent` (the agent that was running when the error occurred).
+2. **Task's `assigned_to` field** — if no workflow state exists (crash scenario), use the persisted agent, excluding `Human`.
+3. **Fallback** — `AgentKind::Intake`.
+
+**Implementation:**
+- `AppMessage::ResumeTask { task_id }` — new workflow command dispatched by the Enter key handler on `InProgress` tasks.
+- `WorkflowEngine::resume(task_id, agent)` — creates a fresh `WorkflowState` in `Running` phase at the resolved agent, overwriting any prior state, and emits `CreateSession` with `context: Some("Task resumed")`.
+- `App::handle_message(ResumeTask)` — resolves the agent, updates `assigned_to`, logs the resumption to the work log, calls `resume()`, and appends `TaskUpdated`.
+- Footer hint shows `[Enter] resume` when an `InProgress` (non-malformed) task is selected on Tab 0.
 
 **Implementation:**
 - `WorkflowPhase::AwaitingApproval { next_agent: AgentKind, context: Option<String> }` -- new phase variant

@@ -31,6 +31,8 @@ pub enum AppMessage {
     // --- Workflow commands ---
     /// Instructs the workflow engine to begin processing the given task.
     StartTask { task_id: TaskId },
+    /// Instructs the workflow engine to resume a previously interrupted task.
+    ResumeTask { task_id: TaskId },
     /// Signals that an agent has finished its work on a task.
     AgentCompleted {
         task_id: TaskId,

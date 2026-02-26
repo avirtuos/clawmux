@@ -94,6 +94,32 @@ impl WorkflowEngine {
         self.states.get(task_id)
     }
 
+    /// Resumes a previously interrupted task at the specified agent.
+    ///
+    /// Creates a fresh `WorkflowState` in the `Running` phase at `agent`,
+    /// overwriting any existing state (including `Errored`). Returns a
+    /// `CreateSession` message to restart the agent.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - The task to resume.
+    /// * `agent` - The agent at which to resume the pipeline.
+    pub fn resume(&mut self, task_id: TaskId, agent: AgentKind) -> Vec<AppMessage> {
+        let state = WorkflowState {
+            task_id: task_id.clone(),
+            current_agent: agent,
+            session_id: None,
+            phase: WorkflowPhase::Running,
+        };
+        self.states.insert(task_id.clone(), state);
+        vec![AppMessage::CreateSession {
+            task_id,
+            agent,
+            prompt: String::new(),
+            context: Some("Task resumed".to_string()),
+        }]
+    }
+
     /// Applies a message to the engine, mutating state and returning side effects.
     ///
     /// The returned `Vec<AppMessage>` contains zero or more messages that the
@@ -861,6 +887,70 @@ mod tests {
             WorkflowPhase::PendingReview,
             "should be PendingReview, not AwaitingApproval"
         );
+    }
+
+    // --- Resume tests ---
+
+    #[test]
+    fn test_resume_creates_session_at_specified_agent() {
+        let mut engine = WorkflowEngine::new(false);
+        let tid = task("6.1");
+        let msgs = engine.resume(tid.clone(), AgentKind::Implementation);
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            matches!(
+                &msgs[0],
+                AppMessage::CreateSession { agent, .. } if *agent == AgentKind::Implementation
+            ),
+            "resume should emit CreateSession for the specified agent"
+        );
+        let state = engine.state(&tid).expect("state should exist after resume");
+        assert_eq!(state.current_agent, AgentKind::Implementation);
+        assert_eq!(state.phase, WorkflowPhase::Running);
+        assert!(state.session_id.is_none());
+    }
+
+    #[test]
+    fn test_resume_replaces_errored_state() {
+        let mut engine = WorkflowEngine::new(false);
+        let tid = task("6.1");
+        // Put the engine into Errored state.
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+        engine.process(AppMessage::SessionError {
+            task_id: tid.clone(),
+            session_id: "s1".to_string(),
+            error: "boom".to_string(),
+        });
+        let errored = engine.state(&tid).expect("state");
+        assert!(matches!(errored.phase, WorkflowPhase::Errored { .. }));
+        // Resume should overwrite the Errored state.
+        let msgs = engine.resume(tid.clone(), AgentKind::Design);
+        assert_eq!(msgs.len(), 1);
+        let state = engine.state(&tid).expect("state after resume");
+        assert_eq!(state.current_agent, AgentKind::Design);
+        assert_eq!(state.phase, WorkflowPhase::Running);
+    }
+
+    #[test]
+    fn test_resume_at_intake_when_no_prior_state() {
+        let mut engine = WorkflowEngine::new(false);
+        let tid = task("6.1");
+        // No prior state exists (simulates app crash scenario with fallback to Intake).
+        let msgs = engine.resume(tid.clone(), AgentKind::Intake);
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            matches!(
+                &msgs[0],
+                AppMessage::CreateSession { agent, context: Some(ctx), .. }
+                    if *agent == AgentKind::Intake && ctx.contains("resumed")
+            ),
+            "resume should emit CreateSession for Intake with resumed context"
+        );
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(state.current_agent, AgentKind::Intake);
+        assert_eq!(state.phase, WorkflowPhase::Running);
     }
 
     #[test]
