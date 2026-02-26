@@ -643,6 +643,42 @@ impl Default for Tab2State {
     }
 }
 
+/// Unescapes common JSON string escape sequences so streaming agent text is readable.
+///
+/// Agent responses are formatted as JSON, so their streaming text contains literal
+/// escape sequences (`\n`, `\t`, `\"`, `\\`) instead of the actual characters.
+/// Replacing these before rendering produces proper line breaks and readable output.
+fn unescape_streaming_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some(&'n') => {
+                    chars.next();
+                    out.push('\n');
+                }
+                Some(&'t') => {
+                    chars.next();
+                    out.push('\t');
+                }
+                Some(&'"') => {
+                    chars.next();
+                    out.push('"');
+                }
+                Some(&'\\') => {
+                    chars.next();
+                    out.push('\\');
+                }
+                _ => out.push(c),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Renders the Agent Activity tab into `area`.
 ///
 /// Displays a placeholder when no task is selected. When a task is selected,
@@ -670,7 +706,7 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
     let mut lines: Vec<Line> = activity_lines
         .into_iter()
         .flat_map(|line| match line {
-            ActivityLine::Text { content } => markdown_to_lines(&content),
+            ActivityLine::Text { content } => markdown_to_lines(&unescape_streaming_text(&content)),
             ActivityLine::ToolActivity {
                 tool,
                 status,
@@ -1790,6 +1826,51 @@ mod tests {
         assert!(
             state.get_tokens(&task2).is_none(),
             "task2 should have no tokens"
+        );
+    }
+
+    // --- unescape_streaming_text tests ---
+
+    #[test]
+    fn test_unescape_newline() {
+        assert_eq!(unescape_streaming_text("line1\\nline2"), "line1\nline2");
+    }
+
+    #[test]
+    fn test_unescape_tab() {
+        assert_eq!(unescape_streaming_text("a\\tb"), "a\tb");
+    }
+
+    #[test]
+    fn test_unescape_quote() {
+        assert_eq!(unescape_streaming_text("say \\\"hi\\\""), "say \"hi\"");
+    }
+
+    #[test]
+    fn test_unescape_backslash() {
+        assert_eq!(unescape_streaming_text("a\\\\b"), "a\\b");
+    }
+
+    #[test]
+    fn test_unescape_plain_text_unchanged() {
+        let s = "hello world, no escapes here.";
+        assert_eq!(unescape_streaming_text(s), s);
+    }
+
+    #[test]
+    fn test_unescape_json_response_fragment() {
+        // Raw string: \n here is literally backslash + n (the JSON escape sequence).
+        let input = r#"{"summary":"done\nstep two","updates":null}"#;
+        let result = unescape_streaming_text(input);
+        // After unescaping, the two-char \n should be a real newline.
+        assert!(
+            result.contains("done\nstep two"),
+            "\\n should become newline"
+        );
+        // The literal backslash-n sequence should no longer appear.
+        assert!(
+            !result.contains("\\n"),
+            "literal \\n should be gone after unescaping"
         );
     }
 
