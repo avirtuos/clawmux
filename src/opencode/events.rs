@@ -363,12 +363,17 @@ impl EventStreamConsumer {
                         .unwrap_or_default();
                     self.accumulated_deltas
                         .retain(|(sid, _), _| *sid != session_id);
+                    // Clone before move into message so we can remove from the map after send.
+                    let sid_for_cleanup = session_id.clone();
                     self.send(AppMessage::SessionCompleted {
                         task_id,
                         session_id,
                         response_text,
                     })
                     .await?;
+                    // Remove the session so child-session completions that arrive later
+                    // are not mistaken for the primary session.
+                    self.session_map.write().await.remove(&sid_for_cleanup);
                 } else {
                     debug!("SessionCompleted for unknown session_id: {}", session_id);
                 }
@@ -383,12 +388,16 @@ impl EventStreamConsumer {
                 self.accumulated_deltas
                     .retain(|(sid, _), _| *sid != session_id);
                 if let Some(task_id) = task_id {
+                    // Clone before move into message so we can remove from the map after send.
+                    let sid_for_cleanup = session_id.clone();
                     self.send(AppMessage::SessionError {
                         task_id,
                         session_id,
                         error,
                     })
                     .await?;
+                    // Remove the session so stale events after the error are dropped.
+                    self.session_map.write().await.remove(&sid_for_cleanup);
                 } else {
                     debug!("SessionError for unknown session_id: {}", session_id);
                 }
@@ -858,7 +867,7 @@ mod tests {
             );
         }
 
-        // Seed a MessageUpdated before SessionCompleted so response_text is populated.
+        // MessageUpdated -- accumulates response_text for SessionCompleted.
         consumer
             .handle_event(OpenCodeEvent::MessageUpdated {
                 session_id: "sess-abc".to_string(),
@@ -867,35 +876,7 @@ mod tests {
             })
             .await
             .expect("handle_event");
-        // Drain the StreamingUpdate.
         let _ = rx.try_recv().expect("StreamingUpdate message");
-
-        // SessionCompleted
-        consumer
-            .handle_event(OpenCodeEvent::SessionCompleted {
-                session_id: "sess-abc".to_string(),
-            })
-            .await
-            .expect("handle_event");
-        let msg = rx.try_recv().expect("SessionCompleted message");
-        assert!(
-            matches!(&msg, AppMessage::SessionCompleted { ref session_id, ref response_text, .. }
-                if session_id == "sess-abc" && response_text == "agent response text")
-        );
-
-        // MessageUpdated
-        consumer
-            .handle_event(OpenCodeEvent::MessageUpdated {
-                session_id: "sess-abc".to_string(),
-                message_id: "msg-1".to_string(),
-                parts: vec![],
-            })
-            .await
-            .expect("handle_event");
-        let msg = rx.try_recv().expect("StreamingUpdate message");
-        assert!(
-            matches!(msg, AppMessage::StreamingUpdate { ref session_id, .. } if session_id == "sess-abc")
-        );
 
         // ToolExecuting
         consumer
@@ -926,20 +907,8 @@ mod tests {
             matches!(msg, AppMessage::ToolActivity { ref status, .. } if status == "completed")
         );
 
-        // SessionError
-        consumer
-            .handle_event(OpenCodeEvent::SessionError {
-                session_id: "sess-abc".to_string(),
-                error: "oops".to_string(),
-            })
-            .await
-            .expect("handle_event");
-        let msg = rx.try_recv().expect("SessionError message");
-        assert!(
-            matches!(msg, AppMessage::SessionError { ref session_id, .. } if session_id == "sess-abc")
-        );
-
-        // SessionCreated
+        // SessionCreated -- must come before SessionCompleted because SessionCompleted
+        // removes the session from the map and subsequent events would not route.
         consumer
             .handle_event(OpenCodeEvent::SessionCreated {
                 session_id: "sess-abc".to_string(),
@@ -950,6 +919,19 @@ mod tests {
         let msg = rx.try_recv().expect("SessionCreated message");
         assert!(
             matches!(msg, AppMessage::SessionCreated { ref session_id, .. } if session_id == "sess-abc")
+        );
+
+        // SessionCompleted -- last event; removes the session from the map.
+        consumer
+            .handle_event(OpenCodeEvent::SessionCompleted {
+                session_id: "sess-abc".to_string(),
+            })
+            .await
+            .expect("handle_event");
+        let msg = rx.try_recv().expect("SessionCompleted message");
+        assert!(
+            matches!(&msg, AppMessage::SessionCompleted { ref session_id, ref response_text, .. }
+                if session_id == "sess-abc" && response_text == "agent response text")
         );
     }
 
@@ -1005,6 +987,69 @@ mod tests {
             .await
             .expect("handle_event");
         assert!(rx.try_recv().is_err(), "Unknown should always be ignored");
+    }
+
+    /// Verifies that `SessionCompleted` removes the session from the map so that
+    /// subsequent events for child sessions are not routed.
+    #[tokio::test]
+    async fn test_session_map_cleanup_on_completed() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-done".to_string(),
+                (task_id.clone(), AgentKind::Implementation),
+            );
+        }
+
+        consumer
+            .handle_event(OpenCodeEvent::SessionCompleted {
+                session_id: "sess-done".to_string(),
+            })
+            .await
+            .expect("handle_event");
+        // Drain the SessionCompleted message.
+        let _ = rx.try_recv().expect("SessionCompleted message");
+
+        // Session must be removed from the map.
+        let map = session_map.read().await;
+        assert!(
+            !map.contains_key("sess-done"),
+            "session should be removed from session_map after SessionCompleted"
+        );
+    }
+
+    /// Verifies that `SessionError` removes the session from the map so that
+    /// subsequent events for child sessions are not routed.
+    #[tokio::test]
+    async fn test_session_map_cleanup_on_error() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-err".to_string(),
+                (task_id.clone(), AgentKind::Implementation),
+            );
+        }
+
+        consumer
+            .handle_event(OpenCodeEvent::SessionError {
+                session_id: "sess-err".to_string(),
+                error: "something went wrong".to_string(),
+            })
+            .await
+            .expect("handle_event");
+        // Drain the SessionError message.
+        let _ = rx.try_recv().expect("SessionError message");
+
+        // Session must be removed from the map.
+        let map = session_map.read().await;
+        assert!(
+            !map.contains_key("sess-err"),
+            "session should be removed from session_map after SessionError"
+        );
     }
 
     /// Verifies that `SessionCreated` succeeds when the session map is populated
