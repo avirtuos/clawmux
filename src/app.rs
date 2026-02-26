@@ -473,6 +473,27 @@ impl App {
                 session_id,
                 error,
             } => {
+                // Guard: ignore errors from child sessions.  When the engine
+                // has a registered primary session_id, only that session's
+                // errors should advance the pipeline.  A None expected_session
+                // means no session is tracked yet (e.g. CreateSession failed
+                // before SSE registration), so those errors pass through.
+                let expected_session = self
+                    .workflow_engine
+                    .state(&task_id)
+                    .and_then(|s| s.session_id.clone());
+                if let Some(ref expected) = expected_session {
+                    if *expected != session_id {
+                        tracing::debug!(
+                            "Ignoring child SessionError for task {} (session {} != expected {})",
+                            task_id,
+                            session_id,
+                            expected
+                        );
+                        return vec![];
+                    }
+                }
+
                 let current_agent = self
                     .workflow_engine
                     .state(&task_id)
@@ -580,8 +601,31 @@ impl App {
             // --- Workflow messages: forward to engine ---
             AppMessage::AgentCompleted { .. }
             | AppMessage::AgentKickedBack { .. }
-            | AppMessage::AgentAskedQuestion { .. }
-            | AppMessage::SessionCreated { .. } => self.workflow_engine.process(msg),
+            | AppMessage::AgentAskedQuestion { .. } => self.workflow_engine.process(msg),
+
+            // Only forward the first (primary) SessionCreated to the engine.
+            // OpenCode spawns child sessions internally; when the engine already
+            // has a session_id set, the incoming event is from a child and must
+            // be ignored to prevent the engine from double-registering.
+            AppMessage::SessionCreated {
+                ref task_id,
+                ref session_id,
+            } => {
+                let already_has_session = self
+                    .workflow_engine
+                    .state(task_id)
+                    .is_some_and(|s| s.session_id.is_some());
+                if already_has_session {
+                    tracing::debug!(
+                        "Ignoring child SessionCreated for task {} (session {})",
+                        task_id,
+                        session_id
+                    );
+                    vec![]
+                } else {
+                    self.workflow_engine.process(msg)
+                }
+            }
 
             AppMessage::HumanApprovedReview { task_id } => {
                 self.review_state
@@ -640,6 +684,27 @@ impl App {
                 session_id,
                 response_text,
             } => {
+                // Guard: ignore completions from child sessions.  When the engine
+                // has a registered primary session_id, only that session's
+                // completion should advance the pipeline.  A None expected_session
+                // means no session has been registered yet, so the completion
+                // passes through (handles CreateSession error path).
+                let expected_session = self
+                    .workflow_engine
+                    .state(&task_id)
+                    .and_then(|s| s.session_id.clone());
+                if let Some(ref expected) = expected_session {
+                    if *expected != session_id {
+                        tracing::debug!(
+                            "Ignoring child SessionCompleted for task {} (session {} != expected {})",
+                            task_id,
+                            session_id,
+                            expected
+                        );
+                        return vec![];
+                    }
+                }
+
                 self.tab2_state.clear_awaiting(&task_id);
 
                 // Drain any queued steering prompt before advancing the workflow.
@@ -3156,5 +3221,151 @@ mod tests {
         );
         let task = app.task_store.get(&task_id).unwrap();
         assert_eq!(task.assigned_to, Some(AgentKind::Intake));
+    }
+
+    // --- Child session guard tests ---
+
+    /// Verifies that a `SessionCreated` arriving when the engine already has a session_id
+    /// (i.e. primary session is registered) is ignored and not forwarded to the engine.
+    #[test]
+    fn test_child_session_created_not_forwarded_to_engine() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        // Register the primary session so the engine has session_id = Some("primary").
+        app.workflow_engine.process(AppMessage::SessionCreated {
+            task_id: task_id.clone(),
+            session_id: "primary".to_string(),
+        });
+
+        // A child SessionCreated should be ignored.
+        let msgs = app.handle_message(AppMessage::SessionCreated {
+            task_id: task_id.clone(),
+            session_id: "child-sess".to_string(),
+        });
+
+        assert!(
+            msgs.is_empty(),
+            "child SessionCreated should produce no messages, got: {msgs:?}"
+        );
+        // Engine session_id must still point to the primary session.
+        let session_id = app
+            .workflow_engine
+            .state(&task_id)
+            .and_then(|s| s.session_id.clone());
+        assert_eq!(
+            session_id.as_deref(),
+            Some("primary"),
+            "engine session_id must remain the primary session"
+        );
+    }
+
+    /// Verifies that a `SessionCreated` arriving when no session is registered yet
+    /// (engine.session_id == None) IS forwarded to the engine.
+    #[test]
+    fn test_primary_session_created_forwarded_to_engine() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        // No SessionCreated has been processed yet; session_id == None.
+        let msgs = app.handle_message(AppMessage::SessionCreated {
+            task_id: task_id.clone(),
+            session_id: "primary".to_string(),
+        });
+
+        // Engine should return vec![] for SessionCreated (no side effects), but the
+        // session_id must now be registered.
+        assert!(
+            msgs.is_empty(),
+            "SessionCreated has no side-effect messages, got: {msgs:?}"
+        );
+        let session_id = app
+            .workflow_engine
+            .state(&task_id)
+            .and_then(|s| s.session_id.clone());
+        assert_eq!(
+            session_id.as_deref(),
+            Some("primary"),
+            "engine should have registered the primary session"
+        );
+    }
+
+    /// Verifies that `SessionCompleted` for a child session (not the primary) is ignored
+    /// and does not advance the pipeline.
+    #[test]
+    fn test_child_session_completed_skipped() {
+        let mut app = App::test_default();
+        let task_id = make_task_with_active_session(&mut app, "primary");
+
+        let msgs = app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "child-sess".to_string(),
+            response_text: r#"{"action":"complete","summary":"done"}"#.to_string(),
+        });
+
+        assert!(
+            msgs.is_empty(),
+            "child SessionCompleted should produce no messages, got: {msgs:?}"
+        );
+        // Workflow must still be in Running phase with the primary session.
+        let state = app
+            .workflow_engine
+            .state(&task_id)
+            .expect("state should exist");
+        assert_eq!(
+            state.session_id.as_deref(),
+            Some("primary"),
+            "engine should still track the primary session"
+        );
+    }
+
+    /// Verifies that `SessionError` for a child session (not the primary) is ignored
+    /// and does not trigger an error transition.
+    #[test]
+    fn test_child_session_error_skipped() {
+        let mut app = App::test_default();
+        let task_id = make_task_with_active_session(&mut app, "primary");
+
+        let msgs = app.handle_message(AppMessage::SessionError {
+            task_id: task_id.clone(),
+            session_id: "child-sess".to_string(),
+            error: "child error".to_string(),
+        });
+
+        assert!(
+            msgs.is_empty(),
+            "child SessionError should produce no messages, got: {msgs:?}"
+        );
+        // The engine's primary session must still be registered.
+        let state = app
+            .workflow_engine
+            .state(&task_id)
+            .expect("state should exist");
+        assert_eq!(
+            state.session_id.as_deref(),
+            Some("primary"),
+            "engine should still track the primary session"
+        );
+    }
+
+    /// Verifies that `SessionError` with an empty session_id passes through when no
+    /// session is registered in the engine (handles CreateSession-level failures).
+    #[test]
+    fn test_session_error_allowed_when_no_session_registered() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+        // No SessionCreated processed; engine.session_id == None.
+
+        let msgs = app.handle_message(AppMessage::SessionError {
+            task_id: task_id.clone(),
+            session_id: String::new(),
+            error: "OpenCode client unavailable".to_string(),
+        });
+
+        // Should emit TaskUpdated (error recorded) and not be silently dropped.
+        assert!(
+            msgs.iter().any(|m| matches!(m, AppMessage::TaskUpdated { .. })),
+            "SessionError with no registered session should still produce TaskUpdated, got: {msgs:?}"
+        );
     }
 }
