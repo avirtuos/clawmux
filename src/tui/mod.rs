@@ -132,6 +132,7 @@ pub fn footer_hint_text(
     focused_input: FocusedInput,
     is_malformed_task: bool,
     is_startable_task: bool,
+    is_resumable_task: bool,
     pending_permission: bool,
     awaiting_approval: bool,
 ) -> &'static str {
@@ -153,6 +154,8 @@ pub fn footer_hint_text(
         "[f] request fix | [Enter] apply fix | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 0 && is_startable_task {
         "[Enter] start | [i] prompt | [s] status | [Up/Down] scroll | [Tab] next tab | [q] quit"
+    } else if active_tab == 0 && is_resumable_task {
+        "[Enter] resume | [s] status | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 0 {
         "[i] prompt | [s] status | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 1 {
@@ -196,6 +199,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let is_startable_task = selected_task
         .map(|t| !t.is_malformed() && t.status == TaskStatus::Open)
         .unwrap_or(false);
+    let is_resumable_task = selected_task
+        .map(|t| !t.is_malformed() && t.status == TaskStatus::InProgress)
+        .unwrap_or(false);
     let focused_input = if app.tab1_state.prompt_focused {
         FocusedInput::Prompt
     } else if app.questions_state.focused_answer.is_some() {
@@ -230,6 +236,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         focused_input,
         is_malformed_task,
         is_startable_task,
+        is_resumable_task,
         pending_permission,
         awaiting_approval,
     );
@@ -609,16 +616,18 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     app.open_status_picker();
                     return None;
                 }
-                // Start an OPEN task with Enter.
+                // Start an OPEN task or resume an INPROGRESS task with Enter.
                 if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
                     if let Some(task_id) = app.selected_task().cloned() {
-                        let is_open = app
-                            .task_store
-                            .get(&task_id)
-                            .map(|t| t.status == TaskStatus::Open)
-                            .unwrap_or(false);
-                        if is_open {
-                            return Some(AppMessage::StartTask { task_id });
+                        let status = app.task_store.get(&task_id).map(|t| t.status.clone());
+                        match status {
+                            Some(TaskStatus::Open) => {
+                                return Some(AppMessage::StartTask { task_id });
+                            }
+                            Some(TaskStatus::InProgress) => {
+                                return Some(AppMessage::ResumeTask { task_id });
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1652,6 +1661,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(text.contains("[i] prompt"), "got: {text}");
         assert!(!text.contains("[a] answer"), "got: {text}"); // moved to Questions tab
@@ -1666,6 +1676,7 @@ mod tests {
             false,
             1,
             FocusedInput::None,
+            false,
             false,
             false,
             false,
@@ -1689,6 +1700,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(text.contains("[Esc]"), "got: {text}");
         assert!(text.contains("Editing prompt"), "got: {text}");
@@ -1705,6 +1717,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(text.contains("[Esc] exit"), "got: {text}");
         assert!(text.contains("Editing answer"), "got: {text}");
@@ -1717,6 +1730,7 @@ mod tests {
             false,
             6,
             FocusedInput::Review,
+            false,
             false,
             false,
             false,
@@ -1738,6 +1752,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(text.contains("[Esc] cancel"), "got: {text}");
         assert!(text.contains("Editing comment"), "got: {text}");
@@ -1751,6 +1766,7 @@ mod tests {
             false,
             2,
             FocusedInput::None,
+            false,
             false,
             false,
             false,
@@ -1774,6 +1790,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(text.contains("[Up/Down] scroll"), "got: {text}");
         assert!(text.contains("[Tab] next tab"), "got: {text}");
@@ -1789,6 +1806,7 @@ mod tests {
             false,
             4,
             FocusedInput::None,
+            false,
             false,
             false,
             false,
@@ -1809,6 +1827,7 @@ mod tests {
             false,
             4,
             FocusedInput::Steering,
+            false,
             false,
             false,
             false,
@@ -2011,6 +2030,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(text.contains("[a] approve"), "got: {text}");
         assert!(text.contains("[R] revisions"), "got: {text}");
@@ -2031,6 +2051,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(text.contains("[a] approve"), "got: {text}");
         assert!(text.contains("[r] review"), "got: {text}");
@@ -2046,6 +2067,7 @@ mod tests {
             false,
             4,
             FocusedInput::None,
+            false,
             false,
             false,
             true,
@@ -2070,6 +2092,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(text.contains("[y/Enter]"), "got: {text}");
         assert!(text.contains("[n/Esc]"), "got: {text}");
@@ -2083,6 +2106,7 @@ mod tests {
             0,
             FocusedInput::None,
             true,
+            false,
             false,
             false,
             false,
@@ -2105,6 +2129,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(text.contains("[1-5] select"), "got: {text}");
         assert!(text.contains("[Up/Down] navigate"), "got: {text}");
@@ -2121,6 +2146,7 @@ mod tests {
             FocusedInput::None,
             false,
             true,
+            false,
             false,
             false,
         );
@@ -2543,18 +2569,18 @@ mod tests {
     fn test_handle_input_enter_no_start_non_open_task() {
         use crate::tasks::models::{TaskId, TaskStatus};
 
-        // Change the task status to InProgress; Enter should not start it.
+        // Change the task status to Completed; Enter should not start or resume it.
         let mut app = app_with_normal_task();
         let id = TaskId::from_path("tasks/1.1.md");
         if let Some(task) = app.task_store.get_mut(&id) {
-            task.status = TaskStatus::InProgress;
+            task.status = TaskStatus::Completed;
         }
 
         let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_input(event, &mut app);
         assert!(
             result.is_none(),
-            "Enter on a non-OPEN task should return None, got: {result:?}"
+            "Enter on a Completed task should return None, got: {result:?}"
         );
     }
 
@@ -2566,6 +2592,7 @@ mod tests {
             false,
             5,
             FocusedInput::None,
+            false,
             false,
             false,
             false,
@@ -2585,6 +2612,7 @@ mod tests {
             false,
             5,
             FocusedInput::None,
+            false,
             false,
             false,
             false,
@@ -2745,5 +2773,118 @@ mod tests {
     fn test_format_tokens_millions() {
         assert_eq!(format_tokens(1_000_000), "1.0M");
         assert_eq!(format_tokens(2_500_000), "2.5M");
+    }
+
+    // --- Resume task UI tests ---
+
+    /// Helper: builds an App with an InProgress task and navigates to it.
+    fn app_with_in_progress_task() -> (App, crate::tasks::TaskId) {
+        use crate::tasks::models::{Task, TaskId, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: Some(crate::workflow::agents::AgentKind::Design),
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+        app.refresh_stories();
+        app.task_list_state
+            .expanded_stories
+            .insert("1. Story".to_string());
+        app.task_list_state.refresh(&app.cached_stories);
+        // items: [0] Story, [1] Task -- navigate to task.
+        let down = key_event(KeyCode::PageDown, KeyModifiers::NONE);
+        handle_input(down, &mut app);
+        (app, task_id)
+    }
+
+    /// Verifies that pressing Enter on an InProgress task emits ResumeTask.
+    #[test]
+    fn test_enter_on_in_progress_task_emits_resume() {
+        let (mut app, task_id) = app_with_in_progress_task();
+        // Tab 0 is default.
+        assert_eq!(app.active_tab, 0);
+
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+
+        assert!(
+            matches!(result, Some(AppMessage::ResumeTask { task_id: ref tid }) if *tid == task_id),
+            "Enter on InProgress task should emit ResumeTask, got: {result:?}"
+        );
+    }
+
+    /// Verifies that pressing Enter on an Open task still emits StartTask.
+    #[test]
+    fn test_enter_on_open_task_still_emits_start() {
+        use crate::tasks::models::{Task, TaskId, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/2.1.md"),
+            story_name: "2. Story".to_string(),
+            name: "2.1".to_string(),
+            status: TaskStatus::Open,
+            assigned_to: None,
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/2.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+        app.refresh_stories();
+        app.task_list_state
+            .expanded_stories
+            .insert("2. Story".to_string());
+        app.task_list_state.refresh(&app.cached_stories);
+        let down = key_event(KeyCode::PageDown, KeyModifiers::NONE);
+        handle_input(down, &mut app);
+
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
+        let result = handle_input(event, &mut app);
+
+        assert!(
+            matches!(result, Some(AppMessage::StartTask { task_id: ref tid }) if *tid == task_id),
+            "Enter on Open task should emit StartTask, got: {result:?}"
+        );
+    }
+
+    /// Verifies that footer shows resume hint for an InProgress task on Tab 0.
+    #[test]
+    fn test_footer_hints_resumable_task() {
+        let hint = footer_hint_text(
+            false,
+            false,
+            0,
+            FocusedInput::None,
+            false,
+            false,
+            true, // is_resumable_task
+            false,
+            false,
+        );
+        assert!(
+            hint.contains("[Enter] resume"),
+            "footer should show resume hint for InProgress task, got: {hint}"
+        );
     }
 }

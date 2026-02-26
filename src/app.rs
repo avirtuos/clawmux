@@ -436,6 +436,37 @@ impl App {
                 msgs
             }
 
+            // --- ResumeTask: re-enter pipeline at the last known agent ---
+            AppMessage::ResumeTask { task_id } => {
+                // Determine resume agent using priority:
+                // 1. Workflow engine Errored state's current_agent
+                // 2. Task's assigned_to (excluding Human)
+                // 3. Fallback: Intake
+                let resume_agent = self
+                    .workflow_engine
+                    .state(&task_id)
+                    .filter(|s| matches!(s.phase, WorkflowPhase::Errored { .. }))
+                    .map(|s| s.current_agent)
+                    .or_else(|| {
+                        self.task_store
+                            .get(&task_id)
+                            .and_then(|t| t.assigned_to)
+                            .filter(|a| *a != AgentKind::Human)
+                    })
+                    .unwrap_or(AgentKind::Intake);
+
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    task.assign_to(Some(resume_agent), AgentKind::Human);
+                    task.log_change(
+                        AgentKind::Human,
+                        format!("Task resumed at {}", resume_agent.display_name()),
+                    );
+                }
+                let mut msgs = self.workflow_engine.resume(task_id.clone(), resume_agent);
+                msgs.push(AppMessage::TaskUpdated { task_id });
+                msgs
+            }
+
             // --- SessionError: record error in work log then forward to engine ---
             AppMessage::SessionError {
                 task_id,
@@ -2982,5 +3013,148 @@ mod tests {
             ),
             "work log should record the assignment to Design Agent"
         );
+    }
+
+    /// Verifies that ResumeTask uses the Errored workflow state's current_agent.
+    #[test]
+    fn test_handle_resume_task_after_error() {
+        use crate::tasks::models::{Task, TaskStatus};
+        use crate::workflow::transitions::WorkflowPhase;
+
+        let mut app = App::test_default();
+        // Insert an InProgress task.
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: Some(AgentKind::Human),
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+
+        // Put the workflow engine in Errored state at Design.
+        // Use resume() to set up the engine at Design, then inject an error via process().
+        app.workflow_engine
+            .resume(task_id.clone(), AgentKind::Design);
+        app.workflow_engine.process(AppMessage::SessionError {
+            task_id: task_id.clone(),
+            session_id: "s1".to_string(),
+            error: "network error".to_string(),
+        });
+        // Confirm it is Errored at Design.
+        let s = app.workflow_engine.state(&task_id).unwrap();
+        assert!(matches!(s.phase, WorkflowPhase::Errored { .. }));
+        assert_eq!(s.current_agent, AgentKind::Design);
+
+        let msgs = app.handle_message(AppMessage::ResumeTask {
+            task_id: task_id.clone(),
+        });
+
+        // Should resume at Design (from errored state) and emit CreateSession + TaskUpdated.
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                AppMessage::CreateSession { agent, .. } if *agent == AgentKind::Design
+            )),
+            "should resume at Design (errored agent), got: {msgs:?}"
+        );
+        assert!(msgs
+            .iter()
+            .any(|m| matches!(m, AppMessage::TaskUpdated { .. })));
+        let task = app.task_store.get(&task_id).unwrap();
+        assert_eq!(task.assigned_to, Some(AgentKind::Design));
+    }
+
+    /// Verifies that ResumeTask uses assigned_to when no errored workflow state exists (crash scenario).
+    #[test]
+    fn test_handle_resume_task_no_workflow_state_uses_assigned_to() {
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            // Persisted assigned_to from before the crash.
+            assigned_to: Some(AgentKind::Implementation),
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+        // No workflow engine state (simulates crash).
+
+        let msgs = app.handle_message(AppMessage::ResumeTask {
+            task_id: task_id.clone(),
+        });
+
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                AppMessage::CreateSession { agent, .. } if *agent == AgentKind::Implementation
+            )),
+            "should resume at Implementation (from assigned_to), got: {msgs:?}"
+        );
+        let task = app.task_store.get(&task_id).unwrap();
+        assert_eq!(task.assigned_to, Some(AgentKind::Implementation));
+    }
+
+    /// Verifies that ResumeTask falls back to Intake when assigned_to is Human.
+    #[test]
+    fn test_handle_resume_task_assigned_to_human_falls_back_to_intake() {
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: Some(AgentKind::Human),
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+        // No workflow engine state; assigned_to is Human -> fallback to Intake.
+
+        let msgs = app.handle_message(AppMessage::ResumeTask {
+            task_id: task_id.clone(),
+        });
+
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                AppMessage::CreateSession { agent, .. } if *agent == AgentKind::Intake
+            )),
+            "should fall back to Intake when assigned_to is Human, got: {msgs:?}"
+        );
+        let task = app.task_store.get(&task_id).unwrap();
+        assert_eq!(task.assigned_to, Some(AgentKind::Intake));
     }
 }
