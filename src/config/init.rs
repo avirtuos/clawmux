@@ -290,6 +290,47 @@ pub(crate) fn configure_provider_from_reader<R: BufRead, W: Write>(
     Ok(())
 }
 
+/// Writes built-in agent definition files to `.opencode/agents/clawdmux/`.
+///
+/// Always overwrites existing files. Creates the directory if it does not exist.
+///
+/// Returns the number of agent files written.
+pub fn update_agent_files(project_root: &Path) -> Result<usize> {
+    let agents_dir = project_root
+        .join(".opencode")
+        .join("agents")
+        .join("clawdmux");
+    std::fs::create_dir_all(&agents_dir).map_err(ClawdMuxError::Io)?;
+
+    let mut count = 0usize;
+    for agent in AgentKind::all() {
+        let (Some(file_name), Some(content)) =
+            (agent_file_name(agent), agent_definition_content(agent))
+        else {
+            continue;
+        };
+        let file_path = agents_dir.join(file_name);
+        std::fs::write(&file_path, content).map_err(ClawdMuxError::Io)?;
+        tracing::info!(path = %file_path.display(), "wrote agent definition");
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Arguments for the `clawdmux update-agents` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct UpdateAgentsArgs {}
+
+/// Overwrites all agent definition files from built-in defaults.
+///
+/// Unlike `init --reset-agents`, this does not check for opencode, prompt for
+/// provider configuration, or write task seed files.
+pub fn run_update_agents(project_root: &Path, _args: &UpdateAgentsArgs) -> Result<()> {
+    let count = update_agent_files(project_root)?;
+    tracing::info!(count, "agent definitions updated");
+    Ok(())
+}
+
 /// Step 3: create project-local files and directories.
 ///
 /// All paths are created only if absent, except agent definition files which
@@ -318,23 +359,28 @@ pub(crate) fn scaffold_project(project_root: &Path, args: &InitArgs) -> Result<(
         }
     }
 
-    // .opencode/agents/clawdmux/
-    let agents_dir = project_root
-        .join(".opencode")
-        .join("agents")
-        .join("clawdmux");
-    std::fs::create_dir_all(&agents_dir).map_err(ClawdMuxError::Io)?;
+    // .opencode/agents/clawdmux/ — delegate to update_agent_files when resetting,
+    // otherwise only write files that do not already exist.
+    if args.reset_agents {
+        update_agent_files(project_root)?;
+    } else {
+        let agents_dir = project_root
+            .join(".opencode")
+            .join("agents")
+            .join("clawdmux");
+        std::fs::create_dir_all(&agents_dir).map_err(ClawdMuxError::Io)?;
 
-    for agent in AgentKind::all() {
-        let (Some(file_name), Some(content)) =
-            (agent_file_name(agent), agent_definition_content(agent))
-        else {
-            continue;
-        };
-        let file_path = agents_dir.join(file_name);
-        if !file_path.exists() || args.reset_agents {
-            std::fs::write(&file_path, content).map_err(ClawdMuxError::Io)?;
-            tracing::info!(path = %file_path.display(), "created agent definition");
+        for agent in AgentKind::all() {
+            let (Some(file_name), Some(content)) =
+                (agent_file_name(agent), agent_definition_content(agent))
+            else {
+                continue;
+            };
+            let file_path = agents_dir.join(file_name);
+            if !file_path.exists() {
+                std::fs::write(&file_path, content).map_err(ClawdMuxError::Io)?;
+                tracing::info!(path = %file_path.display(), "created agent definition");
+            }
         }
     }
 
@@ -702,5 +748,65 @@ mod tests {
             restored, INTAKE_AGENT,
             "intake.md should be restored to the built-in default"
         );
+    }
+
+    // --- update_agent_files tests ---
+
+    #[test]
+    fn test_update_agent_files_writes_all() {
+        let project_dir = TempDir::new().unwrap();
+
+        let count = update_agent_files(project_dir.path()).unwrap();
+        assert_eq!(count, 7, "should write exactly 7 agent files");
+
+        let agents_dir = project_dir.path().join(".opencode/agents/clawdmux");
+        for agent in AgentKind::all() {
+            let file_name = agent_file_name(agent).expect("all() never yields Human");
+            let file_path = agents_dir.join(file_name);
+            assert!(file_path.exists(), "{} should exist", file_path.display());
+            let content = std::fs::read_to_string(&file_path).unwrap();
+            assert!(!content.is_empty(), "{} should be non-empty", file_name);
+        }
+    }
+
+    #[test]
+    fn test_update_agent_files_overwrites_existing() {
+        let project_dir = TempDir::new().unwrap();
+
+        // First call to write the files.
+        update_agent_files(project_dir.path()).unwrap();
+
+        // Corrupt one file.
+        let intake_path = project_dir
+            .path()
+            .join(".opencode/agents/clawdmux/intake.md");
+        std::fs::write(&intake_path, "corrupted content").unwrap();
+
+        // Second call must restore it.
+        update_agent_files(project_dir.path()).unwrap();
+
+        let restored = std::fs::read_to_string(&intake_path).unwrap();
+        assert_eq!(
+            restored, INTAKE_AGENT,
+            "intake.md should be restored to the built-in default after update_agent_files"
+        );
+    }
+
+    #[test]
+    fn test_run_update_agents_succeeds() {
+        let project_dir = TempDir::new().unwrap();
+
+        run_update_agents(project_dir.path(), &UpdateAgentsArgs {}).unwrap();
+
+        let agents_dir = project_dir.path().join(".opencode/agents/clawdmux");
+        for agent in AgentKind::all() {
+            let file_name = agent_file_name(agent).expect("all() never yields Human");
+            let file_path = agents_dir.join(file_name);
+            assert!(
+                file_path.exists(),
+                "agent file {} should exist after run_update_agents",
+                file_path.display()
+            );
+        }
     }
 }
