@@ -487,6 +487,15 @@ impl EventStreamConsumer {
 }
 
 /// Extracts a concise display string from a tool's `input` JSON object.
+/// Truncates `s` to at most `max_chars` Unicode scalar values, appending `"..."`
+/// when truncation occurs. Avoids panics on multi-byte UTF-8 characters.
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => format!("{}...", &s[..idx]),
+        None => s.to_string(),
+    }
+}
+
 ///
 /// Returns the single most relevant value (file path, command, pattern, URL, etc.)
 /// for the given `tool` name, or `None` if no useful detail can be found.
@@ -511,13 +520,7 @@ fn extract_tool_detail(tool: &str, input: &serde_json::Value) -> Option<String> 
         "task" | "agent" => obj.get("description").and_then(|v| v.as_str()),
         _ => obj.values().find_map(|v| v.as_str()),
     };
-    raw.filter(|s| !s.is_empty()).map(|s| {
-        if s.len() > 80 {
-            format!("{}...", &s[..80])
-        } else {
-            s.to_string()
-        }
-    })
+    raw.filter(|s| !s.is_empty()).map(|s| truncate_str(s, 80))
 }
 
 /// Parses an opencode SSE JSON body into an [`OpenCodeEvent`].
