@@ -32,8 +32,12 @@ use crate::tasks::models::TaskId;
 use crate::tasks::TaskStore;
 
 /// ClawdMux: GenAI coding assistance multiplexer and task orchestrator.
+///
+/// Run without a subcommand to launch the interactive TUI.
+/// Use `init` to set up a new project, or `update-agents` to refresh
+/// agent definitions after upgrading.
 #[derive(Parser, Debug)]
-#[command(name = "clawdmux", version, about)]
+#[command(name = "clawdmux", version, about, long_about)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -44,6 +48,12 @@ struct Cli {
 enum Commands {
     /// Initialize the project for use with ClawdMux.
     Init(config::init::InitArgs),
+    /// Update agent definition files from built-in defaults.
+    ///
+    /// Overwrites `.opencode/agents/clawdmux/*.md` with the latest
+    /// built-in agent prompts. Use this after upgrading ClawdMux to
+    /// pick up new agent definitions.
+    UpdateAgents(config::init::UpdateAgentsArgs),
 }
 
 #[tokio::main]
@@ -81,6 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("ClawdMux init command invoked");
             let project_root = std::env::current_dir()?;
             config::init::run_init(&project_root, &args)?;
+        }
+        Some(Commands::UpdateAgents(args)) => {
+            tracing::info!("ClawdMux update-agents command invoked");
+            let project_root = std::env::current_dir()?;
+            config::init::run_update_agents(&project_root, &args)?;
         }
         None => {
             let project_root = std::env::current_dir()?;
