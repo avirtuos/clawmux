@@ -17,7 +17,7 @@ use tui_textarea::TextArea;
 
 use crate::opencode::types::{DiffLineKind, DiffStatus, FileDiff, MessagePart, PermissionRequest};
 use crate::tasks::TaskId;
-use crate::tui::markdown::{markdown_to_lines, visual_line_count};
+use crate::tui::markdown::markdown_to_lines;
 
 /// Maximum number of buffer entries per task before old entries are trimmed.
 const MAX_BUFFER_ENTRIES: usize = 500;
@@ -869,11 +869,13 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
         (area, None)
     };
 
-    // Compute the effective scroll offset using visual (wrapped) line counts.
-    // Subtract 2 from each dimension to account for the surrounding border.
-    let content_width = activity_area.width.saturating_sub(2);
+    // Compute the effective scroll offset using ratatui's own word-wrap-aware
+    // line_count(), which accounts for the block border insets automatically.
     let viewport_height = activity_area.height.saturating_sub(2) as usize;
-    let total_visual = visual_line_count(&lines, content_width);
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    let total_visual = paragraph.line_count(activity_area.width);
     let max_scroll = total_visual.saturating_sub(viewport_height);
     state.last_max_scroll.set(max_scroll);
 
@@ -883,11 +885,7 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
         state.scroll_offset.min(max_scroll)
     };
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((effective_scroll as u16, 0));
-
+    let paragraph = paragraph.scroll((effective_scroll as u16, 0));
     frame.render_widget(paragraph, activity_area);
     if let Some(sa) = steering_area {
         frame.render_widget(&state.steering_input, sa);
