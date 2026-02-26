@@ -655,11 +655,7 @@ impl App {
                             });
                         }
                         let agent = current_agent.unwrap_or(AgentKind::Intake);
-                        let truncated = if summary.len() > 80 {
-                            format!("{}...", &summary[..80])
-                        } else {
-                            summary.clone()
-                        };
+                        let truncated = truncate_str(&summary, 80);
                         self.tab2_state.push_banner(
                             &task_id,
                             format!("{} completed: {}", agent.display_name(), truncated),
@@ -723,11 +719,7 @@ impl App {
                     }) => {
                         let from = current_agent.unwrap_or(AgentKind::Intake);
                         let to = AgentKind::from_display_name(&target_agent).unwrap_or(from);
-                        let truncated_reason = if reason.len() > 80 {
-                            format!("{}...", &reason[..80])
-                        } else {
-                            reason.clone()
-                        };
+                        let truncated_reason = truncate_str(&reason, 80);
                         self.tab2_state.push_banner(
                             &task_id,
                             format!(
@@ -802,12 +794,7 @@ impl App {
                     });
 
                 // Show prompt content in the activity tab (truncated to 500 chars).
-                let display_len = prompt.len().min(500);
-                let prompt_preview = if prompt.len() > 500 {
-                    format!("{}...", &prompt[..display_len])
-                } else {
-                    prompt.clone()
-                };
+                let prompt_preview = truncate_str(&prompt, 500);
                 self.tab2_state
                     .push_banner(&task_id, format!("[Prompt] {}", prompt_preview));
 
@@ -1156,9 +1143,39 @@ impl App {
     }
 }
 
+/// Truncates `s` to at most `max_chars` Unicode scalar values, appending `"..."`
+/// when truncation occurs. Always produces a valid UTF-8 string regardless of
+/// multi-byte characters in `s`.
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => format!("{}...", &s[..idx]),
+        None => s.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_truncate_str_ascii() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+        assert_eq!(truncate_str("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn test_truncate_str_multibyte() {
+        // em dash U+2014 is 3 bytes; slicing at byte 80 would panic without this helper.
+        // s is 81 chars: 79 'a's + em dash + 'b'.
+        let s: String = "a".repeat(79) + "\u{2014}" + "b";
+        // Truncating at 80 chars: takes 79 'a's + em dash, appends "..."
+        assert_eq!(truncate_str(&s, 80), "a".repeat(79) + "\u{2014}" + "...");
+        // Truncating at 79 chars: takes just the 79 'a's, appends "..."
+        assert_eq!(truncate_str(&s, 79), "a".repeat(79) + "...");
+        // No truncation when limit >= length
+        assert_eq!(truncate_str(&s, 81), s);
+        assert_eq!(truncate_str(&s, 100), s);
+    }
 
     #[test]
     fn test_app_new() {
