@@ -246,12 +246,17 @@ impl OpenCodeClient {
         let resp = self.request(Method::GET, &path).send().await?;
         let resp = self.check_response(resp).await?;
         let body = resp.text().await?;
-        tracing::debug!("get_session_messages response body: {}", body);
+        tracing::debug!(
+            "get_session_messages response body (len={}): {}",
+            body.len(),
+            &body[..body.len().min(2000)]
+        );
         let messages: Vec<MessageEntry> = serde_json::from_str(&body).map_err(|e| {
             tracing::warn!(
-                "Failed to parse get_session_messages response: {}; body: {}",
+                "Failed to parse get_session_messages response: {}; body (len={}): {}...",
                 e,
-                body
+                body.len(),
+                &body[..body.len().min(500)]
             );
             ClawdMuxError::Json(e)
         })?;

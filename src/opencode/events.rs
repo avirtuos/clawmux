@@ -284,7 +284,11 @@ impl EventStreamConsumer {
                     debug!("MessagePartDelta for unknown session_id: {}", session_id);
                 }
             }
-            OpenCodeEvent::ToolExecuting { session_id, tool } => {
+            OpenCodeEvent::ToolExecuting {
+                session_id,
+                tool,
+                detail,
+            } => {
                 let task_id = {
                     let map = self.session_map.read().await;
                     map.get(&session_id).map(|(task_id, _)| task_id.clone())
@@ -295,6 +299,7 @@ impl EventStreamConsumer {
                         session_id,
                         tool,
                         status: "executing".to_string(),
+                        detail,
                     })
                     .await?;
                 } else {
@@ -302,7 +307,10 @@ impl EventStreamConsumer {
                 }
             }
             OpenCodeEvent::ToolCompleted {
-                session_id, tool, ..
+                session_id,
+                tool,
+                detail,
+                ..
             } => {
                 let task_id = {
                     let map = self.session_map.read().await;
@@ -314,10 +322,33 @@ impl EventStreamConsumer {
                         session_id,
                         tool,
                         status: "completed".to_string(),
+                        detail,
                     })
                     .await?;
                 } else {
                     debug!("ToolCompleted for unknown session_id: {}", session_id);
+                }
+            }
+            OpenCodeEvent::ToolPending {
+                session_id,
+                tool,
+                detail,
+            } => {
+                let task_id = {
+                    let map = self.session_map.read().await;
+                    map.get(&session_id).map(|(task_id, _)| task_id.clone())
+                };
+                if let Some(task_id) = task_id {
+                    self.send(AppMessage::ToolActivity {
+                        task_id,
+                        session_id,
+                        tool,
+                        status: "pending".to_string(),
+                        detail,
+                    })
+                    .await?;
+                } else {
+                    debug!("ToolPending for unknown session_id: {}", session_id);
                 }
             }
             OpenCodeEvent::SessionCompleted { session_id } => {
@@ -412,6 +443,26 @@ impl EventStreamConsumer {
                     debug!("SessionDiff for unknown session_id: {}", session_id);
                 }
             }
+            OpenCodeEvent::TokensUpdated {
+                session_id,
+                input_tokens,
+                output_tokens,
+            } => {
+                let task_id = {
+                    let map = self.session_map.read().await;
+                    map.get(&session_id).map(|(task_id, _)| task_id.clone())
+                };
+                if let Some(task_id) = task_id {
+                    self.send(AppMessage::TokensUpdated {
+                        task_id,
+                        input_tokens,
+                        output_tokens,
+                    })
+                    .await?;
+                } else {
+                    debug!("TokensUpdated for unknown session_id: {}", session_id);
+                }
+            }
             OpenCodeEvent::MessageCreated { .. } => {
                 // Ignored -- redundant with MessageUpdated
             }
@@ -433,6 +484,40 @@ impl EventStreamConsumer {
             .await
             .map_err(|e| ClawdMuxError::Sse(e.to_string()))
     }
+}
+
+/// Extracts a concise display string from a tool's `input` JSON object.
+///
+/// Returns the single most relevant value (file path, command, pattern, URL, etc.)
+/// for the given `tool` name, or `None` if no useful detail can be found.
+/// Long values are truncated to 80 characters.
+fn extract_tool_detail(tool: &str, input: &serde_json::Value) -> Option<String> {
+    let obj = input.as_object()?;
+    let raw: Option<&str> = match tool.to_lowercase().as_str() {
+        "read" => obj
+            .get("file_path")
+            .or_else(|| obj.get("path"))
+            .and_then(|v| v.as_str()),
+        "glob" => obj.get("pattern").and_then(|v| v.as_str()),
+        "write" | "edit" | "multiedit" | "notebookedit" => obj
+            .get("file_path")
+            .or_else(|| obj.get("path"))
+            .and_then(|v| v.as_str()),
+        "bash" | "execute" => obj
+            .get("command")
+            .or_else(|| obj.get("cmd"))
+            .and_then(|v| v.as_str()),
+        "webfetch" | "web_fetch" => obj.get("url").and_then(|v| v.as_str()),
+        "task" | "agent" => obj.get("description").and_then(|v| v.as_str()),
+        _ => obj.values().find_map(|v| v.as_str()),
+    };
+    raw.filter(|s| !s.is_empty()).map(|s| {
+        if s.len() > 80 {
+            format!("{}...", &s[..80])
+        } else {
+            s.to_string()
+        }
+    })
 }
 
 /// Parses an opencode SSE JSON body into an [`OpenCodeEvent`].
@@ -653,18 +738,82 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
                 }
             }
         }
+        // message.part.updated carries tool state (pending/running/completed) that
+        // must be surfaced. Non-tool parts (text streaming) are still ignored because
+        // they are superseded by message.part.delta (OpenCode >= 1.2).
+        "message.part.updated" => {
+            if let Some(part) = props.get("part") {
+                if part.get("type").and_then(|t| t.as_str()) == Some("tool") {
+                    let session_id = part["sessionID"]
+                        .as_str()
+                        .or_else(|| part["sessionId"].as_str());
+                    let tool = part["tool"].as_str().unwrap_or("unknown");
+                    let status = part["state"]["status"].as_str().unwrap_or("unknown");
+                    let detail = extract_tool_detail(tool, &part["input"]);
+                    if let Some(sid) = session_id {
+                        return match status {
+                            "running" => OpenCodeEvent::ToolExecuting {
+                                session_id: sid.to_string(),
+                                tool: tool.to_string(),
+                                detail,
+                            },
+                            "completed" => OpenCodeEvent::ToolCompleted {
+                                session_id: sid.to_string(),
+                                tool: tool.to_string(),
+                                result: String::new(),
+                                detail,
+                            },
+                            _ => OpenCodeEvent::ToolPending {
+                                session_id: sid.to_string(),
+                                tool: tool.to_string(),
+                                detail,
+                            },
+                        };
+                    }
+                    warn!(
+                        "message.part.updated tool part missing session id: {}",
+                        json_data
+                    );
+                    return OpenCodeEvent::Unknown;
+                }
+            }
+            debug!("SSE event '{}': ignoring (props: {})", event_type, props);
+            OpenCodeEvent::Unknown
+        }
+        // message.updated: ignore the message content (superseded by message.part.delta
+        // in OpenCode >= 1.2) but extract token usage when present and non-zero.
+        //
+        // OpenCode sends two path layouts depending on message role:
+        //   - assistant: info.tokens.{input,output}
+        //   - user:      info.summary.tokens.{input,output}  (fallback, not always present)
+        //
+        // Initial creation events carry all-zero counts and are skipped to avoid
+        // showing "in:0 out:0" before the model has actually processed anything.
+        "message.updated" => {
+            let session_id = props["sessionId"]
+                .as_str()
+                .or_else(|| props["sessionID"].as_str());
+            let input = props["info"]["tokens"]["input"]
+                .as_u64()
+                .or_else(|| props["info"]["summary"]["tokens"]["input"].as_u64());
+            let output = props["info"]["tokens"]["output"]
+                .as_u64()
+                .or_else(|| props["info"]["summary"]["tokens"]["output"].as_u64());
+            if let (Some(sid), Some(inp), Some(out)) = (session_id, input, output) {
+                if inp > 0 || out > 0 {
+                    return OpenCodeEvent::TokensUpdated {
+                        session_id: sid.to_string(),
+                        input_tokens: inp,
+                        output_tokens: out,
+                    };
+                }
+            }
+            debug!("SSE event 'message.updated': ignoring (no token data in props)");
+            OpenCodeEvent::Unknown
+        }
         // Known events we intentionally do not act on.
-        // message.updated and message.part.updated are superseded by message.part.delta
-        // (OpenCode >= 1.2). Ignoring them prevents accumulated delta text from being
-        // overwritten by a stale full-message snapshot if both event types were emitted.
-        "session.updated"
-        | "server.heartbeat"
-        | "server.connected"
-        | "project.updated"
-        | "message.created"
-        | "session.status"
-        | "message.updated"
-        | "message.part.updated" => {
+        "session.updated" | "server.heartbeat" | "server.connected" | "project.updated"
+        | "message.created" | "session.status" => {
             debug!("SSE event '{}': ignoring (props: {})", event_type, props);
             OpenCodeEvent::Unknown
         }
@@ -750,6 +899,7 @@ mod tests {
             .handle_event(OpenCodeEvent::ToolExecuting {
                 session_id: "sess-abc".to_string(),
                 tool: "bash".to_string(),
+                detail: None,
             })
             .await
             .expect("handle_event");
@@ -764,6 +914,7 @@ mod tests {
                 session_id: "sess-abc".to_string(),
                 tool: "bash".to_string(),
                 result: "ok".to_string(),
+                detail: None,
             })
             .await
             .expect("handle_event");
@@ -819,6 +970,7 @@ mod tests {
             .handle_event(OpenCodeEvent::ToolExecuting {
                 session_id: "unknown-sess".to_string(),
                 tool: "bash".to_string(),
+                detail: None,
             })
             .await
             .expect("handle_event");
@@ -1248,29 +1400,134 @@ mod tests {
         );
     }
 
-    /// Verifies that message.updated is now treated as a known-ignored event (returns Unknown).
+    /// Verifies that message.updated without token data returns Unknown.
     ///
-    /// The new API (OpenCode >= 1.2) uses message.part.delta exclusively. Ignoring
-    /// message.updated prevents accumulated delta text from being overwritten by a
-    /// full-message snapshot.
+    /// The message content is intentionally ignored (superseded by message.part.delta
+    /// in OpenCode >= 1.2), and without a token payload there is nothing to emit.
     #[test]
-    fn test_parse_wire_event_message_updated_now_ignored() {
+    fn test_parse_wire_event_message_updated_no_tokens_ignored() {
         let json = r#"{"payload":{"type":"message.updated","properties":{"sessionId":"ses_abc","messageId":"msg_1","parts":[{"type":"text","text":"hello"}]}}}"#;
         let event = parse_wire_event(json);
         assert!(
             matches!(event, OpenCodeEvent::Unknown),
-            "message.updated should return Unknown (now ignored), got: {event:?}"
+            "message.updated with no token data should return Unknown, got: {event:?}"
         );
     }
 
-    /// Verifies that message.part.updated is now treated as a known-ignored event (returns Unknown).
+    /// Verifies that message.updated with zero tokens is ignored (startup creation event).
     #[test]
-    fn test_parse_wire_event_message_part_updated_now_ignored() {
+    fn test_parse_wire_event_message_updated_zero_tokens_ignored() {
+        let json = r#"{"payload":{"type":"message.updated","properties":{"sessionId":"ses_abc","info":{"tokens":{"input":0,"output":0,"reasoning":0}}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "message.updated with all-zero tokens should return Unknown, got: {event:?}"
+        );
+    }
+
+    /// Verifies that message.updated with non-zero info.tokens emits TokensUpdated.
+    ///
+    /// This is the assistant message layout: tokens are at info.tokens.{input,output}.
+    #[test]
+    fn test_parse_wire_event_message_updated_with_info_tokens() {
+        let json = r#"{"payload":{"type":"message.updated","properties":{"sessionId":"ses_abc","info":{"tokens":{"input":1234,"output":567,"reasoning":0}}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(
+                event,
+                OpenCodeEvent::TokensUpdated {
+                    ref session_id,
+                    input_tokens: 1234,
+                    output_tokens: 567,
+                } if session_id == "ses_abc"
+            ),
+            "expected TokensUpdated from info.tokens path, got: {event:?}"
+        );
+    }
+
+    /// Verifies that message.updated with info.summary.tokens also emits TokensUpdated (fallback path).
+    #[test]
+    fn test_parse_wire_event_message_updated_with_summary_tokens() {
+        let json = r#"{"payload":{"type":"message.updated","properties":{"sessionId":"ses_abc","info":{"summary":{"tokens":{"input":2000,"output":800}}}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(
+                event,
+                OpenCodeEvent::TokensUpdated {
+                    ref session_id,
+                    input_tokens: 2000,
+                    output_tokens: 800,
+                } if session_id == "ses_abc"
+            ),
+            "expected TokensUpdated from info.summary.tokens path, got: {event:?}"
+        );
+    }
+
+    /// Verifies that a message.part.updated with no `part` object (legacy `parts` array)
+    /// still returns Unknown (non-tool payload is ignored).
+    #[test]
+    fn test_parse_wire_event_message_part_updated_no_part_object_ignored() {
         let json = r#"{"payload":{"type":"message.part.updated","properties":{"sessionId":"ses_abc","messageId":"msg_1","parts":[{"type":"text","text":"hello"}]}}}"#;
         let event = parse_wire_event(json);
         assert!(
             matches!(event, OpenCodeEvent::Unknown),
-            "message.part.updated should return Unknown (now ignored), got: {event:?}"
+            "message.part.updated with no part object should return Unknown, got: {event:?}"
+        );
+    }
+
+    /// Verifies that a message.part.updated with a tool part in pending state produces ToolPending.
+    #[test]
+    fn test_parse_tool_pending_from_message_part_updated() {
+        let json = r#"{"payload":{"type":"message.part.updated","properties":{"part":{"type":"tool","sessionID":"ses_abc","tool":"write","state":{"status":"pending"}}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(
+                event,
+                OpenCodeEvent::ToolPending { ref session_id, ref tool, .. }
+                    if session_id == "ses_abc" && tool == "write"
+            ),
+            "expected ToolPending, got: {event:?}"
+        );
+    }
+
+    /// Verifies that a message.part.updated with a tool part in running state produces ToolExecuting.
+    #[test]
+    fn test_parse_tool_running_from_message_part_updated() {
+        let json = r#"{"payload":{"type":"message.part.updated","properties":{"part":{"type":"tool","sessionID":"ses_abc","tool":"bash","state":{"status":"running"}}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(
+                event,
+                OpenCodeEvent::ToolExecuting { ref session_id, ref tool, .. }
+                    if session_id == "ses_abc" && tool == "bash"
+            ),
+            "expected ToolExecuting, got: {event:?}"
+        );
+    }
+
+    /// Verifies that a message.part.updated with a tool part in completed state produces ToolCompleted.
+    #[test]
+    fn test_parse_tool_completed_from_message_part_updated() {
+        let json = r#"{"payload":{"type":"message.part.updated","properties":{"part":{"type":"tool","sessionID":"ses_abc","tool":"read","state":{"status":"completed"}}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(
+                event,
+                OpenCodeEvent::ToolCompleted { ref session_id, ref tool, .. }
+                    if session_id == "ses_abc" && tool == "read"
+            ),
+            "expected ToolCompleted, got: {event:?}"
+        );
+    }
+
+    /// Verifies that a message.part.updated with a non-tool (text) part still returns Unknown.
+    #[test]
+    fn test_non_tool_message_part_updated_still_ignored() {
+        let json = r#"{"payload":{"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"ses_abc","text":"hello"}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "non-tool message.part.updated should return Unknown, got: {event:?}"
         );
     }
 

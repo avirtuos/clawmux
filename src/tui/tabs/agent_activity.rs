@@ -15,11 +15,31 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use tui_textarea::TextArea;
 
-use crate::opencode::types::{MessagePart, PermissionRequest};
+use crate::opencode::types::{DiffLineKind, DiffStatus, FileDiff, MessagePart, PermissionRequest};
 use crate::tasks::TaskId;
+use crate::tui::markdown::{markdown_to_lines, visual_line_count};
 
 /// Maximum number of buffer entries per task before old entries are trimmed.
 const MAX_BUFFER_ENTRIES: usize = 500;
+/// Maximum number of hunk lines shown in an inline diff preview.
+const MAX_DIFF_PREVIEW_LINES: usize = 8;
+
+/// A condensed representation of a single file's diff for inline display.
+#[derive(Debug, Clone)]
+pub struct DiffFileSummary {
+    /// Relative path to the changed file.
+    pub path: String,
+    /// Whether the file was added, modified, or deleted.
+    pub status: DiffStatus,
+    /// Number of lines added across all hunks.
+    pub lines_added: usize,
+    /// Number of lines removed across all hunks.
+    pub lines_removed: usize,
+    /// Total hunk lines (all kinds) for truncation detection.
+    pub total_hunk_lines: usize,
+    /// First N hunk lines for compact inline preview.
+    pub preview_lines: Vec<(DiffLineKind, String)>,
+}
 
 /// A single line of activity in the agent activity tab.
 #[derive(Debug, Clone)]
@@ -27,7 +47,12 @@ pub enum ActivityLine {
     /// A text segment from streaming output (Text, Reasoning, or File parts).
     Text { content: String },
     /// A tool invocation status update.
-    ToolActivity { tool: String, status: String },
+    ToolActivity {
+        tool: String,
+        status: String,
+        /// Human-readable summary of the tool's input (file path, command, etc.).
+        detail: Option<String>,
+    },
     /// A banner message from the agent (e.g. session start/complete).
     AgentBanner { message: String },
     /// A pending or resolved permission request from the agent.
@@ -44,6 +69,11 @@ pub enum ActivityLine {
         always: Vec<String>,
         /// Whether the user has already responded to this request.
         resolved: bool,
+    },
+    /// A compact inline diff summary showing files changed and their hunks.
+    DiffSummary {
+        /// Per-file summaries with stats and preview lines.
+        files: Vec<DiffFileSummary>,
     },
 }
 
@@ -64,6 +94,8 @@ enum BufferEntry {
     Tool(ActivityLine),
     /// A banner lifecycle event; always appended, never replaced.
     Banner(ActivityLine),
+    /// An inline diff summary; always appended, never replaced.
+    Diff(ActivityLine),
 }
 
 /// UI state for Tab 2 (Agent Activity).
@@ -106,6 +138,16 @@ pub struct Tab2State {
     ///
     /// Set when a `PermissionAsked` message arrives; cleared when the user responds.
     pub pending_permission: Option<(TaskId, PermissionRequest)>,
+    /// Per-task queued steering prompt (max 1).
+    ///
+    /// Set when the user submits a steering prompt while no session is active.
+    /// Drained at the end of each session turn (`SessionCompleted`) and sent to
+    /// the just-finished session so the agent processes it before the workflow advances.
+    queued_steering_prompts: HashMap<TaskId, String>,
+    /// Cumulative token counts per task: `(input_tokens, output_tokens)`.
+    ///
+    /// Updated whenever a `message.updated` SSE event carries token usage data.
+    task_tokens: HashMap<TaskId, (u64, u64)>,
 }
 
 impl Tab2State {
@@ -129,6 +171,8 @@ impl Tab2State {
             steering_input,
             steering_focused: false,
             pending_permission: None,
+            queued_steering_prompts: HashMap::new(),
+            task_tokens: HashMap::new(),
         }
     }
 
@@ -157,6 +201,7 @@ impl Tab2State {
                 MessagePart::Tool { name, .. } => Some(ActivityLine::ToolActivity {
                     tool: name.clone(),
                     status: "called".to_string(),
+                    detail: None,
                 }),
                 MessagePart::Unknown => None,
             })
@@ -184,16 +229,67 @@ impl Tab2State {
         }
     }
 
-    /// Appends a discrete `ToolActivity` line for `task_id`.
+    /// Upserts a `ToolActivity` line for `task_id`.
     ///
-    /// Tool activity events are always appended (never deduplicated).
+    /// Lifecycle transitions (`pending` → `running`/`executing` → `completed`) for the
+    /// same tool name are collapsed into a single line updated in place, so the activity
+    /// view shows one entry per tool call rather than three. The backward scan finds the
+    /// most recent entry for the same tool that is still in an earlier stage:
+    ///
+    /// - `running`/`executing`: updates the last `pending` entry for this tool.
+    /// - `completed`: updates the last `pending`/`running`/`executing` entry for this tool.
+    /// - All other statuses (including `pending`): always append a new entry.
+    ///
+    /// When updating in place, the `detail` field is replaced only if the new value is
+    /// `Some` (so a detail that arrives with the `running` event overwrites the empty
+    /// `pending` detail, but a `completed` event with no detail keeps the running detail).
+    ///
     /// Automatically scrolls to the bottom if the task is currently displayed.
-    pub fn push_tool(&mut self, task_id: &TaskId, tool: String, status: String) {
+    pub fn push_tool(
+        &mut self,
+        task_id: &TaskId,
+        tool: String,
+        status: String,
+        detail: Option<String>,
+    ) {
         let buffer = self.buffers.entry(task_id.clone()).or_default();
-        buffer.push(BufferEntry::Tool(ActivityLine::ToolActivity {
-            tool,
-            status,
-        }));
+
+        // Determine which earlier statuses this transition can collapse.
+        let earlier: &[&str] = match status.as_str() {
+            "running" | "executing" => &["pending"],
+            "completed" => &["pending", "running", "executing"],
+            _ => &[],
+        };
+
+        let mut updated = false;
+        if !earlier.is_empty() {
+            for entry in buffer.iter_mut().rev() {
+                if let BufferEntry::Tool(ActivityLine::ToolActivity {
+                    tool: ref t,
+                    status: ref mut s,
+                    detail: ref mut d,
+                }) = entry
+                {
+                    if t == &tool && earlier.contains(&s.as_str()) {
+                        *s = status.clone();
+                        if detail.is_some() {
+                            *d = detail.clone();
+                        }
+                        updated = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !updated {
+            buffer.push(BufferEntry::Tool(ActivityLine::ToolActivity {
+                tool,
+                status,
+                detail,
+            }));
+        }
+
         self.trim_buffer(task_id);
         if self.current_task_id.as_ref() == Some(task_id) {
             self.scroll_to_bottom(task_id);
@@ -207,6 +303,52 @@ impl Tab2State {
     pub fn push_banner(&mut self, task_id: &TaskId, message: String) {
         let buffer = self.buffers.entry(task_id.clone()).or_default();
         buffer.push(BufferEntry::Banner(ActivityLine::AgentBanner { message }));
+        self.trim_buffer(task_id);
+        if self.current_task_id.as_ref() == Some(task_id) {
+            self.scroll_to_bottom(task_id);
+        }
+    }
+
+    /// Appends an inline diff summary for `task_id`.
+    ///
+    /// Converts `&[FileDiff]` into a compact `DiffSummary` with per-file stats
+    /// and truncated hunk previews. Always appended, never deduplicated.
+    /// Automatically scrolls to the bottom if the task is currently displayed.
+    pub fn push_diff(&mut self, task_id: &TaskId, diffs: &[FileDiff]) {
+        let files: Vec<DiffFileSummary> = diffs
+            .iter()
+            .map(|fd| {
+                let mut lines_added = 0usize;
+                let mut lines_removed = 0usize;
+                let mut preview_lines = Vec::new();
+                let total_hunk_lines: usize = fd.hunks.iter().map(|h| h.lines.len()).sum();
+
+                for hunk in &fd.hunks {
+                    for line in &hunk.lines {
+                        match line.kind {
+                            DiffLineKind::Added => lines_added += 1,
+                            DiffLineKind::Removed => lines_removed += 1,
+                            DiffLineKind::Context => {}
+                        }
+                        if preview_lines.len() < MAX_DIFF_PREVIEW_LINES {
+                            preview_lines.push((line.kind.clone(), line.content.clone()));
+                        }
+                    }
+                }
+
+                DiffFileSummary {
+                    path: fd.path.clone(),
+                    status: fd.status.clone(),
+                    lines_added,
+                    lines_removed,
+                    total_hunk_lines,
+                    preview_lines,
+                }
+            })
+            .collect();
+
+        let buffer = self.buffers.entry(task_id.clone()).or_default();
+        buffer.push(BufferEntry::Diff(ActivityLine::DiffSummary { files }));
         self.trim_buffer(task_id);
         if self.current_task_id.as_ref() == Some(task_id) {
             self.scroll_to_bottom(task_id);
@@ -348,7 +490,9 @@ impl Tab2State {
                     .iter()
                     .flat_map(|e| match e {
                         BufferEntry::Message { lines, .. } => lines.clone(),
-                        BufferEntry::Tool(line) | BufferEntry::Banner(line) => vec![line.clone()],
+                        BufferEntry::Tool(line)
+                        | BufferEntry::Banner(line)
+                        | BufferEntry::Diff(line) => vec![line.clone()],
                     })
                     .collect()
             })
@@ -380,8 +524,23 @@ impl Tab2State {
     /// Returns whether an agent is actively working on the given task.
     ///
     /// Based on the `thinking_tasks` map which persists from prompt-sent to session completion.
+    #[allow(dead_code)]
     pub fn is_agent_active(&self, task_id: &TaskId) -> bool {
         self.thinking_tasks.contains_key(task_id)
+    }
+
+    /// Updates the cumulative token counts for a task.
+    ///
+    /// Replaces the stored `(input, output)` pair with the latest values reported
+    /// by the OpenCode `message.updated` SSE event.
+    pub fn update_tokens(&mut self, task_id: &TaskId, input_tokens: u64, output_tokens: u64) {
+        self.task_tokens
+            .insert(task_id.clone(), (input_tokens, output_tokens));
+    }
+
+    /// Returns the cumulative `(input_tokens, output_tokens)` for a task, if any have been reported.
+    pub fn get_tokens(&self, task_id: &TaskId) -> Option<(u64, u64)> {
+        self.task_tokens.get(task_id).copied()
     }
 
     /// Sets the steering textarea to the focused (yellow border) style.
@@ -459,161 +618,29 @@ impl Tab2State {
         self.steering_input = ta;
         self.steering_focused = false;
     }
+
+    /// Stores `text` as the pending steering prompt for `task_id`, replacing any
+    /// existing queued prompt (queue size is capped at 1).
+    pub fn queue_prompt(&mut self, task_id: TaskId, text: String) {
+        self.queued_steering_prompts.insert(task_id, text);
+    }
+
+    /// Removes and returns the queued steering prompt for `task_id`, if any.
+    pub fn take_queued_prompt(&mut self, task_id: &TaskId) -> Option<String> {
+        self.queued_steering_prompts.remove(task_id)
+    }
+
+    /// Returns `true` if there is a queued steering prompt for `task_id`.
+    #[allow(dead_code)]
+    pub fn has_queued_prompt(&self, task_id: &TaskId) -> bool {
+        self.queued_steering_prompts.contains_key(task_id)
+    }
 }
 
 impl Default for Tab2State {
     fn default() -> Self {
         Tab2State::new()
     }
-}
-
-/// Converts a markdown string into styled ratatui [`Line`]s.
-///
-/// Uses `pulldown-cmark` to parse the input and applies ratatui styles:
-/// - Bold (`**text**`) → [`Modifier::BOLD`]
-/// - Italic (`*text*`) → [`Modifier::ITALIC`]
-/// - Inline code (`` `code` ``) → cyan text
-/// - Code blocks → dark gray text, split on newlines
-/// - Headings → bold + color (H1=Cyan, H2=Blue, other=LightBlue)
-/// - Soft/hard breaks → new [`Line`]
-/// - List items → `- ` prefix
-///
-/// Returns a `Vec<Line<'static>>` suitable for rendering with ratatui's [`Paragraph`].
-fn markdown_to_lines(input: &str) -> Vec<Line<'static>> {
-    use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut current_spans: Vec<Span<'static>> = Vec::new();
-    let mut bold = false;
-    let mut italic = false;
-    let mut in_code_block = false;
-    let mut heading_color: Option<Color> = None;
-    let mut list_depth: usize = 0;
-
-    let parser = Parser::new_ext(input, Options::empty());
-
-    for event in parser {
-        match event {
-            Event::Start(Tag::Heading { level, .. }) => {
-                bold = true;
-                heading_color = Some(match level {
-                    HeadingLevel::H1 => Color::Cyan,
-                    HeadingLevel::H2 => Color::Blue,
-                    _ => Color::LightBlue,
-                });
-            }
-            Event::End(TagEnd::Heading(_)) => {
-                lines.push(Line::from(std::mem::take(&mut current_spans)));
-                lines.push(Line::from(""));
-                bold = false;
-                heading_color = None;
-            }
-            Event::Start(Tag::Paragraph) => {}
-            Event::End(TagEnd::Paragraph) => {
-                if !current_spans.is_empty() {
-                    lines.push(Line::from(std::mem::take(&mut current_spans)));
-                }
-                lines.push(Line::from(""));
-            }
-            Event::Start(Tag::Strong) => {
-                bold = true;
-            }
-            Event::End(TagEnd::Strong) => {
-                bold = false;
-            }
-            Event::Start(Tag::Emphasis) => {
-                italic = true;
-            }
-            Event::End(TagEnd::Emphasis) => {
-                italic = false;
-            }
-            Event::Start(Tag::CodeBlock(_)) => {
-                in_code_block = true;
-            }
-            Event::End(TagEnd::CodeBlock) => {
-                if !current_spans.is_empty() {
-                    lines.push(Line::from(std::mem::take(&mut current_spans)));
-                }
-                lines.push(Line::from(""));
-                in_code_block = false;
-            }
-            Event::Code(text) => {
-                // Inline code span.
-                let style = Style::default().fg(Color::Cyan);
-                current_spans.push(Span::styled(format!("`{}`", text.as_ref()), style));
-            }
-            Event::Start(Tag::List(_)) => {
-                list_depth += 1;
-            }
-            Event::End(TagEnd::List(_)) => {
-                list_depth = list_depth.saturating_sub(1);
-            }
-            Event::Start(Tag::Item) => {
-                let indent = "  ".repeat(list_depth.saturating_sub(1));
-                current_spans.push(Span::raw(format!("{}- ", indent)));
-            }
-            Event::End(TagEnd::Item) => {
-                if !current_spans.is_empty() {
-                    lines.push(Line::from(std::mem::take(&mut current_spans)));
-                }
-            }
-            Event::Text(text) => {
-                let mut style = Style::default();
-                if bold {
-                    style = style.add_modifier(Modifier::BOLD);
-                }
-                if italic {
-                    style = style.add_modifier(Modifier::ITALIC);
-                }
-                if let Some(color) = heading_color {
-                    style = style.fg(color);
-                }
-                if in_code_block {
-                    style = style.fg(Color::DarkGray);
-                    // Code block text may contain embedded newlines; split into separate lines.
-                    for (i, segment) in text.as_ref().split('\n').enumerate() {
-                        if i > 0 {
-                            lines.push(Line::from(std::mem::take(&mut current_spans)));
-                        }
-                        if !segment.is_empty() {
-                            current_spans.push(Span::styled(segment.to_string(), style));
-                        }
-                    }
-                } else {
-                    current_spans.push(Span::styled(text.to_string(), style));
-                }
-            }
-            Event::SoftBreak | Event::HardBreak => {
-                lines.push(Line::from(std::mem::take(&mut current_spans)));
-            }
-            _ => {}
-        }
-    }
-
-    if !current_spans.is_empty() {
-        lines.push(Line::from(current_spans));
-    }
-
-    lines
-}
-
-/// Computes the total number of visual (wrapped) lines for `lines` at a given `width`.
-///
-/// Each `Line` whose display width exceeds `width` wraps into multiple visual rows.
-/// Empty lines always contribute exactly one visual row.
-fn visual_line_count(lines: &[Line], width: u16) -> usize {
-    let w = width.max(1) as usize;
-    lines
-        .iter()
-        .map(|line| {
-            let lw = line.width();
-            if lw == 0 {
-                1
-            } else {
-                lw.div_ceil(w)
-            }
-        })
-        .sum()
 }
 
 /// Renders the Agent Activity tab into `area`.
@@ -644,16 +671,33 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
         .into_iter()
         .flat_map(|line| match line {
             ActivityLine::Text { content } => markdown_to_lines(&content),
-            ActivityLine::ToolActivity { tool, status } => vec![Line::from(vec![
-                Span::styled(
+            ActivityLine::ToolActivity {
+                tool,
+                status,
+                detail,
+            } => {
+                let status_style = match status.as_str() {
+                    "pending" => Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                    "executing" | "running" => Style::default().fg(Color::Cyan),
+                    "completed" => Style::default().fg(Color::DarkGray),
+                    _ => Style::default().fg(Color::Yellow),
+                };
+                let mut spans = vec![Span::styled(
                     format!("[{tool}]"),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(status, Style::default().fg(Color::Yellow)),
-            ])],
+                )];
+                if let Some(d) = detail {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(d, Style::default().fg(Color::DarkGray)));
+                }
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(status, status_style));
+                vec![Line::from(spans)]
+            }
             ActivityLine::AgentBanner { message } => vec![Line::from(Span::styled(
                 message,
                 Style::default()
@@ -701,6 +745,71 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
                 }
                 result
             }
+            ActivityLine::DiffSummary { files } => {
+                let mut result: Vec<Line<'static>> = Vec::new();
+
+                // Section header
+                result.push(Line::from(Span::styled(
+                    "--- Diff ---",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                )));
+
+                for file in files {
+                    let status_label = match file.status {
+                        DiffStatus::Added => "[+added]",
+                        DiffStatus::Modified => "[modified]",
+                        DiffStatus::Deleted => "[-deleted]",
+                    };
+                    result.push(Line::from(vec![
+                        Span::styled(
+                            format!("  {} ", file.path),
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("{} ", status_label),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            format!("+{}", file.lines_added),
+                            Style::default().fg(Color::Green),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("-{}", file.lines_removed),
+                            Style::default().fg(Color::Red),
+                        ),
+                    ]));
+
+                    for (kind, content) in &file.preview_lines {
+                        let (prefix, color) = match kind {
+                            DiffLineKind::Added => ("+", Color::Green),
+                            DiffLineKind::Removed => ("-", Color::Red),
+                            DiffLineKind::Context => (" ", Color::DarkGray),
+                        };
+                        result.push(Line::from(Span::styled(
+                            format!("    {}{}", prefix, content),
+                            Style::default().fg(color),
+                        )));
+                    }
+
+                    if file.preview_lines.len() < file.total_hunk_lines {
+                        result.push(Line::from(Span::styled(
+                            format!(
+                                "    ... ({} more lines)",
+                                file.total_hunk_lines - file.preview_lines.len()
+                            ),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                }
+
+                result.push(Line::from(""));
+                result
+            }
         })
         .collect();
 
@@ -713,12 +822,8 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
         )));
     }
 
-    // Determine whether the steering textarea should be shown.
-    let show_steering = state.is_agent_active(task_id);
-
-    // Compute the activity area: when steering is shown, split off 6 rows at the bottom
-    // (4 text rows + 2 border rows). When not shown, use the full area.
-    let (activity_area, steering_area_opt) = if show_steering {
+    // Only allocate space for the steering textarea when it is focused.
+    let (activity_area, steering_area) = if state.steering_focused {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(6)])
@@ -748,9 +853,8 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
         .scroll((effective_scroll as u16, 0));
 
     frame.render_widget(paragraph, activity_area);
-
-    if let Some(steering_area) = steering_area_opt {
-        frame.render_widget(&state.steering_input, steering_area);
+    if let Some(sa) = steering_area {
+        frame.render_widget(&state.steering_input, sa);
     }
 }
 
@@ -839,11 +943,152 @@ mod tests {
     fn test_push_tool_activity() {
         let mut state = Tab2State::new();
         let id = task_id();
-        state.push_tool(&id, "bash".to_string(), "running".to_string());
+        state.push_tool(&id, "bash".to_string(), "running".to_string(), None);
         let lines = state.lines_for(&id);
         assert_eq!(lines.len(), 1);
         assert!(
-            matches!(&lines[0], ActivityLine::ToolActivity { tool, status } if tool == "bash" && status == "running")
+            matches!(&lines[0], ActivityLine::ToolActivity { tool, status, .. } if tool == "bash" && status == "running")
+        );
+    }
+
+    /// pending then running for the same tool collapses to a single entry.
+    #[test]
+    fn test_push_tool_collapses_pending_to_running() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.push_tool(&id, "bash".to_string(), "pending".to_string(), None);
+        state.push_tool(
+            &id,
+            "bash".to_string(),
+            "running".to_string(),
+            Some("cargo build".to_string()),
+        );
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), 1, "pending+running should collapse to 1 entry");
+        assert!(
+            matches!(&lines[0], ActivityLine::ToolActivity { tool, status, detail }
+                if tool == "bash" && status == "running" && detail.as_deref() == Some("cargo build")),
+            "entry should show running status with detail; got: {:?}",
+            lines[0]
+        );
+    }
+
+    /// pending -> running -> completed collapses to a single entry.
+    #[test]
+    fn test_push_tool_collapses_full_lifecycle() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.push_tool(&id, "write".to_string(), "pending".to_string(), None);
+        state.push_tool(
+            &id,
+            "write".to_string(),
+            "running".to_string(),
+            Some("src/main.rs".to_string()),
+        );
+        state.push_tool(&id, "write".to_string(), "completed".to_string(), None);
+        let lines = state.lines_for(&id);
+        assert_eq!(
+            lines.len(),
+            1,
+            "pending+running+completed should collapse to 1 entry"
+        );
+        assert!(
+            matches!(&lines[0], ActivityLine::ToolActivity { tool, status, detail }
+                if tool == "write" && status == "completed" && detail.as_deref() == Some("src/main.rs")),
+            "entry should be completed with detail from running stage; got: {:?}",
+            lines[0]
+        );
+    }
+
+    /// completed with no detail preserves the detail set during running.
+    #[test]
+    fn test_push_tool_preserves_detail_when_completed_has_none() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.push_tool(
+            &id,
+            "read".to_string(),
+            "running".to_string(),
+            Some("src/lib.rs".to_string()),
+        );
+        state.push_tool(&id, "read".to_string(), "completed".to_string(), None);
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            matches!(&lines[0], ActivityLine::ToolActivity { status, detail, .. }
+                if status == "completed" && detail.as_deref() == Some("src/lib.rs")),
+            "detail from running stage should be preserved when completed has None; got: {:?}",
+            lines[0]
+        );
+    }
+
+    /// Different tools each get their own entry; they are not cross-collapsed.
+    #[test]
+    fn test_push_tool_separate_tools_not_collapsed() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.push_tool(&id, "bash".to_string(), "pending".to_string(), None);
+        state.push_tool(&id, "write".to_string(), "pending".to_string(), None);
+        state.push_tool(&id, "bash".to_string(), "completed".to_string(), None);
+        state.push_tool(&id, "write".to_string(), "completed".to_string(), None);
+        let lines = state.lines_for(&id);
+        assert_eq!(
+            lines.len(),
+            2,
+            "two distinct tools should produce 2 collapsed entries"
+        );
+        assert!(
+            matches!(&lines[0], ActivityLine::ToolActivity { tool, status, .. }
+                if tool == "bash" && status == "completed"),
+            "first entry should be completed bash; got: {:?}",
+            lines[0]
+        );
+        assert!(
+            matches!(&lines[1], ActivityLine::ToolActivity { tool, status, .. }
+                if tool == "write" && status == "completed"),
+            "second entry should be completed write; got: {:?}",
+            lines[1]
+        );
+    }
+
+    /// Two sequential calls to the same tool produce two separate entries.
+    #[test]
+    fn test_push_tool_sequential_same_tool_produces_two_entries() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        // First bash call: full lifecycle.
+        state.push_tool(&id, "bash".to_string(), "pending".to_string(), None);
+        state.push_tool(
+            &id,
+            "bash".to_string(),
+            "running".to_string(),
+            Some("cargo fmt".to_string()),
+        );
+        state.push_tool(&id, "bash".to_string(), "completed".to_string(), None);
+        // Second bash call: pending only (still in progress).
+        state.push_tool(
+            &id,
+            "bash".to_string(),
+            "pending".to_string(),
+            Some("cargo build".to_string()),
+        );
+        let lines = state.lines_for(&id);
+        assert_eq!(
+            lines.len(),
+            2,
+            "two sequential bash calls should produce 2 entries"
+        );
+        assert!(
+            matches!(&lines[0], ActivityLine::ToolActivity { tool, status, .. }
+                if tool == "bash" && status == "completed"),
+            "first entry should be the completed bash call; got: {:?}",
+            lines[0]
+        );
+        assert!(
+            matches!(&lines[1], ActivityLine::ToolActivity { tool, status, detail }
+                if tool == "bash" && status == "pending" && detail.as_deref() == Some("cargo build")),
+            "second entry should be the new pending bash call; got: {:?}",
+            lines[1]
         );
     }
 
@@ -1137,49 +1382,6 @@ mod tests {
         );
     }
 
-    /// Verifies that `**bold**` markdown produces a span with the BOLD modifier.
-    #[test]
-    fn test_markdown_bold_produces_bold_span() {
-        let lines = markdown_to_lines("**bold**");
-        let has_bold = lines.iter().any(|line| {
-            line.spans.iter().any(|span| {
-                span.style
-                    .add_modifier
-                    .contains(ratatui::style::Modifier::BOLD)
-            })
-        });
-        assert!(
-            has_bold,
-            "**bold** should produce a span with BOLD modifier; lines: {lines:?}"
-        );
-    }
-
-    /// Verifies that two lines separated by a newline produce at least 2 non-empty Lines.
-    #[test]
-    fn test_markdown_multiline_splits_lines() {
-        let lines = markdown_to_lines("line1\nline2");
-        let non_empty: Vec<_> = lines.iter().filter(|l| l.width() > 0).collect();
-        assert!(
-            non_empty.len() >= 2,
-            "should produce at least 2 non-empty lines from 'line1\\nline2'; got {} total: {lines:?}",
-            lines.len()
-        );
-    }
-
-    /// Verifies that plain text passes through without losing content.
-    #[test]
-    fn test_markdown_plain_text_passthrough() {
-        let lines = markdown_to_lines("hello world");
-        assert!(!lines.is_empty(), "should produce at least one line");
-        let found = lines
-            .iter()
-            .any(|l| l.spans.iter().any(|s| s.content.contains("hello world")));
-        assert!(
-            found,
-            "plain text 'hello world' should appear in output; lines: {lines:?}"
-        );
-    }
-
     /// Verifies that `any_thinking_status` returns None when no task is awaiting.
     #[test]
     fn test_any_thinking_status_none_by_default() {
@@ -1240,7 +1442,7 @@ mod tests {
 
     /// Verifies that is_agent_active returns true when an agent is active for the task.
     #[test]
-    fn test_tab2_steering_textarea_visible_when_active() {
+    fn test_is_agent_active_true_when_thinking() {
         let mut state = Tab2State::new();
         let id = task_id();
         state.set_awaiting_response(&id, "Intake Agent".to_string());
@@ -1252,12 +1454,73 @@ mod tests {
 
     /// Verifies that is_agent_active returns false when no agent is active for the task.
     #[test]
-    fn test_tab2_steering_textarea_hidden_when_idle() {
+    fn test_is_agent_active_false_when_idle() {
         let state = Tab2State::new();
         let id = task_id();
         assert!(
             !state.is_agent_active(&id),
             "is_agent_active should return false with no thinking_tasks entry"
+        );
+    }
+
+    /// Verifies that queue_prompt stores a prompt and take_queued_prompt drains it.
+    #[test]
+    fn test_queue_prompt_stores_and_dequeues() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        assert!(!state.has_queued_prompt(&id), "no prompt queued initially");
+        state.queue_prompt(id.clone(), "steer me".to_string());
+        assert!(state.has_queued_prompt(&id), "prompt should be queued");
+        let dequeued = state.take_queued_prompt(&id);
+        assert_eq!(dequeued, Some("steer me".to_string()));
+        assert!(
+            !state.has_queued_prompt(&id),
+            "queue should be empty after take"
+        );
+    }
+
+    /// Verifies that a second queue_prompt replaces the first (max queue size of 1).
+    #[test]
+    fn test_queue_prompt_replaces_existing() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.queue_prompt(id.clone(), "first prompt".to_string());
+        state.queue_prompt(id.clone(), "second prompt".to_string());
+        let dequeued = state.take_queued_prompt(&id);
+        assert_eq!(
+            dequeued,
+            Some("second prompt".to_string()),
+            "second queue_prompt should replace the first"
+        );
+    }
+
+    /// Verifies that take_queued_prompt returns None when nothing is queued.
+    #[test]
+    fn test_take_queued_prompt_empty() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        assert_eq!(state.take_queued_prompt(&id), None);
+    }
+
+    /// Verifies that queued prompts are isolated per task.
+    #[test]
+    fn test_queue_prompt_isolated_per_task() {
+        let mut state = Tab2State::new();
+        let id1 = TaskId::from_path("tasks/1.1.md");
+        let id2 = TaskId::from_path("tasks/1.2.md");
+        state.queue_prompt(id1.clone(), "for task 1".to_string());
+        assert!(
+            !state.has_queued_prompt(&id2),
+            "task 2 should have no queue"
+        );
+        assert_eq!(
+            state.take_queued_prompt(&id2),
+            None,
+            "take on task 2 should return None"
+        );
+        assert_eq!(
+            state.take_queued_prompt(&id1),
+            Some("for task 1".to_string())
         );
     }
 
@@ -1338,19 +1601,255 @@ mod tests {
         );
     }
 
-    /// Verifies that visual_line_count correctly counts wrapped lines.
-    #[test]
-    fn test_visual_line_count_wrapping() {
-        // A line of width 10 in a 5-wide viewport wraps to 2 visual rows.
-        let lines = vec![
-            Line::from("abcdefghij"), // width 10
-            Line::from("ab"),         // width 2
-            Line::from(""),           // empty -> 1 row
-        ];
-        // At width=5: ceil(10/5)=2 + ceil(2/5)=1 + 1(empty) = 4
-        assert_eq!(visual_line_count(&lines, 5), 4);
+    // --- push_diff tests ---
 
-        // At width=10: ceil(10/10)=1 + 1 + 1 = 3
-        assert_eq!(visual_line_count(&lines, 10), 3);
+    fn make_file_diff(
+        path: &str,
+        status: DiffStatus,
+        lines: Vec<(DiffLineKind, &str)>,
+    ) -> FileDiff {
+        use crate::opencode::types::{DiffHunk, DiffLine};
+        let hunk_lines = lines
+            .into_iter()
+            .map(|(kind, content)| DiffLine {
+                kind,
+                content: content.to_string(),
+            })
+            .collect();
+        FileDiff {
+            path: path.to_string(),
+            status,
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                new_start: 1,
+                lines: hunk_lines,
+            }],
+        }
+    }
+
+    /// Verifies that push_diff creates a buffer entry and lines_for returns one DiffSummary.
+    #[test]
+    fn test_push_diff_creates_buffer_entry() {
+        use crate::opencode::types::DiffStatus;
+
+        let mut state = Tab2State::new();
+        let id = task_id();
+        let diff = make_file_diff(
+            "src/main.rs",
+            DiffStatus::Modified,
+            vec![(DiffLineKind::Added, "fn main() {}")],
+        );
+        state.push_diff(&id, &[diff]);
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), 1, "should have exactly one DiffSummary line");
+        assert!(
+            matches!(&lines[0], ActivityLine::DiffSummary { files } if files.len() == 1),
+            "DiffSummary should contain 1 file; got: {:?}",
+            lines[0]
+        );
+    }
+
+    /// Verifies that push_diff correctly computes stats for added/removed lines.
+    #[test]
+    fn test_push_diff_summary_stats() {
+        use crate::opencode::types::DiffStatus;
+
+        let mut state = Tab2State::new();
+        let id = task_id();
+        let diff = make_file_diff(
+            "src/lib.rs",
+            DiffStatus::Modified,
+            vec![
+                (DiffLineKind::Context, "context line"),
+                (DiffLineKind::Added, "added line 1"),
+                (DiffLineKind::Added, "added line 2"),
+                (DiffLineKind::Removed, "removed line"),
+            ],
+        );
+        state.push_diff(&id, &[diff]);
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), 1);
+        if let ActivityLine::DiffSummary { files } = &lines[0] {
+            let f = &files[0];
+            assert_eq!(f.path, "src/lib.rs");
+            assert!(matches!(f.status, DiffStatus::Modified));
+            assert_eq!(f.lines_added, 2, "lines_added should be 2");
+            assert_eq!(f.lines_removed, 1, "lines_removed should be 1");
+            assert_eq!(f.total_hunk_lines, 4, "total_hunk_lines should be 4");
+        } else {
+            panic!("expected DiffSummary, got: {:?}", lines[0]);
+        }
+    }
+
+    /// Verifies that push_diff truncates preview_lines to MAX_DIFF_PREVIEW_LINES.
+    #[test]
+    fn test_push_diff_truncates_preview() {
+        use crate::opencode::types::DiffStatus;
+
+        let mut state = Tab2State::new();
+        let id = task_id();
+        // 20 added lines -- well above MAX_DIFF_PREVIEW_LINES (8).
+        let hunk_lines: Vec<(DiffLineKind, &str)> =
+            (0..20).map(|_| (DiffLineKind::Added, "line")).collect();
+        let diff = make_file_diff("src/big.rs", DiffStatus::Modified, hunk_lines);
+        state.push_diff(&id, &[diff]);
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), 1);
+        if let ActivityLine::DiffSummary { files } = &lines[0] {
+            let f = &files[0];
+            assert_eq!(
+                f.preview_lines.len(),
+                MAX_DIFF_PREVIEW_LINES,
+                "preview should be capped at MAX_DIFF_PREVIEW_LINES"
+            );
+            assert_eq!(f.total_hunk_lines, 20, "total_hunk_lines should be 20");
+        } else {
+            panic!("expected DiffSummary, got: {:?}", lines[0]);
+        }
+    }
+
+    /// Verifies that push_diff interleaves correctly with other entry types.
+    #[test]
+    fn test_push_diff_interleaves_with_other_entries() {
+        use crate::opencode::types::DiffStatus;
+
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.push_banner(&id, "session started".to_string());
+        state.push_streaming(
+            &id,
+            "msg-1",
+            &[MessagePart::Text {
+                text: "working...".to_string(),
+            }],
+        );
+        let diff = make_file_diff(
+            "src/foo.rs",
+            DiffStatus::Added,
+            vec![(DiffLineKind::Added, "new file content")],
+        );
+        state.push_diff(&id, &[diff]);
+        state.push_tool(&id, "bash".to_string(), "done".to_string(), None);
+
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), 4, "should have 4 lines in order");
+        assert!(
+            matches!(&lines[0], ActivityLine::AgentBanner { .. }),
+            "first should be banner"
+        );
+        assert!(
+            matches!(&lines[1], ActivityLine::Text { .. }),
+            "second should be text"
+        );
+        assert!(
+            matches!(&lines[2], ActivityLine::DiffSummary { .. }),
+            "third should be diff summary"
+        );
+        assert!(
+            matches!(&lines[3], ActivityLine::ToolActivity { .. }),
+            "fourth should be tool activity"
+        );
+    }
+
+    /// Verifies that update_tokens stores values and get_tokens retrieves them.
+    #[test]
+    fn test_update_and_get_tokens() {
+        let mut state = Tab2State::new();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+
+        assert!(
+            state.get_tokens(&task_id).is_none(),
+            "tokens should be None before any update"
+        );
+
+        state.update_tokens(&task_id, 1000, 250);
+        assert_eq!(
+            state.get_tokens(&task_id),
+            Some((1000, 250)),
+            "tokens should match after update"
+        );
+
+        // Subsequent update replaces previous values.
+        state.update_tokens(&task_id, 2000, 500);
+        assert_eq!(
+            state.get_tokens(&task_id),
+            Some((2000, 500)),
+            "tokens should be replaced by second update"
+        );
+    }
+
+    /// Verifies that token counts are per-task and do not bleed between tasks.
+    #[test]
+    fn test_tokens_are_per_task() {
+        let mut state = Tab2State::new();
+        let task1 = TaskId::from_path("tasks/1.1.md");
+        let task2 = TaskId::from_path("tasks/1.2.md");
+
+        state.update_tokens(&task1, 100, 50);
+        assert_eq!(state.get_tokens(&task1), Some((100, 50)));
+        assert!(
+            state.get_tokens(&task2).is_none(),
+            "task2 should have no tokens"
+        );
+    }
+
+    /// Verifies that render() does not panic when steering is unfocused and area is small.
+    ///
+    /// When `steering_focused` is false the activity area should consume the full rect,
+    /// so no 6-row steering section is subtracted even on a very constrained terminal.
+    #[test]
+    fn test_render_unfocused_steering_uses_full_area() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut state = Tab2State::new();
+        state.steering_focused = false;
+        let id = task_id();
+        state.set_displayed_task(Some(&id));
+        state.push_streaming(
+            &id,
+            "msg-1",
+            &[MessagePart::Text {
+                text: "hello".to_string(),
+            }],
+        );
+
+        // A small area (8 rows) that would be completely consumed by the 6-row steering
+        // block if it were always rendered -- this must not panic.
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), Some(&id), &state);
+            })
+            .unwrap();
+    }
+
+    /// Verifies that render() does not panic when steering is focused and area is adequate.
+    ///
+    /// When `steering_focused` is true the layout splits into activity + 6-row steering.
+    #[test]
+    fn test_render_focused_steering_splits_area() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut state = Tab2State::new();
+        state.steering_focused = true;
+        state.set_steering_focused_style();
+        let id = task_id();
+        state.set_displayed_task(Some(&id));
+        state.push_streaming(
+            &id,
+            "msg-1",
+            &[MessagePart::Text {
+                text: "hello".to_string(),
+            }],
+        );
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), Some(&id), &state);
+            })
+            .unwrap();
     }
 }

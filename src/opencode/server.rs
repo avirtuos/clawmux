@@ -609,6 +609,7 @@ mod tests {
                 port,
                 password: None,
             },
+            workflow: crate::config::WorkflowConfig::default(),
         }
     }
 

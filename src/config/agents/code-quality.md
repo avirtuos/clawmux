@@ -1,7 +1,7 @@
 ---
 description: Ensures adequate test coverage and adherence to coding standards
 mode: subagent
-model: anthropic/claude-sonnet-4-5
+model: openrouter/anthropic/claude-sonnet-4.6
 steps: 30
 tools:
   read: true

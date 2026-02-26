@@ -158,7 +158,10 @@ Scaffolding project...
   created .opencode/agents/clawdmux/code-quality.md
   created .opencode/agents/clawdmux/security-review.md
   created .opencode/agents/clawdmux/code-review.md
-  created tasks/  (task file directory)
+  created tasks/tasks.md
+  created tasks/1.1.md
+  created tasks/1.2.md
+  created tasks/2.1.md
 ```
 
 The agent definition files contain sensible defaults. Users may edit them to customize agent behaviour. Running `clawdmux init --reset-agents` regenerates them from built-in defaults.
@@ -451,6 +454,33 @@ Pipeline: Intake -> Design -> Planning -> Implementation -> CodeQuality -> Secur
 13. Human reviews in Tab 4 (diff view + comments), approves or requests revisions
 14. If human requests revisions -> `HumanRequestedRevisions` -> `CodeReview` agent receives combined feedback (its own findings + human comments) and kicks back to the appropriate agent
 15. If human approves -> `HumanApprovedReview` -> `CodeReview` agent prepares commit message -> task enters `Completed`
+
+### Human Approval Gate
+
+Between each agent handoff, ClawdMux can pause and require explicit human approval before starting the next agent. This allows the user to inspect intermediate results at each pipeline stage without having to race against automatic progression.
+
+**Behavior:**
+- When an agent completes (via `AgentCompleted`, `AgentKickedBack`, or `SessionCompleted` fallback), the workflow engine transitions to `WorkflowPhase::AwaitingApproval { next_agent, context }` instead of immediately emitting `CreateSession`.
+- The Team Status tab (Tab 5) shows `"Awaiting approval to start <Agent Name>"` in the Phase panel.
+- The next agent is highlighted in **magenta** in the pipeline bar.
+- The footer shows `[n] next agent` as an available action.
+- When the human presses `n` on Tab 5, a `HumanApprovedTransition` message is dispatched. The workflow engine transitions to `Running` and emits `CreateSession` for the pending agent.
+
+**Configuration:**
+The gate is **on by default**. Disable it by adding the following to `.clawdmux/config.toml`:
+
+```toml
+[workflow]
+approval_gate = false
+```
+
+When disabled, the pipeline advances automatically without pausing between agents (original behavior).
+
+**Implementation:**
+- `WorkflowPhase::AwaitingApproval { next_agent: AgentKind, context: Option<String> }` -- new phase variant
+- `AppMessage::HumanApprovedTransition { task_id: TaskId }` -- new message dispatched by Tab 5 `n` key
+- `WorkflowEngine::new(approval_gate_enabled: bool)` -- gate flag wired from `AppConfig::workflow.approval_gate`
+- `WorkflowConfig` struct in `src/config/mod.rs` with `approval_gate: bool` (default: `true`)
 
 ### OpenCode Client Layer
 

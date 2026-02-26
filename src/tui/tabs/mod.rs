@@ -1,6 +1,6 @@
 //! Tab bar and tab dispatch.
 //!
-//! Renders the 7-tab right pane (Details, Questions, Design, Plan, Agent Activity, Team Status, Review)
+//! Renders the 8-tab right pane (Details, Questions, Design, Plan, Agent Activity, Team Status, Review, Code Diff)
 //! and dispatches input events to the currently active tab.
 
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -15,10 +15,11 @@ pub mod code_review;
 pub mod design;
 pub mod plan;
 pub mod questions;
+pub mod review;
 pub mod task_details;
 pub mod team_status;
 
-/// Returns tab titles for the seven right-pane tabs.
+/// Returns tab titles for the eight right-pane tabs.
 ///
 /// Appends `*` to "Questions" when the selected task has any unanswered questions,
 /// so the user can see at a glance that input is needed.
@@ -41,6 +42,7 @@ pub fn tab_titles(app: &App) -> Vec<&'static str> {
         "Agent Activity",
         "Team Status",
         "Review",
+        "Code Diff",
     ]
 }
 
@@ -107,6 +109,10 @@ pub fn render(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         }
         6 => {
             let task_id = app.selected_task();
+            review::render(frame, content_area, task_id, &app.review_state);
+        }
+        7 => {
+            let task_id = app.selected_task();
             code_review::render(frame, content_area, task_id, &app.tab4_state);
         }
         _ => {
@@ -129,8 +135,8 @@ mod tests {
     use crate::app::App;
 
     #[test]
-    fn test_tab_bar_renders_seven_tabs() {
-        let backend = TestBackend::new(120, 24);
+    fn test_tab_bar_renders_eight_tabs() {
+        let backend = TestBackend::new(160, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::test_default();
 
@@ -174,6 +180,10 @@ mod tests {
         assert!(
             content.contains("Review"),
             "Buffer should contain 'Review' tab label"
+        );
+        assert!(
+            content.contains("Code Diff"),
+            "Buffer should contain 'Code Diff' tab label"
         );
     }
 

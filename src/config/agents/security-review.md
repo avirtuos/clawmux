@@ -1,7 +1,7 @@
 ---
 description: Audits code for security vulnerabilities and credential exposure
 mode: subagent
-model: anthropic/claude-sonnet-4-5
+model: openrouter/anthropic/claude-sonnet-4.6
 steps: 20
 tools:
   read: true

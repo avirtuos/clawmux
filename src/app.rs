@@ -18,6 +18,7 @@ use crate::tui::tabs::code_review::Tab4State;
 use crate::tui::tabs::design::DesignTabState;
 use crate::tui::tabs::plan::PlanTabState;
 use crate::tui::tabs::questions::QuestionsTabState;
+use crate::tui::tabs::review::ReviewTabState;
 use crate::tui::tabs::task_details::Tab1State;
 use crate::tui::tabs::team_status::Tab3State;
 use crate::tui::task_list::TaskListState;
@@ -62,6 +63,8 @@ pub struct App {
     pub tab3_state: Tab3State,
     /// UI state for Tab 4 (Code Review): per-task diff storage.
     pub tab4_state: Tab4State,
+    /// UI state for Tab 6 (Review Discussion): per-task review timeline.
+    pub review_state: ReviewTabState,
     /// Shared HTTP client for async opencode session operations.
     pub opencode_client: Option<Arc<OpenCodeClient>>,
     /// Shared map from session ID to (TaskId, AgentKind), used by EventStreamConsumer.
@@ -83,11 +86,13 @@ impl App {
     /// * `opencode_client` - Optional shared HTTP client for opencode session operations.
     /// * `session_map` - Shared map correlating session IDs to tasks and agents.
     /// * `async_tx` - Channel sender for routing async task results back to the event loop.
+    /// * `approval_gate` - When `true`, pause and require human approval between agents.
     pub fn new(
         task_store: TaskStore,
         opencode_client: Option<Arc<OpenCodeClient>>,
         session_map: SessionMap,
         async_tx: mpsc::Sender<AppMessage>,
+        approval_gate: bool,
     ) -> Self {
         let cached_stories = task_store.stories();
         let mut task_list_state = TaskListState::new();
@@ -105,9 +110,10 @@ impl App {
             design_state: DesignTabState::new(),
             plan_state: PlanTabState::new(),
             tab2_state: Tab2State::new(),
-            workflow_engine: WorkflowEngine::new(),
+            workflow_engine: WorkflowEngine::new(approval_gate),
             tab3_state: Tab3State::new(),
             tab4_state: Tab4State::new(),
+            review_state: ReviewTabState::new(),
             opencode_client,
             session_map,
             async_tx,
@@ -165,7 +171,41 @@ impl App {
         use tokio::sync::RwLock;
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let session_map = Arc::new(RwLock::new(HashMap::new()));
-        App::new(TaskStore::new(), None, session_map, tx)
+        App::new(TaskStore::new(), None, session_map, tx, false)
+    }
+
+    /// Reads the workflow engine's post-transition state for a task and syncs
+    /// `task.assigned_to` and `task.status` to match.
+    ///
+    /// Called after the engine processes an `AgentCompleted` event so the task
+    /// model stays in sync with the pipeline phase.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - The task to update.
+    /// * `actor` - The agent whose action triggered this sync (recorded in the work log).
+    fn sync_task_with_workflow(&mut self, task_id: &TaskId, actor: AgentKind) {
+        let state_snapshot = self
+            .workflow_engine
+            .state(task_id)
+            .map(|s| (s.phase.clone(), s.current_agent));
+        if let Some((phase, current_agent)) = state_snapshot {
+            if let Some(task) = self.task_store.get_mut(task_id) {
+                match &phase {
+                    WorkflowPhase::PendingReview => {
+                        task.set_status(TaskStatus::PendingReview, actor);
+                        task.assign_to(Some(AgentKind::Human), actor);
+                    }
+                    WorkflowPhase::Running => {
+                        task.assign_to(Some(current_agent), actor);
+                    }
+                    WorkflowPhase::AwaitingApproval { .. } => {
+                        task.assign_to(Some(AgentKind::Human), actor);
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Processes a single [`AppMessage`], mutating state and returning
@@ -290,8 +330,9 @@ impl App {
                 session_id: _,
                 tool,
                 status,
+                detail,
             } => {
-                self.tab2_state.push_tool(&task_id, tool, status);
+                self.tab2_state.push_tool(&task_id, tool, status, detail);
                 vec![]
             }
 
@@ -383,7 +424,8 @@ impl App {
             // --- StartTask: set task InProgress then forward to engine ---
             AppMessage::StartTask { task_id } => {
                 if let Some(task) = self.task_store.get_mut(&task_id) {
-                    task.status = TaskStatus::InProgress;
+                    task.set_status(TaskStatus::InProgress, AgentKind::Human);
+                    task.assign_to(Some(AgentKind::Intake), AgentKind::Human);
                 }
                 let mut msgs = self.workflow_engine.process(AppMessage::StartTask {
                     task_id: task_id.clone(),
@@ -431,6 +473,9 @@ impl App {
                     session_id,
                     error,
                 });
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    task.assign_to(Some(AgentKind::Human), current_agent);
+                }
                 msgs.push(AppMessage::TaskUpdated { task_id });
                 msgs
             }
@@ -488,6 +533,15 @@ impl App {
                     question_index,
                     answer,
                 });
+                let next_agent = self
+                    .workflow_engine
+                    .state(&task_id)
+                    .map(|wf| wf.current_agent);
+                if let Some(agent) = next_agent {
+                    if let Some(task) = self.task_store.get_mut(&task_id) {
+                        task.assign_to(Some(agent), AgentKind::Human);
+                    }
+                }
                 msgs.push(AppMessage::TaskUpdated { task_id });
                 msgs
             }
@@ -496,17 +550,81 @@ impl App {
             AppMessage::AgentCompleted { .. }
             | AppMessage::AgentKickedBack { .. }
             | AppMessage::AgentAskedQuestion { .. }
-            | AppMessage::HumanApprovedReview { .. }
-            | AppMessage::HumanRequestedRevisions { .. }
             | AppMessage::SessionCreated { .. } => self.workflow_engine.process(msg),
+
+            AppMessage::HumanApprovedReview { task_id } => {
+                self.review_state
+                    .push_banner(&task_id, "Review approved".to_string());
+                let mut msgs = self
+                    .workflow_engine
+                    .process(AppMessage::HumanApprovedReview {
+                        task_id: task_id.clone(),
+                    });
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    task.set_status(TaskStatus::Completed, AgentKind::Human);
+                    task.assign_to(Some(AgentKind::Human), AgentKind::Human);
+                }
+                msgs.push(AppMessage::TaskUpdated { task_id });
+                msgs
+            }
+
+            AppMessage::HumanApprovedTransition { task_id } => {
+                self.tab2_state
+                    .push_banner(&task_id, "Transition approved by human".to_string());
+                let mut msgs = self
+                    .workflow_engine
+                    .process(AppMessage::HumanApprovedTransition {
+                        task_id: task_id.clone(),
+                    });
+                let next_agent = self
+                    .workflow_engine
+                    .state(&task_id)
+                    .map(|wf| wf.current_agent);
+                if let Some(agent) = next_agent {
+                    if let Some(task) = self.task_store.get_mut(&task_id) {
+                        task.assign_to(Some(agent), AgentKind::Human);
+                    }
+                }
+                msgs.push(AppMessage::TaskUpdated { task_id });
+                msgs
+            }
+            AppMessage::HumanRequestedRevisions { task_id, comments } => {
+                self.review_state.push_user_comments(&task_id, &comments);
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    task.assign_to(Some(AgentKind::CodeReview), AgentKind::Human);
+                }
+                let mut msgs = self
+                    .workflow_engine
+                    .process(AppMessage::HumanRequestedRevisions {
+                        task_id: task_id.clone(),
+                        comments,
+                    });
+                msgs.push(AppMessage::TaskUpdated { task_id });
+                msgs
+            }
 
             // --- SessionCompleted: parse agent response and dispatch semantic message ---
             AppMessage::SessionCompleted {
                 task_id,
-                session_id: _,
+                session_id,
                 response_text,
             } => {
                 self.tab2_state.clear_awaiting(&task_id);
+
+                // Drain any queued steering prompt before advancing the workflow.
+                // If found, send it to the same session so the agent processes the
+                // user's input in a new turn. The workflow will advance when that
+                // follow-up turn completes (or errors).
+                if let Some(queued_text) = self.tab2_state.take_queued_prompt(&task_id) {
+                    self.tab2_state
+                        .push_banner(&task_id, format!("[You] {}", queued_text));
+                    return vec![AppMessage::SendPrompt {
+                        task_id,
+                        session_id,
+                        prompt: queued_text,
+                    }];
+                }
+
                 self.tab2_state.clear_thinking(&task_id);
                 let current_agent = self
                     .workflow_engine
@@ -546,11 +664,20 @@ impl App {
                             &task_id,
                             format!("{} completed: {}", agent.display_name(), truncated),
                         );
+                        // Push the full summary to the review timeline when it is a CodeReview agent.
+                        if agent == AgentKind::CodeReview {
+                            self.review_state.push_agent_summary(
+                                &task_id,
+                                agent.display_name(),
+                                &summary,
+                            );
+                        }
                         let mut msgs = self.workflow_engine.process(AppMessage::AgentCompleted {
                             task_id: task_id.clone(),
                             agent,
                             summary,
                         });
+                        self.sync_task_with_workflow(&task_id, agent);
                         msgs.push(AppMessage::TaskUpdated {
                             task_id: task_id.clone(),
                         });
@@ -582,6 +709,9 @@ impl App {
                                     agent,
                                     question,
                                 });
+                        if let Some(task) = self.task_store.get_mut(&task_id) {
+                            task.assign_to(Some(AgentKind::Human), agent);
+                        }
                         msgs.push(AppMessage::TaskUpdated {
                             task_id: task_id.clone(),
                         });
@@ -607,12 +737,23 @@ impl App {
                                 truncated_reason
                             ),
                         );
-                        self.workflow_engine.process(AppMessage::AgentKickedBack {
-                            task_id,
+                        self.review_state.push_kickback(
+                            &task_id,
+                            from.display_name(),
+                            to.display_name(),
+                            &reason,
+                        );
+                        let mut msgs = self.workflow_engine.process(AppMessage::AgentKickedBack {
+                            task_id: task_id.clone(),
                             from,
                             to,
                             reason,
-                        })
+                        });
+                        if let Some(task) = self.task_store.get_mut(&task_id) {
+                            task.assign_to(Some(to), from);
+                        }
+                        msgs.push(AppMessage::TaskUpdated { task_id });
+                        msgs
                     }
                     Err(_) => {
                         // Fallback: advance pipeline with a placeholder summary.
@@ -625,11 +766,14 @@ impl App {
                             &task_id,
                             "Agent output could not be parsed; advancing".to_string(),
                         );
-                        self.workflow_engine.process(AppMessage::AgentCompleted {
-                            task_id,
+                        let mut msgs = self.workflow_engine.process(AppMessage::AgentCompleted {
+                            task_id: task_id.clone(),
                             agent,
                             summary: "(no structured output)".to_string(),
-                        })
+                        });
+                        self.sync_task_with_workflow(&task_id, agent);
+                        msgs.push(AppMessage::TaskUpdated { task_id });
+                        msgs
                     }
                 }
             }
@@ -857,6 +1001,16 @@ impl App {
                 vec![]
             }
 
+            AppMessage::TokensUpdated {
+                task_id,
+                input_tokens,
+                output_tokens,
+            } => {
+                self.tab2_state
+                    .update_tokens(&task_id, input_tokens, output_tokens);
+                vec![]
+            }
+
             // --- Permission handling ---
             AppMessage::PermissionAsked { task_id, request } => {
                 self.tab2_state.push_banner(
@@ -955,6 +1109,9 @@ impl App {
                         agent,
                         question,
                     });
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    task.assign_to(Some(AgentKind::Human), agent);
+                }
                 msgs.push(AppMessage::TaskUpdated { task_id });
                 msgs
             }
@@ -989,10 +1146,10 @@ impl App {
 
             // --- Diff storage ---
             AppMessage::DiffReady { task_id, diffs } => {
+                self.tab2_state.push_diff(&task_id, &diffs);
                 self.tab4_state.set_diffs(&task_id, diffs);
                 self.tab4_state.set_displayed_task(Some(&task_id));
                 self.tab4_state.reset_for_diffs();
-                self.active_tab = 6;
                 vec![]
             }
         }
@@ -1508,7 +1665,8 @@ mod tests {
             Some("New design"),
             "design should be updated"
         );
-        assert_eq!(task.work_log.len(), 1, "work log should have one entry");
+        // 1 entry for the agent summary + 1 for the assignment to the next agent.
+        assert_eq!(task.work_log.len(), 2, "work log should have two entries");
     }
 
     #[test]
@@ -1676,9 +1834,9 @@ mod tests {
             "expected TaskUpdated after SessionError"
         );
 
-        // Work log should contain the error entry.
+        // Work log should contain the error entry plus the assignment-to-Human entry.
         let task = app.task_store.get(&task_id).expect("task should exist");
-        assert_eq!(task.work_log.len(), 1, "work log should have one entry");
+        assert_eq!(task.work_log.len(), 2, "work log should have two entries");
         let description = match &task.work_log[0] {
             WorkLogEntry::Parsed { description, .. } => description.as_str(),
             WorkLogEntry::Raw { text, .. } => text.as_str(),
@@ -1909,9 +2067,9 @@ mod tests {
         );
     }
 
-    /// Verifies that DiffReady stores diffs, switches to Tab 4, and resets navigation.
+    /// Verifies that DiffReady stores diffs without switching tabs, and resets navigation.
     #[test]
-    fn test_handle_diff_ready_switches_to_review_tab() {
+    fn test_handle_diff_ready_stores_diffs() {
         use crate::opencode::types::{DiffStatus, FileDiff};
 
         let mut app = App::test_default();
@@ -1929,7 +2087,7 @@ mod tests {
         });
 
         assert!(msgs.is_empty());
-        assert_eq!(app.active_tab, 6, "should switch to Tab 6 (Review)");
+        assert_eq!(app.active_tab, 0, "should NOT switch tabs");
         assert_eq!(
             app.tab4_state.diffs_for(&task_id).len(),
             1,
@@ -2202,6 +2360,610 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, AppMessage::SessionError { .. })),
             "Tick should not poll when last_status_poll is recent"
+        );
+    }
+
+    /// Verifies that DiffReady pushes a DiffSummary to tab2_state and stores diffs in tab4_state.
+    #[test]
+    fn test_handle_diff_ready_pushes_to_tab2() {
+        use crate::opencode::types::{DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff};
+        use crate::tui::tabs::agent_activity::ActivityLine;
+
+        let mut app = App::test_default();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+
+        let diffs = vec![FileDiff {
+            path: "src/main.rs".to_string(),
+            status: DiffStatus::Modified,
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    DiffLine {
+                        kind: DiffLineKind::Added,
+                        content: "fn main() {}".to_string(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Removed,
+                        content: "fn old() {}".to_string(),
+                    },
+                ],
+            }],
+        }];
+
+        app.handle_message(AppMessage::DiffReady {
+            task_id: task_id.clone(),
+            diffs,
+        });
+
+        // tab2_state should have a DiffSummary line.
+        let tab2_lines = app.tab2_state.lines_for(&task_id);
+        assert_eq!(tab2_lines.len(), 1, "tab2 should have one DiffSummary line");
+        assert!(
+            matches!(&tab2_lines[0], ActivityLine::DiffSummary { files } if files.len() == 1),
+            "tab2 line should be a DiffSummary with 1 file; got: {:?}",
+            tab2_lines[0]
+        );
+
+        // tab4_state should also have the diffs stored.
+        let tab4_diffs = app.tab4_state.diffs_for(&task_id);
+        assert_eq!(tab4_diffs.len(), 1, "tab4 should have 1 FileDiff");
+        assert_eq!(tab4_diffs[0].path, "src/main.rs");
+    }
+
+    /// Helper: advance the workflow engine to the CodeReview agent stage.
+    fn make_task_at_code_review(app: &mut App) -> TaskId {
+        let task_id = make_task_in_progress(app);
+        // Advance Intake -> Design -> Planning -> Implementation -> CodeQuality -> SecurityReview -> CodeReview (6 steps).
+        for _ in 0..6 {
+            let agent = app.workflow_engine.state(&task_id).unwrap().current_agent;
+            app.workflow_engine.process(AppMessage::AgentCompleted {
+                task_id: task_id.clone(),
+                agent,
+                summary: "done".to_string(),
+            });
+        }
+        task_id
+    }
+
+    /// Verifies that a CodeReview SessionCompleted pushes the full summary to review_state.
+    #[test]
+    fn test_session_completed_code_review_pushes_to_review_state() {
+        use crate::tui::tabs::review::ReviewEntry;
+
+        let mut app = App::test_default();
+        let task_id = make_task_at_code_review(&mut app);
+
+        let response_json = r#"{"action":"complete","summary":"The code looks well-structured and passes all checks."}"#;
+        app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-cr".to_string(),
+            response_text: response_json.to_string(),
+        });
+
+        let entries = app.review_state.entries_for(&task_id);
+        assert!(
+            !entries.is_empty(),
+            "review_state should have at least one entry after CodeReview completion"
+        );
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                ReviewEntry::AgentSummary { agent, summary }
+                    if agent == "Code Review Agent"
+                        && summary.contains("The code looks well-structured")
+            )),
+            "review_state should contain the full summary; entries: {:?}",
+            entries
+        );
+    }
+
+    /// Verifies that HumanRequestedRevisions records comments in review_state.
+    #[test]
+    fn test_human_requested_revisions_records_in_review_state() {
+        use crate::tui::tabs::review::ReviewEntry;
+
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+        let comments = vec![
+            "src/main.rs:1-3: Rename this variable".to_string(),
+            "src/lib.rs:10: Remove unused import".to_string(),
+        ];
+
+        app.handle_message(AppMessage::HumanRequestedRevisions {
+            task_id: task_id.clone(),
+            comments: comments.clone(),
+        });
+
+        let entries = app.review_state.entries_for(&task_id);
+        assert!(
+            !entries.is_empty(),
+            "review_state should have an entry after HumanRequestedRevisions"
+        );
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                ReviewEntry::UserComments { comments: c } if c == &comments
+            )),
+            "review_state should contain a UserComments entry; entries: {:?}",
+            entries
+        );
+    }
+
+    /// Verifies that a kickback from CodeReview records a Kickback entry in review_state.
+    #[test]
+    fn test_kickback_from_code_review_records_in_review_state() {
+        use crate::tui::tabs::review::ReviewEntry;
+
+        let mut app = App::test_default();
+        let task_id = make_task_at_code_review(&mut app);
+
+        let response_json = r#"{"action":"kickback","target_agent":"Implementation Agent","reason":"Missing unit tests for edge cases."}"#;
+        app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-cr".to_string(),
+            response_text: response_json.to_string(),
+        });
+
+        let entries = app.review_state.entries_for(&task_id);
+        assert!(
+            !entries.is_empty(),
+            "review_state should have an entry after kickback"
+        );
+        assert!(
+            entries.iter().any(|e| matches!(
+                e,
+                ReviewEntry::Kickback { from, to, reason }
+                    if from == "Code Review Agent"
+                        && to == "Implementation Agent"
+                        && reason.contains("Missing unit tests")
+            )),
+            "review_state should contain a Kickback entry; entries: {:?}",
+            entries
+        );
+    }
+
+    /// Verifies that when a queued steering prompt exists on SessionCompleted, it is
+    /// dispatched as SendPrompt to the same session and the workflow does NOT advance.
+    #[test]
+    fn test_session_completed_dispatches_queued_prompt() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        // Queue a steering prompt for this task.
+        app.tab2_state
+            .queue_prompt(task_id.clone(), "please add more tests".to_string());
+
+        let msgs = app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-1".to_string(),
+            response_text: r#"{"action":"complete","summary":"done"}"#.to_string(),
+        });
+
+        // The queued prompt should be dispatched as SendPrompt to the same session.
+        assert_eq!(msgs.len(), 1, "expected exactly one message: {msgs:?}");
+        assert!(
+            matches!(&msgs[0], AppMessage::SendPrompt { session_id, prompt, .. }
+                if session_id == "sess-1" && prompt == "please add more tests"),
+            "expected SendPrompt with queued text, got: {msgs:?}"
+        );
+
+        // The queue should now be empty.
+        assert_eq!(
+            app.tab2_state.take_queued_prompt(&task_id),
+            None,
+            "queue should be empty after dispatch"
+        );
+
+        // The workflow should NOT have advanced (no CreateSession).
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, AppMessage::CreateSession { .. })),
+            "workflow should not advance when queued prompt was dispatched"
+        );
+    }
+
+    /// Verifies that when no queued prompt exists, SessionCompleted advances the workflow normally.
+    #[test]
+    fn test_session_completed_no_queue_advances_workflow() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        // No queued prompt.
+        let msgs = app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-1".to_string(),
+            response_text: r#"{"action":"complete","summary":"Intake done"}"#.to_string(),
+        });
+
+        // Workflow should advance: CreateSession for Design.
+        assert!(
+            msgs.iter().any(|m| matches!(m, AppMessage::CreateSession { agent, .. } if *agent == AgentKind::Design)),
+            "workflow should advance to Design when no queue, got: {msgs:?}"
+        );
+    }
+
+    /// Verifies that [You - queued] banner appears in the activity buffer when a
+    /// queued prompt is dispatched at the end of a turn.
+    #[test]
+    fn test_session_completed_queued_prompt_shows_banner() {
+        use crate::tui::tabs::agent_activity::ActivityLine;
+
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        app.tab2_state
+            .queue_prompt(task_id.clone(), "steer this way".to_string());
+
+        app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-1".to_string(),
+            response_text: r#"{"action":"complete","summary":"done"}"#.to_string(),
+        });
+
+        let lines = app.tab2_state.lines_for(&task_id);
+        assert!(
+            lines
+                .iter()
+                .any(|l| matches!(l, ActivityLine::AgentBanner { message }
+                if message.contains("steer this way"))),
+            "expected [You] banner for queued prompt in activity buffer; lines: {lines:?}"
+        );
+    }
+
+    /// Verifies that StartTask sets assigned_to to Intake and produces 2 work log entries.
+    #[test]
+    fn test_start_task_assigns_to_intake_and_logs() {
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::Open,
+            assigned_to: None,
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+
+        app.handle_message(AppMessage::StartTask {
+            task_id: task_id.clone(),
+        });
+
+        let task = app.task_store.get(&task_id).unwrap();
+        assert_eq!(
+            task.assigned_to,
+            Some(AgentKind::Intake),
+            "assigned_to should be Intake after StartTask"
+        );
+        // 2 work log entries: status change + assignment.
+        assert_eq!(task.work_log.len(), 2, "work log should have 2 entries");
+    }
+
+    /// Verifies that SessionCompleted (Complete) mid-pipeline sets assigned_to to the next agent.
+    #[test]
+    fn test_session_completed_complete_assigns_next_agent() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        let response_json = r#"{"action":"complete","summary":"Intake done","updates":{}}"#;
+        app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-1".to_string(),
+            response_text: response_json.to_string(),
+        });
+
+        // After Intake completes, workflow advances to Design.
+        let task = app.task_store.get(&task_id).unwrap();
+        assert_eq!(
+            task.assigned_to,
+            Some(AgentKind::Design),
+            "assigned_to should advance to Design after Intake completes"
+        );
+    }
+
+    /// Verifies that when CodeReview completes, status is set to PendingReview and
+    /// assigned_to is Human.
+    #[test]
+    fn test_session_completed_code_review_sets_pending_review() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        // Advance pipeline through all agents up to and including CodeReview.
+        // Pipeline: Intake -> Design -> Planning -> Implementation -> CodeQuality -> SecurityReview -> CodeReview
+        let agents_before_code_review = [
+            AgentKind::Intake,
+            AgentKind::Design,
+            AgentKind::Planning,
+            AgentKind::Implementation,
+            AgentKind::CodeQuality,
+            AgentKind::SecurityReview,
+        ];
+        for agent in agents_before_code_review {
+            app.workflow_engine.process(AppMessage::AgentCompleted {
+                task_id: task_id.clone(),
+                agent,
+                summary: "done".to_string(),
+            });
+        }
+
+        // Now simulate CodeReview completing.
+        let response_json = r#"{"action":"complete","summary":"Code review passed","updates":{}}"#;
+        app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-cr".to_string(),
+            response_text: response_json.to_string(),
+        });
+
+        let task = app.task_store.get(&task_id).unwrap();
+        assert_eq!(
+            task.status,
+            crate::tasks::models::TaskStatus::PendingReview,
+            "status should be PendingReview after CodeReview completes"
+        );
+        assert_eq!(
+            task.assigned_to,
+            Some(AgentKind::Human),
+            "assigned_to should be Human while awaiting code review approval"
+        );
+    }
+
+    /// Verifies that HumanApprovedReview sets status to Completed and assigned_to to Human.
+    #[test]
+    fn test_human_approved_review_sets_completed() {
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::PendingReview,
+            assigned_to: Some(AgentKind::Human),
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+
+        let msgs = app.handle_message(AppMessage::HumanApprovedReview {
+            task_id: task_id.clone(),
+        });
+
+        let task = app.task_store.get(&task_id).unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::Completed,
+            "status should be Completed after HumanApprovedReview"
+        );
+        assert_eq!(
+            task.assigned_to,
+            Some(AgentKind::Human),
+            "assigned_to should remain Human after approval"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AppMessage::TaskUpdated { .. })),
+            "HumanApprovedReview should emit TaskUpdated"
+        );
+    }
+
+    /// Verifies that a Kickback response sets assigned_to to the target agent.
+    #[test]
+    fn test_session_completed_kickback_assigns_target() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        // Advance to CodeQuality.
+        for _ in 0..4 {
+            app.workflow_engine.process(AppMessage::AgentCompleted {
+                task_id: task_id.clone(),
+                agent: app.workflow_engine.state(&task_id).unwrap().current_agent,
+                summary: "done".to_string(),
+            });
+        }
+
+        let response_json =
+            r#"{"action":"kickback","target_agent":"Implementation Agent","reason":"Needs tests"}"#;
+        app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-1".to_string(),
+            response_text: response_json.to_string(),
+        });
+
+        let task = app.task_store.get(&task_id).unwrap();
+        assert_eq!(
+            task.assigned_to,
+            Some(AgentKind::Implementation),
+            "assigned_to should be Implementation after kickback"
+        );
+    }
+
+    /// Verifies that a Question response sets assigned_to to Human.
+    #[test]
+    fn test_session_completed_question_assigns_human() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        let response_json =
+            r#"{"action":"question","question":"What is scope?","context":"Need clarity"}"#;
+        app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-1".to_string(),
+            response_text: response_json.to_string(),
+        });
+
+        let task = app.task_store.get(&task_id).unwrap();
+        assert_eq!(
+            task.assigned_to,
+            Some(AgentKind::Human),
+            "assigned_to should be Human while waiting for answer"
+        );
+    }
+
+    /// Verifies that HumanAnswered restores assigned_to to the current agent.
+    #[test]
+    fn test_human_answered_restores_current_agent() {
+        use crate::tasks::models::{Question, Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            // Pre-seed: Human currently owns it (waiting for answer).
+            assigned_to: Some(AgentKind::Human),
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: vec![Question {
+                agent: AgentKind::Intake,
+                text: "What is the scope?".to_string(),
+                answer: None,
+                opencode_request_id: None,
+            }],
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+        app.workflow_engine.process(AppMessage::StartTask {
+            task_id: task_id.clone(),
+        });
+
+        app.handle_message(AppMessage::HumanAnswered {
+            task_id: task_id.clone(),
+            question_index: 0,
+            answer: "Minimal scope.".to_string(),
+        });
+
+        let task = app.task_store.get(&task_id).unwrap();
+        assert_eq!(
+            task.assigned_to,
+            Some(AgentKind::Intake),
+            "assigned_to should be restored to the current workflow agent after answer"
+        );
+    }
+
+    /// Verifies that HumanRequestedRevisions sets assigned_to to CodeReview.
+    #[test]
+    fn test_human_requested_revisions_assigns_code_review() {
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::PendingReview,
+            assigned_to: Some(AgentKind::Human),
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+
+        let msgs = app.handle_message(AppMessage::HumanRequestedRevisions {
+            task_id: task_id.clone(),
+            comments: vec!["Please fix the tests.".to_string()],
+        });
+
+        let task = app.task_store.get(&task_id).unwrap();
+        assert_eq!(
+            task.assigned_to,
+            Some(AgentKind::CodeReview),
+            "assigned_to should be CodeReview after HumanRequestedRevisions"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AppMessage::TaskUpdated { .. })),
+            "HumanRequestedRevisions should emit TaskUpdated"
+        );
+    }
+
+    /// Verifies that HumanApprovedTransition sets assigned_to to the next pipeline agent.
+    #[test]
+    fn test_human_approved_transition_assigns_next_agent() {
+        let mut app = App::test_default();
+        // Build a task and start it with approval_gate enabled so we hit AwaitingApproval.
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let task = Task {
+            id: TaskId::from_path("tasks/2.1.md"),
+            story_name: "2. Story".to_string(),
+            name: "2.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: None,
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/2.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+        // Enable the approval gate so the engine reaches AwaitingApproval.
+        app.workflow_engine.set_approval_gate(true);
+        app.workflow_engine.process(AppMessage::StartTask {
+            task_id: task_id.clone(),
+        });
+        // Simulate Intake completing -- engine should transition to AwaitingApproval.
+        app.workflow_engine.process(AppMessage::AgentCompleted {
+            task_id: task_id.clone(),
+            agent: AgentKind::Intake,
+            summary: "done".to_string(),
+        });
+
+        app.handle_message(AppMessage::HumanApprovedTransition {
+            task_id: task_id.clone(),
+        });
+
+        let task = app.task_store.get(&task_id).unwrap();
+        // After approval, the engine starts Design; assigned_to should be Design.
+        assert_eq!(
+            task.assigned_to,
+            Some(AgentKind::Design),
+            "assigned_to should advance to Design after HumanApprovedTransition"
+        );
+        assert!(
+            task.work_log.iter().any(
+                |e| matches!(e, crate::tasks::models::WorkLogEntry::Parsed { description, .. }
+                    if description.contains("Design Agent"))
+            ),
+            "work log should record the assignment to Design Agent"
         );
     }
 }

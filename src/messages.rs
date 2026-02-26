@@ -64,6 +64,8 @@ pub enum AppMessage {
         task_id: TaskId,
         comments: Vec<String>,
     },
+    /// The human approved advancing to the next agent in the pipeline.
+    HumanApprovedTransition { task_id: TaskId },
 
     // --- OpenCode session events ---
     /// Requests the OpenCode client to create a new session for the given agent.
@@ -99,6 +101,8 @@ pub enum AppMessage {
         session_id: String,
         tool: String,
         status: String,
+        /// Human-readable summary of the tool's input (file path, command, etc.), if available.
+        detail: Option<String>,
     },
     /// Confirms that a prompt was successfully sent to an active session.
     PromptSent { task_id: TaskId, session_id: String },
@@ -152,6 +156,12 @@ pub enum AppMessage {
     },
     /// OpenCode reported that session diffs changed; poll the diff endpoint.
     SessionDiffChanged { task_id: TaskId, session_id: String },
+    /// Updates the cumulative token counts for a task (input and output tokens).
+    TokensUpdated {
+        task_id: TaskId,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
 
     // --- Diff events ---
     /// Carries file diffs fetched from the opencode `/session/:id/diff` endpoint.

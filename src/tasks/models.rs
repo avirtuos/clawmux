@@ -220,6 +220,55 @@ impl Task {
     pub fn is_malformed(&self) -> bool {
         self.parse_error.is_some()
     }
+
+    /// Appends a work-log entry recording a lifecycle change.
+    ///
+    /// # Arguments
+    ///
+    /// * `actor` - The agent recording this change.
+    /// * `description` - A short description of what changed.
+    pub fn log_change(&mut self, actor: AgentKind, description: String) {
+        let seq = self.work_log.len() as u32 + 1;
+        self.work_log.push(WorkLogEntry::Parsed {
+            sequence: seq,
+            timestamp: chrono::Utc::now(),
+            agent: actor,
+            description,
+        });
+    }
+
+    /// Sets `assigned_to` and logs the change. No-op if already equal.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_agent` - The agent to assign the task to, or `None` to clear the assignment.
+    /// * `actor` - The agent making this assignment change (recorded in the work log).
+    pub fn assign_to(&mut self, new_agent: Option<AgentKind>, actor: AgentKind) {
+        if self.assigned_to == new_agent {
+            return;
+        }
+        let desc = match new_agent {
+            Some(a) => format!("Assigned to {}", a.display_name()),
+            None => "Assignment cleared".to_string(),
+        };
+        self.assigned_to = new_agent;
+        self.log_change(actor, desc);
+    }
+
+    /// Sets `status` and logs the change. No-op if already equal.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_status` - The new lifecycle status.
+    /// * `actor` - The agent making this status change (recorded in the work log).
+    pub fn set_status(&mut self, new_status: TaskStatus, actor: AgentKind) {
+        if self.status == new_status {
+            return;
+        }
+        let desc = format!("Status changed to {}", new_status);
+        self.status = new_status;
+        self.log_change(actor, desc);
+    }
 }
 
 /// A story groups related tasks under a common name.
@@ -266,6 +315,7 @@ impl Story {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow::agents::AgentKind;
 
     fn make_test_task(name: &str, story_name: &str) -> Task {
         Task {
@@ -405,5 +455,81 @@ mod tests {
 
         task.status = TaskStatus::Abandoned;
         assert!(!task.is_active());
+    }
+
+    #[test]
+    fn test_log_change_increments_seq() {
+        let mut task = make_test_task("1.1", "Story");
+        task.log_change(AgentKind::Human, "first".to_string());
+        task.log_change(AgentKind::Human, "second".to_string());
+        assert_eq!(task.work_log.len(), 2);
+        match &task.work_log[0] {
+            WorkLogEntry::Parsed { sequence, .. } => assert_eq!(*sequence, 1),
+            _ => panic!("expected Parsed entry"),
+        }
+        match &task.work_log[1] {
+            WorkLogEntry::Parsed { sequence, .. } => assert_eq!(*sequence, 2),
+            _ => panic!("expected Parsed entry"),
+        }
+    }
+
+    #[test]
+    fn test_assign_to_logs() {
+        let mut task = make_test_task("1.1", "Story");
+        task.assign_to(Some(AgentKind::Intake), AgentKind::Human);
+        assert_eq!(task.assigned_to, Some(AgentKind::Intake));
+        assert_eq!(task.work_log.len(), 1);
+        match &task.work_log[0] {
+            WorkLogEntry::Parsed {
+                description, agent, ..
+            } => {
+                assert!(
+                    description.contains("Intake Agent"),
+                    "description should mention Intake Agent, got: {description}"
+                );
+                assert_eq!(*agent, AgentKind::Human);
+            }
+            _ => panic!("expected Parsed entry"),
+        }
+    }
+
+    #[test]
+    fn test_assign_to_noop_same() {
+        let mut task = make_test_task("1.1", "Story");
+        task.assigned_to = Some(AgentKind::Intake);
+        task.assign_to(Some(AgentKind::Intake), AgentKind::Human);
+        assert_eq!(
+            task.work_log.len(),
+            0,
+            "no-op when assigned_to is already equal"
+        );
+    }
+
+    #[test]
+    fn test_set_status_logs() {
+        let mut task = make_test_task("1.1", "Story");
+        task.set_status(TaskStatus::InProgress, AgentKind::Human);
+        assert_eq!(task.status, TaskStatus::InProgress);
+        assert_eq!(task.work_log.len(), 1);
+        match &task.work_log[0] {
+            WorkLogEntry::Parsed {
+                description, agent, ..
+            } => {
+                assert!(
+                    description.contains("IN_PROGRESS"),
+                    "description should mention IN_PROGRESS, got: {description}"
+                );
+                assert_eq!(*agent, AgentKind::Human);
+            }
+            _ => panic!("expected Parsed entry"),
+        }
+    }
+
+    #[test]
+    fn test_set_status_noop_same() {
+        let mut task = make_test_task("1.1", "Story");
+        // status starts as Open; calling set_status(Open) should be a no-op.
+        task.set_status(TaskStatus::Open, AgentKind::Human);
+        assert_eq!(task.work_log.len(), 0, "no-op when status is already equal");
     }
 }
