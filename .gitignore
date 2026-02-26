@@ -1,4 +1,5 @@
+.opencode/
 target/
-.clawdmux/logs/
+.clawdmux/
 *.log
 .env

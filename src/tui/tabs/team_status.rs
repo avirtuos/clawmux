@@ -79,14 +79,17 @@ fn pipeline_label(agent: &AgentKind) -> &'static str {
 }
 
 /// Maps a `WorkflowPhase` to a human-readable status string.
-fn phase_text(phase: &WorkflowPhase) -> &'static str {
+fn phase_text(phase: &WorkflowPhase) -> String {
     match phase {
-        WorkflowPhase::Idle => "Idle",
-        WorkflowPhase::Running => "Running",
-        WorkflowPhase::AwaitingAnswer { .. } => "Awaiting Answer",
-        WorkflowPhase::PendingReview => "Pending Review",
-        WorkflowPhase::Completed => "Completed",
-        WorkflowPhase::Errored { .. } => "Errored",
+        WorkflowPhase::Idle => "Idle".to_string(),
+        WorkflowPhase::Running => "Running".to_string(),
+        WorkflowPhase::AwaitingAnswer { .. } => "Awaiting Answer".to_string(),
+        WorkflowPhase::AwaitingApproval { next_agent, .. } => {
+            format!("Awaiting approval to start {}", next_agent.display_name())
+        }
+        WorkflowPhase::PendingReview => "Pending Review".to_string(),
+        WorkflowPhase::Completed => "Completed".to_string(),
+        WorkflowPhase::Errored { .. } => "Errored".to_string(),
     }
 }
 
@@ -133,19 +136,32 @@ pub fn render(
 
     // --- Pipeline bar ---
     let current_agent_idx = workflow_state.map(|ws| ws.current_agent.pipeline_index());
+    let awaiting_idx = workflow_state.and_then(|ws| {
+        if let WorkflowPhase::AwaitingApproval { next_agent, .. } = &ws.phase {
+            Some(next_agent.pipeline_index())
+        } else {
+            None
+        }
+    });
     let mut spans: Vec<Span> = Vec::new();
     for (i, agent) in AgentKind::all().iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(" > ", Style::default().fg(Color::DarkGray)));
         }
         let idx = agent.pipeline_index();
-        let style = match current_agent_idx {
-            None => Style::default().fg(Color::DarkGray),
-            Some(curr) if idx < curr => Style::default().fg(Color::Green),
-            Some(curr) if idx == curr => Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-            _ => Style::default().fg(Color::DarkGray),
+        let style = if awaiting_idx == Some(idx) {
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            match current_agent_idx {
+                None => Style::default().fg(Color::DarkGray),
+                Some(curr) if idx < curr => Style::default().fg(Color::Green),
+                Some(curr) if idx == curr => Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+                _ => Style::default().fg(Color::DarkGray),
+            }
         };
         spans.push(Span::styled(pipeline_label(agent), style));
     }
@@ -157,7 +173,7 @@ pub fn render(
     // --- Phase ---
     let phase_str = workflow_state
         .map(|ws| phase_text(&ws.phase))
-        .unwrap_or("No workflow active");
+        .unwrap_or_else(|| "No workflow active".to_string());
     let phase_para =
         Paragraph::new(phase_str).block(Block::default().title("Phase").borders(Borders::ALL));
     frame.render_widget(phase_para, phase_area);

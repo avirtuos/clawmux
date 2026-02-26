@@ -23,6 +23,13 @@ pub enum WorkflowPhase {
         /// Zero-based index into the task's `questions` list.
         question_index: usize,
     },
+    /// The workflow is paused, waiting for human approval to start the next agent.
+    AwaitingApproval {
+        /// The agent that will start once the human approves.
+        next_agent: AgentKind,
+        /// Optional context for `CreateSession` (e.g., kickback reason).
+        context: Option<String>,
+    },
     /// All agents have completed; the task is awaiting human approval.
     PendingReview,
     /// The human has approved the task; it is complete.
@@ -57,15 +64,29 @@ pub struct WorkflowState {
 #[allow(dead_code)]
 pub struct WorkflowEngine {
     states: HashMap<TaskId, WorkflowState>,
+    /// When `true`, pause and wait for human approval before starting the next agent.
+    approval_gate_enabled: bool,
 }
 
 #[allow(dead_code)]
 impl WorkflowEngine {
     /// Creates a new `WorkflowEngine` with an empty state map.
-    pub fn new() -> Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `approval_gate_enabled` - When `true`, the engine pauses after each agent
+    ///   completes and waits for [`AppMessage::HumanApprovedTransition`] before
+    ///   starting the next agent. Set to `false` for fully-automatic pipeline execution.
+    pub fn new(approval_gate_enabled: bool) -> Self {
         Self {
             states: HashMap::new(),
+            approval_gate_enabled,
         }
+    }
+
+    /// Enables or disables the human approval gate at runtime.
+    pub fn set_approval_gate(&mut self, enabled: bool) {
+        self.approval_gate_enabled = enabled;
     }
 
     /// Returns a reference to the workflow state for the given task, if any.
@@ -115,14 +136,22 @@ impl WorkflowEngine {
                 };
                 match state.current_agent.next() {
                     Some(next) => {
-                        state.current_agent = next;
                         state.session_id = None;
-                        vec![AppMessage::CreateSession {
-                            task_id,
-                            agent: next,
-                            prompt: String::new(),
-                            context: None,
-                        }]
+                        if self.approval_gate_enabled {
+                            state.phase = WorkflowPhase::AwaitingApproval {
+                                next_agent: next,
+                                context: None,
+                            };
+                            vec![]
+                        } else {
+                            state.current_agent = next;
+                            vec![AppMessage::CreateSession {
+                                task_id,
+                                agent: next,
+                                prompt: String::new(),
+                                context: None,
+                            }]
+                        }
                     }
                     None => {
                         state.session_id = None;
@@ -148,14 +177,22 @@ impl WorkflowEngine {
                 }
                 match agent.next() {
                     Some(next) => {
-                        state.current_agent = next;
                         state.session_id = None;
-                        vec![AppMessage::CreateSession {
-                            task_id,
-                            agent: next,
-                            prompt: String::new(),
-                            context: None,
-                        }]
+                        if self.approval_gate_enabled {
+                            state.phase = WorkflowPhase::AwaitingApproval {
+                                next_agent: next,
+                                context: None,
+                            };
+                            vec![]
+                        } else {
+                            state.current_agent = next;
+                            vec![AppMessage::CreateSession {
+                                task_id,
+                                agent: next,
+                                prompt: String::new(),
+                                context: None,
+                            }]
+                        }
                     }
                     None => {
                         state.session_id = None;
@@ -186,14 +223,22 @@ impl WorkflowEngine {
                         ),
                     }];
                 }
-                state.current_agent = to;
                 state.session_id = None;
-                vec![AppMessage::CreateSession {
-                    task_id,
-                    agent: to,
-                    prompt: String::new(),
-                    context: Some(reason),
-                }]
+                if self.approval_gate_enabled {
+                    state.phase = WorkflowPhase::AwaitingApproval {
+                        next_agent: to,
+                        context: Some(reason),
+                    };
+                    vec![]
+                } else {
+                    state.current_agent = to;
+                    vec![AppMessage::CreateSession {
+                        task_id,
+                        agent: to,
+                        prompt: String::new(),
+                        context: Some(reason),
+                    }]
+                }
             }
 
             AppMessage::AgentAskedQuestion { task_id, .. } => {
@@ -244,6 +289,30 @@ impl WorkflowEngine {
                 }]
             }
 
+            AppMessage::HumanApprovedTransition { task_id } => {
+                let Some(state) = self.states.get_mut(&task_id) else {
+                    return vec![];
+                };
+                match &state.phase {
+                    WorkflowPhase::AwaitingApproval {
+                        next_agent,
+                        context,
+                    } => {
+                        let next = *next_agent;
+                        let ctx = context.clone();
+                        state.current_agent = next;
+                        state.phase = WorkflowPhase::Running;
+                        vec![AppMessage::CreateSession {
+                            task_id,
+                            agent: next,
+                            prompt: String::new(),
+                            context: ctx,
+                        }]
+                    }
+                    _ => vec![],
+                }
+            }
+
             AppMessage::SessionError {
                 task_id,
                 session_id: _,
@@ -271,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_start_task_transitions_to_running() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let tid = task("6.1");
         let msgs = engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
@@ -287,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_agent_completed_advances_pipeline() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let tid = task("6.1");
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
@@ -319,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_agent_completed_ignored_for_mismatched_agent() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let tid = task("6.1");
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
@@ -349,7 +418,7 @@ mod tests {
 
     #[test]
     fn test_code_review_completed_transitions_to_pending_review() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let tid = task("6.1");
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
@@ -379,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_valid_kickback_accepted() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let tid = task("6.1");
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
@@ -401,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_invalid_kickback_rejected() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let tid = task("6.1");
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
@@ -419,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_question_pauses_workflow() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let tid = task("6.1");
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
@@ -440,7 +509,7 @@ mod tests {
 
     #[test]
     fn test_human_answer_resumes_workflow() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let tid = task("6.1");
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
@@ -464,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_human_approved_completes() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let tid = task("6.1");
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
@@ -488,7 +557,7 @@ mod tests {
 
     #[test]
     fn test_session_error_transitions_to_errored() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let tid = task("6.1");
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
@@ -511,7 +580,7 @@ mod tests {
 
     #[test]
     fn test_session_created_records_session_id() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let tid = task("6.1");
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
@@ -527,7 +596,7 @@ mod tests {
 
     #[test]
     fn test_human_requested_revisions() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let tid = task("6.1");
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
@@ -548,14 +617,14 @@ mod tests {
 
     #[test]
     fn test_unhandled_message_ignored() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let msgs = engine.process(AppMessage::Tick);
         assert!(msgs.is_empty());
     }
 
     #[test]
     fn test_create_session_carries_context_on_kickback() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let tid = task("6.1");
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
@@ -579,7 +648,7 @@ mod tests {
 
     #[test]
     fn test_create_session_carries_context_on_answer() {
-        let mut engine = WorkflowEngine::new();
+        let mut engine = WorkflowEngine::new(false);
         let tid = task("6.1");
         engine.process(AppMessage::StartTask {
             task_id: tid.clone(),
@@ -604,5 +673,213 @@ mod tests {
             ),
             "answer CreateSession should carry the answer as context"
         );
+    }
+
+    // --- Approval gate tests ---
+
+    #[test]
+    fn test_approval_gate_pauses_on_agent_completed() {
+        let mut engine = WorkflowEngine::new(true);
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+
+        let msgs = engine.process(AppMessage::AgentCompleted {
+            task_id: tid.clone(),
+            agent: AgentKind::Intake,
+            summary: "done".to_string(),
+        });
+        assert!(
+            msgs.is_empty(),
+            "gate enabled: AgentCompleted should emit no messages"
+        );
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(
+            state.current_agent,
+            AgentKind::Intake,
+            "current_agent should remain Intake until approved"
+        );
+        assert!(
+            matches!(
+                &state.phase,
+                WorkflowPhase::AwaitingApproval {
+                    next_agent: AgentKind::Design,
+                    context: None
+                }
+            ),
+            "phase should be AwaitingApproval for Design"
+        );
+    }
+
+    #[test]
+    fn test_approval_gate_resume_creates_session() {
+        let mut engine = WorkflowEngine::new(true);
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+        engine.process(AppMessage::AgentCompleted {
+            task_id: tid.clone(),
+            agent: AgentKind::Intake,
+            summary: "done".to_string(),
+        });
+
+        let msgs = engine.process(AppMessage::HumanApprovedTransition {
+            task_id: tid.clone(),
+        });
+        assert_eq!(msgs.len(), 1, "approval should emit CreateSession");
+        assert!(
+            matches!(&msgs[0], AppMessage::CreateSession { agent, .. } if *agent == AgentKind::Design),
+            "CreateSession should target Design agent"
+        );
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(state.current_agent, AgentKind::Design);
+        assert_eq!(state.phase, WorkflowPhase::Running);
+    }
+
+    #[test]
+    fn test_approval_gate_disabled_advances_immediately() {
+        let mut engine = WorkflowEngine::new(false);
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+
+        let msgs = engine.process(AppMessage::AgentCompleted {
+            task_id: tid.clone(),
+            agent: AgentKind::Intake,
+            summary: "done".to_string(),
+        });
+        assert_eq!(
+            msgs.len(),
+            1,
+            "gate disabled: should emit CreateSession immediately"
+        );
+        assert!(
+            matches!(&msgs[0], AppMessage::CreateSession { agent, .. } if *agent == AgentKind::Design)
+        );
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(state.current_agent, AgentKind::Design);
+        assert_eq!(state.phase, WorkflowPhase::Running);
+    }
+
+    #[test]
+    fn test_approval_gate_pauses_on_kickback() {
+        let mut engine = WorkflowEngine::new(true);
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+
+        let msgs = engine.process(AppMessage::AgentKickedBack {
+            task_id: tid.clone(),
+            from: AgentKind::CodeQuality,
+            to: AgentKind::Implementation,
+            reason: "needs rework".to_string(),
+        });
+        assert!(
+            msgs.is_empty(),
+            "gate enabled: kickback should emit no messages"
+        );
+        let state = engine.state(&tid).expect("state");
+        assert!(
+            matches!(
+                &state.phase,
+                WorkflowPhase::AwaitingApproval {
+                    next_agent: AgentKind::Implementation,
+                    context: Some(ctx),
+                } if ctx == "needs rework"
+            ),
+            "phase should be AwaitingApproval with kickback reason as context"
+        );
+    }
+
+    #[test]
+    fn test_approval_gate_resume_preserves_kickback_context() {
+        let mut engine = WorkflowEngine::new(true);
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+        engine.process(AppMessage::AgentKickedBack {
+            task_id: tid.clone(),
+            from: AgentKind::CodeQuality,
+            to: AgentKind::Implementation,
+            reason: "needs rework".to_string(),
+        });
+
+        let msgs = engine.process(AppMessage::HumanApprovedTransition {
+            task_id: tid.clone(),
+        });
+        assert_eq!(msgs.len(), 1);
+        assert!(
+            matches!(
+                &msgs[0],
+                AppMessage::CreateSession {
+                    agent,
+                    context: Some(ctx),
+                    ..
+                } if *agent == AgentKind::Implementation && ctx == "needs rework"
+            ),
+            "CreateSession should carry the kickback reason as context"
+        );
+    }
+
+    #[test]
+    fn test_approval_gate_no_pause_on_last_agent() {
+        let mut engine = WorkflowEngine::new(true);
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+        // Advance to CodeReview (last agent) via SessionCompleted with gate disabled temporarily.
+        // Simpler: advance via AgentCompleted with gate enabled and approve each step.
+        // Use gate disabled to reach CodeReview quickly, then re-enable.
+        engine.set_approval_gate(false);
+        for _ in 0..6 {
+            engine.process(AppMessage::SessionCompleted {
+                task_id: tid.clone(),
+                session_id: "s".to_string(),
+                response_text: String::new(),
+            });
+        }
+        engine.set_approval_gate(true);
+
+        let msgs = engine.process(AppMessage::AgentCompleted {
+            task_id: tid.clone(),
+            agent: AgentKind::CodeReview,
+            summary: "done".to_string(),
+        });
+        assert!(
+            msgs.is_empty(),
+            "CodeReview has no next agent, should transition to PendingReview, not AwaitingApproval"
+        );
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(
+            state.phase,
+            WorkflowPhase::PendingReview,
+            "should be PendingReview, not AwaitingApproval"
+        );
+    }
+
+    #[test]
+    fn test_human_approved_transition_ignored_when_not_awaiting() {
+        let mut engine = WorkflowEngine::new(true);
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+        // Phase is Running, not AwaitingApproval.
+        let msgs = engine.process(AppMessage::HumanApprovedTransition {
+            task_id: tid.clone(),
+        });
+        assert!(
+            msgs.is_empty(),
+            "HumanApprovedTransition while Running should be a no-op"
+        );
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(state.phase, WorkflowPhase::Running);
+        assert_eq!(state.current_agent, AgentKind::Intake);
     }
 }

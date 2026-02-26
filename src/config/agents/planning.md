@@ -1,7 +1,7 @@
 ---
 description: Creates a step-by-step implementation plan from the task and design
 mode: subagent
-model: anthropic/claude-sonnet-4-5
+model: openrouter/anthropic/claude-opus-4.6
 steps: 30
 tools:
   read: true

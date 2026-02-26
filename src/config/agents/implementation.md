@@ -1,7 +1,7 @@
 ---
 description: Implements code changes according to the implementation plan
 mode: subagent
-model: anthropic/claude-sonnet-4-5
+model: openrouter/anthropic/claude-sonnet-4.6
 steps: 50
 tools:
   read: true

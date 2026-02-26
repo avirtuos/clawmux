@@ -77,8 +77,11 @@ impl TaskStore {
             let entry = entry?;
             let path: PathBuf = entry.path();
 
-            // Only process .md files.
+            // Only process .md files; skip the format reference doc.
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            if path.file_name().and_then(|n| n.to_str()) == Some("tasks.md") {
                 continue;
             }
 
@@ -442,6 +445,26 @@ mod tests {
         std::fs::write(&file_path, &minimal_md("1. Story", "1.1")).unwrap();
         store.reload(&id).unwrap();
         assert!(!store.get(&id).unwrap().is_malformed());
+    }
+
+    #[test]
+    fn test_load_skips_tasks_md() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("tasks");
+        std::fs::create_dir(&tasks_dir).unwrap();
+
+        write_file(&tasks_dir, "1.1.md", &minimal_md("1. Story", "1.1"));
+        write_file(
+            &tasks_dir,
+            "tasks.md",
+            "# Task format reference\n\nThis is not a task.\n",
+        );
+
+        let mut store = TaskStore::new();
+        let count = store.load_from_disk(tmp.path()).unwrap();
+
+        assert_eq!(count, 1, "tasks.md should be ignored");
+        assert_eq!(store.task_count(), 1);
     }
 
     #[test]

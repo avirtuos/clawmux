@@ -433,7 +433,7 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
     if diffs.is_empty() {
         let no_diffs = Paragraph::new("No diffs available.")
             .style(Style::default().fg(Color::DarkGray))
-            .block(Block::default().title("Review").borders(Borders::ALL));
+            .block(Block::default().title("Code Diff").borders(Borders::ALL));
         frame.render_widget(no_diffs, area);
         return;
     }
@@ -453,7 +453,7 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
         ""
     };
     let block_title = format!(
-        "Review {}/{}: {} {}{}",
+        "Code Diff {}/{}: {} {}{}",
         sel + 1,
         file_count,
         file_diff.path,

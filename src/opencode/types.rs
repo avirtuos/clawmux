@@ -27,8 +27,11 @@ pub enum MessagePart {
     Text { text: String },
     /// A tool invocation with its optional result.
     Tool {
+        #[serde(alias = "tool")]
         name: String,
+        #[serde(default)]
         input: serde_json::Value,
+        #[serde(default)]
         result: Option<String>,
     },
     /// An agent reasoning trace.
@@ -192,6 +195,9 @@ pub enum OpenCodeEvent {
         #[serde(alias = "sessionId")]
         session_id: String,
         tool: String,
+        /// Human-readable summary of the tool's input parameters (e.g. file path, command).
+        #[serde(default)]
+        detail: Option<String>,
     },
     /// A tool finished executing.
     ToolCompleted {
@@ -199,6 +205,18 @@ pub enum OpenCodeEvent {
         session_id: String,
         tool: String,
         result: String,
+        /// Human-readable summary of the tool's input parameters (e.g. file path, command).
+        #[serde(default)]
+        detail: Option<String>,
+    },
+    /// A tool is in pending state, typically awaiting permission approval.
+    ToolPending {
+        #[serde(alias = "sessionId")]
+        session_id: String,
+        tool: String,
+        /// Human-readable summary of the tool's input parameters (e.g. file path, command).
+        #[serde(default)]
+        detail: Option<String>,
     },
     /// An incremental text delta for a message part (OpenCode >= 1.2 streaming format).
     MessagePartDelta {
@@ -235,6 +253,12 @@ pub enum OpenCodeEvent {
     },
     /// Session diffs have changed; use as a trigger to poll the diff endpoint.
     SessionDiff { session_id: String },
+    /// Token usage reported by a completed agent message.
+    TokensUpdated {
+        session_id: String,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
     /// An unrecognized event type; ignored gracefully for forward compatibility.
     #[serde(other)]
     Unknown,
@@ -363,6 +387,17 @@ mod tests {
         let part: MessagePart = serde_json::from_str(json).expect("deserialize");
         assert!(
             matches!(part, MessagePart::Text { ref text } if text == "hello"),
+            "unexpected variant: {part:?}"
+        );
+    }
+
+    #[test]
+    fn test_message_part_tool_with_tool_alias() {
+        // The OpenCode API sends "tool" as the field key instead of "name".
+        let json = r#"{"type":"tool","tool":"read","input":{}}"#;
+        let part: MessagePart = serde_json::from_str(json).expect("deserialize");
+        assert!(
+            matches!(part, MessagePart::Tool { ref name, .. } if name == "read"),
             "unexpected variant: {part:?}"
         );
     }

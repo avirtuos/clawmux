@@ -54,12 +54,33 @@ impl Default for OpenCodeConfig {
     }
 }
 
+/// Workflow behavior settings from `.clawdmux/config.toml`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WorkflowConfig {
+    /// When `true`, require human approval before starting the next agent.
+    ///
+    /// The human presses `n` on the Team Status tab (Tab 5) to approve.
+    /// Defaults to `true` so intermediate results can be inspected.
+    pub approval_gate: bool,
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            approval_gate: true,
+        }
+    }
+}
+
 /// Private wrapper for deserializing the project-level TOML, which uses an
 /// `[opencode]` table rather than bare top-level keys.
 #[derive(Debug, Deserialize, Default)]
 struct ProjectConfigFile {
     #[serde(default)]
     opencode: OpenCodeConfig,
+    #[serde(default)]
+    workflow: WorkflowConfig,
 }
 
 /// Merged application configuration combining global and project-level settings.
@@ -72,6 +93,8 @@ pub struct AppConfig {
     pub global: GlobalConfig,
     /// Opencode server connection settings for the current project.
     pub opencode: OpenCodeConfig,
+    /// Workflow behavior settings.
+    pub workflow: WorkflowConfig,
 }
 
 #[allow(dead_code)]
@@ -140,22 +163,26 @@ impl AppConfig {
         // --- Project config ---
         let project_config_path = project_root.join(".clawdmux").join("config.toml");
 
-        let opencode = match std::fs::read_to_string(&project_config_path) {
+        let (opencode, workflow) = match std::fs::read_to_string(&project_config_path) {
             Ok(contents) => {
                 let file: ProjectConfigFile = toml::from_str(&contents)?;
-                file.opencode
+                (file.opencode, file.workflow)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::info!(
                     path = %project_config_path.display(),
                     "project config not found, using defaults"
                 );
-                OpenCodeConfig::default()
+                (OpenCodeConfig::default(), WorkflowConfig::default())
             }
             Err(e) => return Err(ClawdMuxError::Io(e)),
         };
 
-        Ok(AppConfig { global, opencode })
+        Ok(AppConfig {
+            global,
+            opencode,
+            workflow,
+        })
     }
 }
 
@@ -279,7 +306,21 @@ password = "mypassword"
                 port: 4096,
                 password: project_pw.map(str::to_string),
             },
+            workflow: WorkflowConfig::default(),
         }
+    }
+
+    #[test]
+    fn test_workflow_config_defaults_approval_gate_true() {
+        let config: WorkflowConfig = toml::from_str("").unwrap();
+        assert!(config.approval_gate, "approval_gate should default to true");
+    }
+
+    #[test]
+    fn test_workflow_config_explicit_false() {
+        let toml = "approval_gate = false\n";
+        let config: WorkflowConfig = toml::from_str(toml).unwrap();
+        assert!(!config.approval_gate);
     }
 
     #[test]

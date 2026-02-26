@@ -48,21 +48,20 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Log to a file so that log output does not corrupt the TUI display.
-    // Prefer `.clawdmux/` (created by `clawdmux init`); fall back to the
-    // platform data-local directory so we never pollute the project root.
+    // Log to ~/.clawdmux/ so the log file never appears inside the project
+    // directory (where it could be picked up by OpenCode's file tracking and
+    // embedded in huge session diffs). Falls back to the platform data-local
+    // directory if $HOME is unavailable.
     let log_dir = {
-        let cwd = std::env::current_dir()?;
-        let local_dir = cwd.join(".clawdmux");
-        if local_dir.exists() {
-            local_dir
-        } else {
-            let fallback = dirs::data_local_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join("clawdmux");
-            std::fs::create_dir_all(&fallback)?;
-            fallback
-        }
+        let dir = dirs::home_dir()
+            .map(|h| h.join(".clawdmux"))
+            .unwrap_or_else(|| {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join("clawdmux")
+            });
+        std::fs::create_dir_all(&dir)?;
+        dir
     };
     let file_appender = tracing_appender::rolling::never(log_dir, "clawdmux.log");
     tracing_subscriber::fmt()
@@ -238,6 +237,7 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         opencode_client,
         Arc::clone(&session_map),
         async_tx.clone(),
+        config.workflow.approval_gate,
     );
     let mut event_stream = crossterm::event::EventStream::new();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(250));

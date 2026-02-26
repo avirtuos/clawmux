@@ -29,6 +29,23 @@ const SECURITY_REVIEW_AGENT: &str = include_str!("agents/security-review.md");
 const CODE_REVIEW_AGENT: &str = include_str!("agents/code-review.md");
 
 // ---------------------------------------------------------------------------
+// Task template file content (embedded at compile time from `src/config/tasks/`)
+// ---------------------------------------------------------------------------
+
+const TASK_FORMAT_DOC: &str = include_str!("tasks/tasks.md");
+const TASK_1_1: &str = include_str!("tasks/1.1.md");
+const TASK_1_2: &str = include_str!("tasks/1.2.md");
+const TASK_2_1: &str = include_str!("tasks/2.1.md");
+
+/// Task template files written into `tasks/` during scaffolding.
+const TASK_SEED_FILES: &[(&str, &str)] = &[
+    ("tasks.md", TASK_FORMAT_DOC),
+    ("1.1.md", TASK_1_1),
+    ("1.2.md", TASK_1_2),
+    ("2.1.md", TASK_2_1),
+];
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -289,10 +306,17 @@ pub(crate) fn scaffold_project(project_root: &Path, args: &InitArgs) -> Result<(
         tracing::info!(path = %project_config_path.display(), "created project config");
     }
 
-    // tasks/
+    // tasks/ with seed files
     let tasks_dir = project_root.join("tasks");
     std::fs::create_dir_all(&tasks_dir).map_err(ClawdMuxError::Io)?;
-    tracing::info!(path = %tasks_dir.display(), "created tasks directory");
+
+    for &(file_name, content) in TASK_SEED_FILES {
+        let file_path = tasks_dir.join(file_name);
+        if !file_path.exists() {
+            std::fs::write(&file_path, content).map_err(ClawdMuxError::Io)?;
+            tracing::info!(path = %file_path.display(), "created task seed file");
+        }
+    }
 
     // .opencode/agents/clawdmux/
     let agents_dir = project_root
@@ -535,9 +559,51 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            project_dir.path().join("tasks").is_dir(),
-            "tasks/ directory should be created"
+        let tasks_dir = project_dir.path().join("tasks");
+        assert!(tasks_dir.is_dir(), "tasks/ directory should be created");
+
+        for &(file_name, _) in TASK_SEED_FILES {
+            let file_path = tasks_dir.join(file_name);
+            assert!(
+                file_path.exists(),
+                "task seed file {} should be created",
+                file_name
+            );
+            let content = std::fs::read_to_string(&file_path).unwrap();
+            assert!(
+                !content.is_empty(),
+                "task seed file {} should have non-empty content",
+                file_name
+            );
+        }
+    }
+
+    #[test]
+    fn test_scaffold_does_not_overwrite_existing_task_files() {
+        let global_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let global_path = global_dir.path().join("config.toml");
+        write_global_config(&global_path);
+
+        // Pre-create tasks/ and write custom content into one seed file.
+        let tasks_dir = project_dir.path().join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        let existing_path = tasks_dir.join("1.1.md");
+        std::fs::write(&existing_path, "custom content").unwrap();
+
+        run_init_with_paths(
+            &global_path,
+            project_dir.path(),
+            &InitArgs {
+                reset_agents: false,
+            },
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&existing_path).unwrap();
+        assert_eq!(
+            content, "custom content",
+            "existing task file should not be overwritten by scaffold"
         );
     }
 
