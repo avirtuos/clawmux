@@ -869,13 +869,14 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
         (area, None)
     };
 
-    // Compute the effective scroll offset using ratatui's own word-wrap-aware
-    // line_count(), which accounts for the block border insets automatically.
+    // line_count() adjusts for vertical borders but NOT horizontal ones, so we
+    // call it on a blockless paragraph with the inner content width to match
+    // what the renderer actually uses for word-wrapping.
+    let inner_width = activity_area.width.saturating_sub(2);
     let viewport_height = activity_area.height.saturating_sub(2) as usize;
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    let total_visual = paragraph.line_count(activity_area.width);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let total_visual = paragraph.line_count(inner_width);
+    let paragraph = paragraph.block(block);
     let max_scroll = total_visual.saturating_sub(viewport_height);
     state.last_max_scroll.set(max_scroll);
 
@@ -1930,5 +1931,55 @@ mod tests {
                 render(frame, frame.area(), Some(&id), &state);
             })
             .unwrap();
+    }
+
+    /// Verifies that line_count called with inner_width (no block) gives a higher visual
+    /// line count than the old approach of calling line_count with outer_width on a paragraph
+    /// that has a bordered block attached.
+    ///
+    /// Four lines each `inner_width + 1` chars long wrap to 2 lines at inner_width but fit
+    /// without wrapping at outer_width. The new count (8) exceeds the old buggy count (6),
+    /// which means max_scroll is correctly estimated rather than underestimated.
+    #[test]
+    fn test_scroll_line_count_uses_inner_width() {
+        let outer_width = 20u16;
+        let inner_width = outer_width.saturating_sub(2);
+        let viewport_height = 5usize;
+
+        // Each line is exactly inner_width + 1 chars: fits in outer_width, wraps at inner_width.
+        let content: String = "a".repeat((inner_width + 1) as usize);
+        let lines: Vec<Line> = (0..4).map(|_| Line::from(content.clone())).collect();
+
+        // New (correct) approach: blockless paragraph with inner_width.
+        let paragraph_no_block = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
+        let total_visual_new = paragraph_no_block.line_count(inner_width);
+
+        // Old (buggy) approach: paragraph with block at outer_width.
+        let block = Block::default().borders(Borders::ALL);
+        let paragraph_with_block = Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false });
+        let total_visual_old = paragraph_with_block.line_count(outer_width);
+
+        // New: 4 lines x 2 visual rows each = 8.
+        assert_eq!(
+            total_visual_new, 8,
+            "each line should wrap to 2 at inner_width"
+        );
+        // Old: 4 lines (no wrap at outer_width) + 2 border rows = 6.
+        assert_eq!(
+            total_visual_old, 6,
+            "old count: no wrapping + 2 border rows"
+        );
+
+        // max_scroll from new code allows scrolling further than old code.
+        let max_scroll_new = total_visual_new.saturating_sub(viewport_height);
+        let max_scroll_old = total_visual_old.saturating_sub(viewport_height);
+        assert!(
+            max_scroll_new > max_scroll_old,
+            "new max_scroll ({}) should exceed old max_scroll ({})",
+            max_scroll_new,
+            max_scroll_old
+        );
     }
 }

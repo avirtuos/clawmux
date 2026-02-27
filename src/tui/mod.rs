@@ -13,6 +13,7 @@ use tui_textarea::Input;
 
 use crate::app::App;
 use crate::messages::AppMessage;
+use crate::opencode::types::PermissionRequest;
 use crate::tasks::models::{status_to_index, Task, TaskStatus, ALL_STATUSES};
 use crate::tasks::TaskId;
 use crate::workflow::agents::AgentKind;
@@ -251,10 +252,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 .unwrap_or(false)
         })
         .unwrap_or(false);
-    let awaiting_approval = app
+    let awaiting_agent = app
         .selected_task()
         .and_then(|id| app.workflow_engine.state(id))
-        .is_some_and(|s| matches!(s.phase, WorkflowPhase::AwaitingApproval { .. }));
+        .and_then(|s| match &s.phase {
+            WorkflowPhase::AwaitingApproval { next_agent, .. } => Some(*next_agent),
+            _ => None,
+        });
+    let awaiting_approval = awaiting_agent.is_some();
     let hint = footer_hint_text(
         app.show_quit_confirm,
         app.show_status_picker.is_some(),
@@ -267,13 +272,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         awaiting_approval,
     );
     let right_status: Option<String> = {
-        let base = if let Some(t) = app.tab2_state.any_thinking_status() {
-            Some(t)
-        } else if awaiting_approval {
-            Some("pending approval for next agent".to_string())
-        } else {
-            None
-        };
+        let base = app.tab2_state.any_thinking_status().or_else(|| {
+            awaiting_agent.map(|a| format!("pending approval for {}", a.display_name()))
+        });
         let tokens = app
             .selected_task()
             .and_then(|id| app.tab2_state.get_tokens(id));
@@ -333,6 +334,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         render_quit_confirm_dialog(frame, frame.area());
     }
 
+    if let Some((ref _tid, ref request)) = app.tab2_state.pending_permission {
+        render_permission_dialog(frame, frame.area(), request);
+    }
+
     if let Some(selected_idx) = app.show_status_picker {
         let current_status = app
             .selected_task()
@@ -378,6 +383,41 @@ fn render_quit_confirm_dialog(frame: &mut Frame, area: Rect) {
     let paragraph = Paragraph::new("Are you sure you want to quit?")
         .block(block)
         .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(paragraph, dialog_area);
+}
+
+/// Renders a centered modal permission request dialog over the given area.
+///
+/// Blanks a 60-column centered region using [`Clear`] then draws a
+/// yellow-bordered block titled ` Permission Request ` listing the permission
+/// type, each command pattern, and the available key bindings.
+fn render_permission_dialog(frame: &mut Frame, area: Rect, request: &PermissionRequest) {
+    let dialog_width = 60u16;
+    let pattern_rows = request.patterns.len().min(7) as u16;
+    let dialog_height = (5u16 + pattern_rows).min(12);
+    let x = area.x + area.width.saturating_sub(dialog_width) / 2;
+    let y = area.y + area.height.saturating_sub(dialog_height) / 2;
+    let dialog_area = Rect::new(
+        x,
+        y,
+        dialog_width.min(area.width),
+        dialog_height.min(area.height),
+    );
+
+    frame.render_widget(Clear, dialog_area);
+    let block = Block::default()
+        .title(" Permission Request ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let mut content_lines = vec![Line::from(format!("Type: {}", request.permission))];
+    for p in request.patterns.iter().take(7) {
+        content_lines.push(Line::from(format!("  cmd: {}", p)));
+    }
+    content_lines.push(Line::from(""));
+    content_lines.push(Line::from(
+        "[y] approve once | [a] always allow | [n] reject",
+    ));
+    let paragraph = Paragraph::new(content_lines).block(block);
     frame.render_widget(paragraph, dialog_area);
 }
 
@@ -578,6 +618,41 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     return apply_status_change(app, selected_idx);
                 }
                 _ => return None, // swallow all other keys
+            }
+        }
+
+        // When a permission dialog is visible, intercept y/a/n regardless of active tab.
+        let has_pending = app
+            .selected_task()
+            .map(|id| {
+                app.tab2_state
+                    .pending_permission
+                    .as_ref()
+                    .map(|(tid, _)| tid == id)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if has_pending {
+            let response = match key.code {
+                KeyCode::Char('y') if key.modifiers == KeyModifiers::NONE => {
+                    Some("once".to_string())
+                }
+                KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
+                    Some("always".to_string())
+                }
+                KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
+                    Some("reject".to_string())
+                }
+                _ => None,
+            };
+            if let Some(resp) = response {
+                if let Some((task_id, request)) = app.tab2_state.pending_permission.clone() {
+                    return Some(AppMessage::PermissionResolved {
+                        task_id,
+                        request,
+                        response: resp,
+                    });
+                }
             }
         }
 
@@ -782,40 +857,6 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                 // Forward all other keys to the textarea.
                 app.tab2_state.steering_input.input(Input::from(key));
                 return None;
-            }
-            // Permission pending: intercept y/a/n to resolve it.
-            let has_pending = app
-                .selected_task()
-                .map(|id| {
-                    app.tab2_state
-                        .pending_permission
-                        .as_ref()
-                        .map(|(tid, _)| tid == id)
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if has_pending {
-                let response = match key.code {
-                    KeyCode::Char('y') if key.modifiers == KeyModifiers::NONE => {
-                        Some("once".to_string())
-                    }
-                    KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
-                        Some("always".to_string())
-                    }
-                    KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
-                        Some("reject".to_string())
-                    }
-                    _ => None,
-                };
-                if let Some(resp) = response {
-                    if let Some((task_id, request)) = app.tab2_state.pending_permission.clone() {
-                        return Some(AppMessage::PermissionResolved {
-                            task_id,
-                            request,
-                            response: resp,
-                        });
-                    }
-                }
             }
             // Unfocused mode.
             match key.code {
@@ -2973,5 +3014,84 @@ mod tests {
         let task = make_task(TaskStatus::PendingReview, Some(AgentKind::CodeReview));
         let text = team_status_text(Some(&task));
         assert_eq!(text, "Pending Review - Code Review Agent");
+    }
+
+    /// Builds an App with one task selected and a pending permission request stored.
+    fn app_with_pending_permission() -> App {
+        use crate::opencode::types::PermissionRequest;
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        let task = Task {
+            id: task_id.clone(),
+            story_name: "1. Alpha".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: None,
+            description: String::new(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        app.task_store.insert(task);
+        app.refresh_stories();
+        app.task_list_state
+            .expanded_stories
+            .insert("1. Alpha".to_string());
+        app.task_list_state.refresh(&app.cached_stories);
+        // Navigate to the task row (index 1 after expanding story).
+        let down = key_event(KeyCode::PageDown, KeyModifiers::NONE);
+        handle_input(down, &mut app);
+
+        let request = PermissionRequest {
+            id: "perm-1".to_string(),
+            session_id: "sess-1".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["cargo build".to_string()],
+            always: vec![],
+        };
+        app.tab2_state.push_permission(task_id, request);
+        app
+    }
+
+    /// Pressing 'y' with a pending permission resolves it with "once", regardless of active tab.
+    #[test]
+    fn test_permission_popup_y_resolves_from_any_tab() {
+        let mut app = app_with_pending_permission();
+        app.active_tab = 0;
+
+        let result = handle_input(key_event(KeyCode::Char('y'), KeyModifiers::NONE), &mut app);
+
+        assert!(
+            matches!(
+                result,
+                Some(AppMessage::PermissionResolved {
+                    ref response,
+                    ..
+                }) if response == "once"
+            ),
+            "expected PermissionResolved with response=once, got: {result:?}"
+        );
+    }
+
+    /// A non-permission key (Tab) passes through and changes the active tab even when
+    /// a permission dialog is pending.
+    #[test]
+    fn test_permission_popup_non_permission_key_passes_through() {
+        let mut app = app_with_pending_permission();
+        let initial_tab = app.active_tab;
+
+        handle_input(key_event(KeyCode::Tab, KeyModifiers::NONE), &mut app);
+
+        assert_ne!(
+            app.active_tab, initial_tab,
+            "Tab key should cycle active_tab even when permission is pending"
+        );
     }
 }

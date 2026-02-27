@@ -3,3 +3,4 @@ target/
 .clawdmux/
 *.log
 .env
+docs/research.md
