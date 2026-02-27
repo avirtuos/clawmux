@@ -13,8 +13,9 @@ use tui_textarea::Input;
 
 use crate::app::App;
 use crate::messages::AppMessage;
-use crate::tasks::models::{status_to_index, TaskStatus, ALL_STATUSES};
+use crate::tasks::models::{status_to_index, Task, TaskStatus, ALL_STATUSES};
 use crate::tasks::TaskId;
+use crate::workflow::agents::AgentKind;
 use crate::workflow::transitions::WorkflowPhase;
 
 pub mod layout;
@@ -179,6 +180,31 @@ pub fn footer_hint_text(
     }
 }
 
+/// Returns a short status string describing the selected task's state and active agent.
+///
+/// Shown in the footer right section at all times so the user always knows the current
+/// task state without having to look at the task list. Returns `"No Task Selected"` when
+/// no task is focused. For tasks assigned to `Human` (i.e. no automated agent active),
+/// returns `"No Active Agent"` in the agent position.
+fn team_status_text(task: Option<&Task>) -> String {
+    let Some(task) = task else {
+        return "No Task Selected".to_string();
+    };
+    let status_label = match task.status {
+        TaskStatus::Open => "Open",
+        TaskStatus::InProgress => "In Progress",
+        TaskStatus::PendingReview => "Pending Review",
+        TaskStatus::Completed => "Completed",
+        TaskStatus::Abandoned => "Abandoned",
+    };
+    let agent_label = task
+        .assigned_to
+        .filter(|a| *a != AgentKind::Human)
+        .map(|a| a.display_name())
+        .unwrap_or("No Active Agent");
+    format!("{} - {}", status_label, agent_label)
+}
+
 /// Draws the full TUI frame with layout and task list widget.
 ///
 /// Renders left pane (task list), right pane, and footer using the computed layout regions.
@@ -264,7 +290,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 format_tokens(inp),
                 format_tokens(out)
             )),
-            (None, None) => None,
+            (None, None) => Some(team_status_text(selected_task)),
         }
     };
     let footer_block = Block::default().borders(Borders::TOP);
@@ -2886,5 +2912,66 @@ mod tests {
             hint.contains("[Enter] resume"),
             "footer should show resume hint for InProgress task, got: {hint}"
         );
+    }
+
+    // --- team_status_text tests ---
+
+    fn make_task(status: TaskStatus, assigned_to: Option<AgentKind>) -> Task {
+        use crate::tasks::models::TaskId;
+        Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status,
+            assigned_to,
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        }
+    }
+
+    /// No task selected returns "No Task Selected".
+    #[test]
+    fn test_team_status_text_no_task() {
+        let text = team_status_text(None);
+        assert_eq!(text, "No Task Selected");
+    }
+
+    /// Open task with no assignment shows "Open - No Active Agent".
+    #[test]
+    fn test_team_status_text_open_no_agent() {
+        let task = make_task(TaskStatus::Open, None);
+        let text = team_status_text(Some(&task));
+        assert_eq!(text, "Open - No Active Agent");
+    }
+
+    /// InProgress task assigned to Implementation agent shows correct labels.
+    #[test]
+    fn test_team_status_text_in_progress_with_agent() {
+        let task = make_task(TaskStatus::InProgress, Some(AgentKind::Implementation));
+        let text = team_status_text(Some(&task));
+        assert_eq!(text, "In Progress - Implementation Agent");
+    }
+
+    /// Completed task assigned to Human shows "No Active Agent" (Human is not a pipeline agent).
+    #[test]
+    fn test_team_status_text_completed_human_assigned() {
+        let task = make_task(TaskStatus::Completed, Some(AgentKind::Human));
+        let text = team_status_text(Some(&task));
+        assert_eq!(text, "Completed - No Active Agent");
+    }
+
+    /// PendingReview task assigned to CodeReview agent shows correct labels.
+    #[test]
+    fn test_team_status_text_pending_review_with_agent() {
+        let task = make_task(TaskStatus::PendingReview, Some(AgentKind::CodeReview));
+        let text = team_status_text(Some(&task));
+        assert_eq!(text, "Pending Review - Code Review Agent");
     }
 }

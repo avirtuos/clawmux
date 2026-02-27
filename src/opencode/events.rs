@@ -788,6 +788,22 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
                     );
                     return OpenCodeEvent::Unknown;
                 }
+                if part.get("type").and_then(|t| t.as_str()) == Some("step-finish") {
+                    let session_id = part["sessionID"]
+                        .as_str()
+                        .or_else(|| part["sessionId"].as_str());
+                    let input = part["tokens"]["input"].as_u64();
+                    let output = part["tokens"]["output"].as_u64();
+                    if let (Some(sid), Some(inp), Some(out)) = (session_id, input, output) {
+                        if inp > 0 || out > 0 {
+                            return OpenCodeEvent::TokensUpdated {
+                                session_id: sid.to_string(),
+                                input_tokens: inp,
+                                output_tokens: out,
+                            };
+                        }
+                    }
+                }
             }
             debug!("SSE event '{}': ignoring (props: {})", event_type, props);
             OpenCodeEvent::Unknown
@@ -2019,6 +2035,38 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "no message expected for delta from unknown session"
+        );
+    }
+
+    /// Verifies that a message.part.updated with a step-finish part containing non-zero
+    /// tokens emits TokensUpdated with the correct counts.
+    #[test]
+    fn test_parse_step_finish_tokens_from_message_part_updated() {
+        // Matches the actual SSE payload observed in production logs (research.md line 29).
+        let json = r#"{"payload":{"type":"message.part.updated","properties":{"part":{"cost":0.044665,"id":"prt_abc","messageID":"msg_1","reason":"tool-calls","sessionID":"ses_xyz","tokens":{"cache":{"read":0,"write":0},"input":7873,"output":212,"reasoning":0,"total":8085},"type":"step-finish"}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(
+                event,
+                OpenCodeEvent::TokensUpdated {
+                    ref session_id,
+                    input_tokens,
+                    output_tokens,
+                } if session_id == "ses_xyz" && input_tokens == 7873 && output_tokens == 212
+            ),
+            "expected TokensUpdated from step-finish part, got: {event:?}"
+        );
+    }
+
+    /// Verifies that a step-finish part with all-zero token counts returns Unknown
+    /// (avoids displaying "in:0 out:0" before any real inference has happened).
+    #[test]
+    fn test_parse_step_finish_zero_tokens_ignored() {
+        let json = r#"{"payload":{"type":"message.part.updated","properties":{"part":{"sessionID":"ses_xyz","tokens":{"input":0,"output":0},"type":"step-finish"}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "step-finish with zero tokens should return Unknown, got: {event:?}"
         );
     }
 }
