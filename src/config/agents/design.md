@@ -1,7 +1,7 @@
 ---
 description: Reviews the task and proposes design implications
 mode: subagent
-model: openrouter/anthropic/claude-opus-4.6
+model: openrouter/anthropic/claude-sonnet-4.6
 steps: 30
 tools:
   read: true
