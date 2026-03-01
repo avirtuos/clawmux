@@ -1,6 +1,6 @@
 //! Tab 3: Implementation plan display.
 //!
-//! Renders the selected task's implementation plan as a scrollable paragraph.
+//! Renders the selected task's implementation plan as a scrollable markdown paragraph.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::tasks::Task;
+use crate::tui::markdown::markdown_to_lines;
 
 /// UI state for Tab 3 (Plan).
 pub struct PlanTabState {
@@ -49,7 +50,7 @@ pub fn render(frame: &mut Frame, area: Rect, task: Option<&Task>, state: &PlanTa
         .borders(Borders::ALL);
     match content {
         Some(text) => {
-            let para = Paragraph::new(text.to_string())
+            let para = Paragraph::new(markdown_to_lines(text))
                 .block(block)
                 .wrap(Wrap { trim: false })
                 .scroll((state.scroll, 0));
@@ -139,6 +140,32 @@ mod tests {
         assert!(
             content.contains("Step 1: do this."),
             "should show plan content; got: {content:?}"
+        );
+    }
+
+    /// Verifies that markdown bold syntax renders with the BOLD style modifier.
+    #[test]
+    fn test_plan_render_markdown_bold() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let task = make_task(Some("**critical step**"));
+        let state = PlanTabState::new();
+
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), Some(&task), &state);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let has_bold = buf.content().iter().any(|cell| {
+            cell.style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        });
+        assert!(
+            has_bold,
+            "**critical step** should render with BOLD modifier; none found in buffer"
         );
     }
 }
