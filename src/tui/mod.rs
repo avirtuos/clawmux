@@ -157,13 +157,13 @@ pub fn footer_hint_text(
     } else if matches!(focused_input, FocusedInput::Steering) {
         "[Esc] exit | [Enter] send | Editing steering prompt"
     } else if active_tab == 0 && is_malformed_task {
-        "[f] request fix | [Enter] apply fix | [Up/Down] scroll | [Tab] next tab | [q] quit"
+        "[f] request fix | [Enter] apply fix | [PgUp/PgDn] switch tasks | [Tab] next tab | [q] quit"
     } else if active_tab == 0 && is_startable_task {
-        "[Enter] start | [p] prompt | [s] status | [Up/Down] scroll | [Tab] next tab | [q] quit"
+        "[Enter] start | [p] prompt | [s] status | [PgUp/PgDn] switch tasks | [Tab] next tab | [q] quit"
     } else if active_tab == 0 && is_resumable_task {
-        "[Enter] resume | [s] status | [Up/Down] scroll | [Tab] next tab | [q] quit"
+        "[Enter] resume | [s] status | [PgUp/PgDn] switch tasks | [Tab] next tab | [q] quit"
     } else if active_tab == 0 {
-        "[p] prompt | [s] status | [Up/Down] scroll | [Tab] next tab | [q] quit"
+        "[p] prompt | [s] status | [PgUp/PgDn] switch tasks | [Tab] next tab | [q] quit"
     } else if active_tab == 1 {
         "[p] answer | [Enter] submit | [Up/Down] navigate | [Tab] next tab | [q] quit"
     } else if active_tab == 2 || active_tab == 3 {
@@ -1789,7 +1789,8 @@ mod tests {
         assert!(text.contains("[p] prompt"), "got: {text}");
         assert!(!text.contains("[a] answer"), "got: {text}"); // moved to Questions tab
         assert!(text.contains("[s] status"), "got: {text}");
-        assert!(text.contains("Up/Down"), "got: {text}");
+        assert!(text.contains("PgUp/PgDn"), "got: {text}");
+        assert!(text.contains("switch tasks"), "got: {text}");
     }
 
     #[test]
@@ -2236,7 +2237,8 @@ mod tests {
         );
         assert!(text.contains("[f] request fix"), "got: {text}");
         assert!(text.contains("[Enter] apply fix"), "got: {text}");
-        assert!(text.contains("Up/Down"), "got: {text}");
+        assert!(text.contains("PgUp/PgDn"), "got: {text}");
+        assert!(text.contains("switch tasks"), "got: {text}");
         // Normal task hints should not appear for malformed tasks.
         assert!(!text.contains("[i] prompt"), "got: {text}");
     }
@@ -2275,7 +2277,8 @@ mod tests {
         );
         assert!(text.contains("[Enter] start"), "got: {text}");
         assert!(text.contains("[s] status"), "got: {text}");
-        assert!(text.contains("Up/Down"), "got: {text}");
+        assert!(text.contains("PgUp/PgDn"), "got: {text}");
+        assert!(text.contains("switch tasks"), "got: {text}");
         // Should not show [a] answer (moved to Questions tab).
         assert!(!text.contains("[a] answer"), "got: {text}");
     }
