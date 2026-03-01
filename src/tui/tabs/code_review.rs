@@ -178,6 +178,12 @@ pub struct Tab4State {
     pub comment_draft: TextArea<'static>,
     /// All submitted inline review comments for the current diff session.
     pub inline_comments: Vec<InlineComment>,
+    /// Textarea for typing a general (non-line-specific) review comment.
+    pub review_comment: TextArea<'static>,
+    /// Whether the general review comment textarea is focused.
+    pub review_comment_focused: bool,
+    /// Accumulated general review comments submitted by the user.
+    general_comments: Vec<String>,
 }
 
 impl Tab4State {
@@ -185,6 +191,8 @@ impl Tab4State {
     pub fn new() -> Self {
         let mut comment_draft = TextArea::default();
         comment_draft.set_block(Self::comment_draft_block());
+        let mut review_comment = TextArea::default();
+        review_comment.set_block(Self::review_comment_block());
         Self {
             diffs: HashMap::new(),
             current_task_id: None,
@@ -199,6 +207,9 @@ impl Tab4State {
             comment_mode: false,
             comment_draft,
             inline_comments: Vec::new(),
+            review_comment,
+            review_comment_focused: false,
+            general_comments: Vec::new(),
         }
     }
 
@@ -228,8 +239,9 @@ impl Tab4State {
 
     /// Resets per-diff navigation state when a new set of diffs is loaded.
     ///
-    /// Accumulated `inline_comments` are intentionally preserved across diff loads
-    /// so that a reviewer can accumulate feedback across multiple agent iterations.
+    /// Accumulated `inline_comments` and `general_comments` are intentionally preserved
+    /// across diff loads so that a reviewer can accumulate feedback across multiple
+    /// agent iterations.
     pub fn reset_for_diffs(&mut self) {
         self.selected_file = 0;
         self.diff_scroll = 0;
@@ -243,6 +255,7 @@ impl Tab4State {
         let mut ta = TextArea::default();
         ta.set_block(Self::comment_draft_block());
         self.comment_draft = ta;
+        self.review_comment_focused = false;
     }
 
     /// Focuses the review pane, enabling cursor navigation and line selection.
@@ -261,6 +274,7 @@ impl Tab4State {
         let mut ta = TextArea::default();
         ta.set_block(Self::comment_draft_block());
         self.comment_draft = ta;
+        self.review_comment_focused = false;
     }
 
     /// Moves the cursor up one line, adjusting the scroll offset to keep it visible.
@@ -373,13 +387,56 @@ impl Tab4State {
         self.comment_draft = ta;
     }
 
-    /// Takes all accumulated inline comments, formats them as `path:start-end: text` strings,
-    /// and clears the list.
+    /// Takes all accumulated comments (general and inline), formats inline comments as
+    /// `path:start-end: text` strings, and clears both lists.
+    ///
+    /// General comments are returned first, followed by formatted inline comments.
     pub fn take_comments(&mut self) -> Vec<String> {
-        self.inline_comments
-            .drain(..)
-            .map(|c| c.formatted())
-            .collect()
+        let mut result: Vec<String> = self.general_comments.drain(..).collect();
+        result.extend(self.inline_comments.drain(..).map(|c| c.formatted()));
+        result
+    }
+
+    /// Focuses the general review comment textarea with a highlighted border.
+    pub fn focus_review_comment(&mut self) {
+        self.review_comment_focused = true;
+        self.review_comment
+            .set_block(Self::review_comment_focused_block());
+    }
+
+    /// Removes focus from the general review comment textarea and resets its border style.
+    pub fn unfocus_review_comment(&mut self) {
+        self.review_comment_focused = false;
+        self.review_comment.set_block(Self::review_comment_block());
+    }
+
+    /// Submits the current general comment text to the accumulated list and resets the textarea.
+    ///
+    /// Does nothing if the textarea is empty. Exits focus mode after submission.
+    pub fn submit_review_comment(&mut self) {
+        let text = self.review_comment.lines().join("\n");
+        let trimmed = text.trim().to_string();
+        if !trimmed.is_empty() {
+            self.general_comments.push(trimmed);
+        }
+        let mut ta = TextArea::default();
+        ta.set_block(Self::review_comment_block());
+        self.review_comment = ta;
+        self.review_comment_focused = false;
+    }
+
+    fn review_comment_block() -> Block<'static> {
+        Block::default()
+            .title("General Comment  [Enter] submit  [Esc] cancel")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+    }
+
+    fn review_comment_focused_block() -> Block<'static> {
+        Block::default()
+            .title("General Comment  [Enter] submit  [Esc] cancel")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
     }
 
     /// Returns the active selection range `(lo, hi)` as flat-line indices for rendering.
@@ -465,24 +522,39 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Split layout: diff area + optional comment draft + hint bar.
-    let (diff_area, comment_draft_area, hint_area) = if state.comment_mode {
-        let sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(4),
-                Constraint::Length(1),
-            ])
-            .split(inner);
-        (sections[0], Some(sections[1]), sections[2])
-    } else {
-        let sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
-            .split(inner);
-        (sections[0], None, sections[1])
-    };
+    // Split layout: diff area + optional comment draft + optional general comment + hint bar.
+    let (diff_area, comment_draft_area, review_comment_area, hint_area) =
+        match (state.comment_mode, state.review_comment_focused) {
+            (true, _) => {
+                let sections = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(1),
+                        Constraint::Length(4),
+                        Constraint::Length(1),
+                    ])
+                    .split(inner);
+                (sections[0], Some(sections[1]), None, sections[2])
+            }
+            (false, true) => {
+                let sections = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(1),
+                        Constraint::Length(4),
+                        Constraint::Length(1),
+                    ])
+                    .split(inner);
+                (sections[0], None, Some(sections[1]), sections[2])
+            }
+            (false, false) => {
+                let sections = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(1)])
+                    .split(inner);
+                (sections[0], None, None, sections[1])
+            }
+        };
 
     // Compute the flat line list and selection bounds for the current file.
     let flat_lines = flatten_file_diff(file_diff);
@@ -540,6 +612,11 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
         frame.render_widget(&state.comment_draft, ca);
     }
 
+    // General review comment textarea (visible only when focused).
+    if let Some(rca) = review_comment_area {
+        frame.render_widget(&state.review_comment, rca);
+    }
+
     // Context-sensitive hint bar.
     let comment_count = state.inline_comments.len();
     let count_suffix = if comment_count > 0 {
@@ -553,7 +630,12 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
     };
 
     let hint_text = if state.comment_mode {
-        "[Enter] save | [Esc] cancel | Typing comment...".to_string()
+        "[Enter] save | [Esc] cancel | Typing inline comment...".to_string()
+    } else if state.review_comment_focused {
+        format!(
+            "[Enter] submit | [Esc] cancel | Typing general comment...{}",
+            count_suffix
+        )
     } else if state.review_focused && state.selection_start.is_some() {
         format!(
             "[Space] end selection | [Up/Down] extend | [Esc] cancel{}",
@@ -566,7 +648,7 @@ pub fn render(frame: &mut Frame, area: Rect, task_id: Option<&TaskId>, state: &T
         )
     } else {
         format!(
-            "[r] review | [a] approve | [R] revisions | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit{}",
+            "[r] review | [a] approve | [R] revisions | [p] comment | [PgUp/PgDn] scroll | [Tab] next tab | [q] quit{}",
             count_suffix
         )
     };

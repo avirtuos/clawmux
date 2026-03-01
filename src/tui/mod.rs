@@ -110,6 +110,8 @@ pub enum FocusedInput {
     Comment,
     /// The steering textarea on Tab 2 (Agent Activity) is focused.
     Steering,
+    /// The general review comment textarea on Tab 6 or Tab 7 is focused.
+    ReviewComment,
 }
 
 /// Returns the footer hint string based on the current application state.
@@ -142,10 +144,12 @@ pub fn footer_hint_text(
         "[y/Enter] confirm quit | [n/Esc] cancel"
     } else if show_status_picker {
         "[1-5] select | [Up/Down] navigate | [Enter] confirm | [Esc] cancel"
+    } else if matches!(focused_input, FocusedInput::ReviewComment) {
+        "[Esc] exit | [Enter] submit | Editing review comment"
     } else if matches!(focused_input, FocusedInput::Prompt) {
-        "[Esc] exit | Editing prompt"
+        "[Esc] exit | [Enter] exit | Editing prompt"
     } else if matches!(focused_input, FocusedInput::Answer) {
-        "[Esc] exit | [Tab] next answer | Editing answer"
+        "[Esc] exit | [Tab] next answer | [Enter] submit | Editing answer"
     } else if matches!(focused_input, FocusedInput::Review) {
         "[Esc] exit | [Up/Down] cursor | [PgUp/PgDn] files | [Space] select | [a] approve"
     } else if matches!(focused_input, FocusedInput::Comment) {
@@ -155,13 +159,13 @@ pub fn footer_hint_text(
     } else if active_tab == 0 && is_malformed_task {
         "[f] request fix | [Enter] apply fix | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 0 && is_startable_task {
-        "[Enter] start | [i] prompt | [s] status | [Up/Down] scroll | [Tab] next tab | [q] quit"
+        "[Enter] start | [p] prompt | [s] status | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 0 && is_resumable_task {
         "[Enter] resume | [s] status | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 0 {
-        "[i] prompt | [s] status | [Up/Down] scroll | [Tab] next tab | [q] quit"
+        "[p] prompt | [s] status | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 1 {
-        "[a] answer | [Alt+Enter] submit | [Up/Down] navigate | [Tab] next tab | [q] quit"
+        "[p] answer | [Enter] submit | [Up/Down] navigate | [Tab] next tab | [q] quit"
     } else if active_tab == 2 || active_tab == 3 {
         "[Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 4 && pending_permission {
@@ -173,9 +177,9 @@ pub fn footer_hint_text(
     } else if active_tab == 5 {
         "[Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 6 {
-        "[a] approve | [R] revisions | [Up/Down] scroll | [Tab] next tab | [q] quit"
+        "[a] approve | [p] comment | [R] revisions | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 7 {
-        "[r] review | [a] approve | [R] revisions | [Up/Down] scroll | [Tab] next tab | [q] quit"
+        "[r] review | [a] approve | [p] comment | [R] revisions | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else {
         "[Tab] next tab | [q] quit"
     }
@@ -233,6 +237,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         FocusedInput::Prompt
     } else if app.questions_state.focused_answer.is_some() {
         FocusedInput::Answer
+    } else if app.tab4_state.review_comment_focused {
+        FocusedInput::ReviewComment
     } else if app.tab4_state.comment_mode {
         FocusedInput::Comment
     } else if app.tab4_state.review_focused {
@@ -695,7 +701,9 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                 // Fall through to shared navigation handling below.
             } else {
                 if app.tab1_state.prompt_focused {
-                    if key.code == KeyCode::Esc {
+                    if key.code == KeyCode::Esc
+                        || (key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE)
+                    {
                         app.tab1_state.prompt_focused = false;
                         app.tab1_state.set_prompt_unfocused_style();
                     } else {
@@ -703,8 +711,8 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     }
                     return None;
                 }
-                // Enter focus on the supplemental prompt with 'i'.
-                if key.code == KeyCode::Char('i') && key.modifiers == KeyModifiers::NONE {
+                // Enter focus on the supplemental prompt with 'p'.
+                if key.code == KeyCode::Char('p') && key.modifiers == KeyModifiers::NONE {
                     app.tab1_state.prompt_focused = true;
                     app.tab1_state.set_prompt_focused_style();
                     return None;
@@ -754,7 +762,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                 if key.code == KeyCode::Esc {
                     app.questions_state.set_answer_unfocused_style(idx);
                     app.questions_state.focused_answer = None;
-                } else if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::ALT {
+                } else if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
                     // Submit the answer.
                     let answer_text: String =
                         app.questions_state.answer_inputs[idx].lines().join("\n");
@@ -798,7 +806,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     app.questions_state.select_next(total);
                     return None;
                 }
-                KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
+                KeyCode::Char('p') if key.modifiers == KeyModifiers::NONE => {
                     // Focus the answer textarea for the currently selected question.
                     if !app.questions_state.answer_inputs.is_empty() {
                         if let Some(answer_idx) = find_answer_idx_for_selected(app) {
@@ -906,6 +914,24 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
 
         // Tab 6 (Review Discussion): approve, request revisions, scroll.
         if app.active_tab == 6 {
+            // General comment box input handling takes priority.
+            if app.tab4_state.review_comment_focused {
+                match key.code {
+                    KeyCode::Esc => {
+                        app.tab4_state.unfocus_review_comment();
+                        return None;
+                    }
+                    KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
+                        app.tab4_state.submit_review_comment();
+                        return None;
+                    }
+                    _ => {
+                        app.tab4_state.review_comment.input(Input::from(key));
+                        return None;
+                    }
+                }
+            }
+
             match key.code {
                 KeyCode::Up => {
                     app.review_state.scroll_up();
@@ -921,7 +947,13 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     }
                     return None;
                 }
-                // Shift+R: request revisions using accumulated inline comments from tab 7.
+                KeyCode::Char('p') if key.modifiers == KeyModifiers::NONE => {
+                    if app.selected_task().is_some() {
+                        app.tab4_state.focus_review_comment();
+                    }
+                    return None;
+                }
+                // Shift+R: request revisions using accumulated inline and general comments.
                 KeyCode::Char('R') => {
                     if let Some(task_id) = app.selected_task().cloned() {
                         let comments = app.tab4_state.take_comments();
@@ -957,6 +989,24 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     }
                     _ => {
                         app.tab4_state.comment_draft.input(Input::from(key));
+                        return None;
+                    }
+                }
+            }
+
+            // General comment box: user is typing a general review comment.
+            if app.tab4_state.review_comment_focused {
+                match key.code {
+                    KeyCode::Esc => {
+                        app.tab4_state.unfocus_review_comment();
+                        return None;
+                    }
+                    KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
+                        app.tab4_state.submit_review_comment();
+                        return None;
+                    }
+                    _ => {
+                        app.tab4_state.review_comment.input(Input::from(key));
                         return None;
                     }
                 }
@@ -1036,13 +1086,19 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     app.tab4_state.scroll_down();
                     return None;
                 }
+                KeyCode::Char('p') if key.modifiers == KeyModifiers::NONE => {
+                    if app.selected_task().is_some() {
+                        app.tab4_state.focus_review_comment();
+                    }
+                    return None;
+                }
                 KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
                     if let Some(task_id) = app.selected_task().cloned() {
                         return Some(AppMessage::HumanApprovedReview { task_id });
                     }
                     return None;
                 }
-                // Shift+R: request revisions using accumulated inline comments.
+                // Shift+R: request revisions using accumulated inline and general comments.
                 KeyCode::Char('R') => {
                     if let Some(task_id) = app.selected_task().cloned() {
                         let comments = app.tab4_state.take_comments();
@@ -1328,7 +1384,7 @@ mod tests {
         assert_eq!(app.active_tab, 0);
         assert!(!app.tab1_state.prompt_focused);
 
-        let event = key_event(KeyCode::Char('i'), KeyModifiers::NONE);
+        let event = key_event(KeyCode::Char('p'), KeyModifiers::NONE);
         let result = handle_input(event, &mut app);
 
         assert!(result.is_none());
@@ -1344,7 +1400,7 @@ mod tests {
         assert_eq!(app.questions_state.answer_inputs.len(), 1);
         assert!(app.questions_state.focused_answer.is_none());
 
-        let event = key_event(KeyCode::Char('a'), KeyModifiers::NONE);
+        let event = key_event(KeyCode::Char('p'), KeyModifiers::NONE);
         let result = handle_input(event, &mut app);
 
         assert!(result.is_none());
@@ -1358,7 +1414,7 @@ mod tests {
         // Focus the answer textarea.
         app.questions_state.focused_answer = Some(0);
 
-        let event = key_event(KeyCode::Enter, KeyModifiers::ALT);
+        let event = key_event(KeyCode::Enter, KeyModifiers::NONE);
         let result = handle_input(event, &mut app);
 
         assert!(
@@ -1730,7 +1786,7 @@ mod tests {
             false,
             false,
         );
-        assert!(text.contains("[i] prompt"), "got: {text}");
+        assert!(text.contains("[p] prompt"), "got: {text}");
         assert!(!text.contains("[a] answer"), "got: {text}"); // moved to Questions tab
         assert!(text.contains("[s] status"), "got: {text}");
         assert!(text.contains("Up/Down"), "got: {text}");
@@ -1749,8 +1805,8 @@ mod tests {
             false,
             false,
         );
-        assert!(text.contains("[a] answer"), "got: {text}");
-        assert!(text.contains("[Alt+Enter] submit"), "got: {text}");
+        assert!(text.contains("[p] answer"), "got: {text}");
+        assert!(text.contains("[Enter] submit"), "got: {text}");
         assert!(text.contains("Up/Down"), "got: {text}");
         assert!(text.contains("[Tab] next tab"), "got: {text}");
         assert!(text.contains("[q] quit"), "got: {text}");

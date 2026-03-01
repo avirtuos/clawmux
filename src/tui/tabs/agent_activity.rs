@@ -529,6 +529,52 @@ impl Tab2State {
         self.thinking_tasks.contains_key(task_id)
     }
 
+    /// Strips trailing JSON response data from the last streaming message for `task_id`.
+    ///
+    /// When an agent session completes, the structured JSON response (e.g.
+    /// `{"action":"complete","summary":"..."}`) may have been streamed token-by-token into the
+    /// activity buffer as part of the agent's text output. This method removes it from display so
+    /// only the human-readable portion of the message is shown.
+    ///
+    /// Finds the last `BufferEntry::Message` in the buffer, then in that message's lines finds
+    /// the last `ActivityLine::Text` and strips everything from the last `{"action":` marker
+    /// onwards (mirroring the marker used by `parse_response()`). If the remaining text is empty
+    /// or whitespace-only, that `ActivityLine::Text` is removed entirely.
+    pub fn strip_response_json(&mut self, task_id: &TaskId) {
+        const JSON_MARKER: &str = r#"{"action":"#;
+        let Some(buffer) = self.buffers.get_mut(task_id) else {
+            return;
+        };
+        // Find the last Message entry.
+        let Some(last_msg) = buffer.iter_mut().rev().find_map(|e| {
+            if let BufferEntry::Message { lines, .. } = e {
+                Some(lines)
+            } else {
+                None
+            }
+        }) else {
+            return;
+        };
+        // Find the index of the last Text line in that message.
+        let Some(last_text_idx) = last_msg
+            .iter()
+            .rposition(|l| matches!(l, ActivityLine::Text { .. }))
+        else {
+            return;
+        };
+        if let ActivityLine::Text { content } = &mut last_msg[last_text_idx] {
+            if let Some(pos) = content.rfind(JSON_MARKER) {
+                *content = content[..pos].to_string();
+            }
+        }
+        // Remove the line if it became empty or whitespace-only.
+        if let ActivityLine::Text { content } = &last_msg[last_text_idx] {
+            if content.trim().is_empty() {
+                last_msg.remove(last_text_idx);
+            }
+        }
+    }
+
     /// Updates the cumulative token counts for a task.
     ///
     /// Replaces the stored `(input, output)` pair with the latest values reported
@@ -1980,6 +2026,87 @@ mod tests {
             "new max_scroll ({}) should exceed old max_scroll ({})",
             max_scroll_new,
             max_scroll_old
+        );
+    }
+
+    /// strip_response_json removes the trailing JSON block from the last Text line.
+    #[test]
+    fn test_strip_response_json_removes_trailing_json() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        let content = r#"Here is my analysis.
+{"action":"complete","summary":"All done"}"#
+            .to_string();
+        state.push_streaming(&id, "msg-1", &[MessagePart::Text { text: content }]);
+
+        state.strip_response_json(&id);
+
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), 1, "should still have one text line");
+        if let ActivityLine::Text { content } = &lines[0] {
+            assert_eq!(
+                content.trim(),
+                "Here is my analysis.",
+                "JSON should be stripped; got: {content:?}"
+            );
+        } else {
+            panic!("expected ActivityLine::Text, got: {:?}", lines[0]);
+        }
+    }
+
+    /// strip_response_json keeps text that appears before the JSON marker.
+    #[test]
+    fn test_strip_response_json_preserves_preceding_text() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        let content =
+            "First sentence. Second sentence. {\"action\":\"complete\",\"summary\":\"ok\"}"
+                .to_string();
+        state.push_streaming(&id, "msg-1", &[MessagePart::Text { text: content }]);
+
+        state.strip_response_json(&id);
+
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), 1);
+        if let ActivityLine::Text { content } = &lines[0] {
+            assert!(
+                content.contains("First sentence."),
+                "preceding text should be preserved; got: {content:?}"
+            );
+            assert!(
+                content.contains("Second sentence."),
+                "preceding text should be preserved; got: {content:?}"
+            );
+            assert!(
+                !content.contains(r#"{"action":"#),
+                "JSON marker should be stripped; got: {content:?}"
+            );
+        } else {
+            panic!("expected ActivityLine::Text, got: {:?}", lines[0]);
+        }
+    }
+
+    /// strip_response_json is a no-op when there is no JSON marker in the buffer.
+    #[test]
+    fn test_strip_response_json_noop_when_no_json() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.push_streaming(
+            &id,
+            "msg-1",
+            &[MessagePart::Text {
+                text: "No JSON here.".to_string(),
+            }],
+        );
+
+        state.strip_response_json(&id);
+
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), 1, "line count should be unchanged");
+        assert!(
+            matches!(&lines[0], ActivityLine::Text { content } if content == "No JSON here."),
+            "content should be unchanged; got: {:?}",
+            lines[0]
         );
     }
 }

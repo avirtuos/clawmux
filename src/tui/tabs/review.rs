@@ -7,6 +7,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -14,6 +15,7 @@ use ratatui::Frame;
 
 use crate::tasks::TaskId;
 use crate::tui::markdown::{markdown_to_lines, visual_line_count};
+use crate::tui::tabs::code_review::Tab4State;
 
 /// A single entry in the review discussion timeline for a task.
 #[derive(Debug, Clone)]
@@ -197,6 +199,9 @@ impl Default for ReviewTabState {
 /// entries yet. When entries exist, renders them in chronological order with
 /// distinct styles per variant. Supports scrolling with follow-tail auto-scroll.
 ///
+/// When `tab4_state.review_comment_focused` is true, the area is split to show
+/// a general review comment input box at the bottom.
+///
 /// Updates `state.last_max_scroll` via interior mutability so that `scroll_up`
 /// and `scroll_down` can reference the correct visual line count.
 pub fn render(
@@ -204,14 +209,29 @@ pub fn render(
     area: ratatui::layout::Rect,
     task_id: Option<&TaskId>,
     state: &ReviewTabState,
+    tab4_state: &Tab4State,
 ) {
+    // Split area when the general comment box is visible.
+    let (review_area, comment_area) = if tab4_state.review_comment_focused {
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(4)])
+            .split(area);
+        (sections[0], Some(sections[1]))
+    } else {
+        (area, None)
+    };
+
     let block = Block::default().title("Review").borders(Borders::ALL);
 
     if task_id.is_none() {
         let placeholder = Paragraph::new("Select a task to view review discussion")
             .style(Style::default().fg(Color::DarkGray))
             .block(block);
-        frame.render_widget(placeholder, area);
+        frame.render_widget(placeholder, review_area);
+        if let Some(ca) = comment_area {
+            frame.render_widget(&tab4_state.review_comment, ca);
+        }
         return;
     }
 
@@ -222,7 +242,10 @@ pub fn render(
         let placeholder = Paragraph::new("No review activity yet.")
             .style(Style::default().fg(Color::DarkGray))
             .block(block);
-        frame.render_widget(placeholder, area);
+        frame.render_widget(placeholder, review_area);
+        if let Some(ca) = comment_area {
+            frame.render_widget(&tab4_state.review_comment, ca);
+        }
         return;
     }
 
@@ -280,8 +303,8 @@ pub fn render(
     }
 
     // Compute effective scroll using visual (wrapped) line counts.
-    let content_width = area.width.saturating_sub(2);
-    let viewport_height = area.height.saturating_sub(2) as usize;
+    let content_width = review_area.width.saturating_sub(2);
+    let viewport_height = review_area.height.saturating_sub(2) as usize;
     let total_visual = visual_line_count(&lines, content_width);
     let max_scroll = total_visual.saturating_sub(viewport_height);
     state.last_max_scroll.set(max_scroll);
@@ -297,7 +320,12 @@ pub fn render(
         .wrap(Wrap { trim: false })
         .scroll((effective_scroll as u16, 0));
 
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, review_area);
+
+    // General review comment textarea (visible only when focused).
+    if let Some(ca) = comment_area {
+        frame.render_widget(&tab4_state.review_comment, ca);
+    }
 }
 
 #[cfg(test)]

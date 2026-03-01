@@ -722,6 +722,7 @@ impl App {
                 }
 
                 self.tab2_state.clear_thinking(&task_id);
+                self.tab2_state.strip_response_json(&task_id);
                 let current_agent = self
                     .workflow_engine
                     .state(&task_id)
@@ -751,10 +752,9 @@ impl App {
                             });
                         }
                         let agent = current_agent.unwrap_or(AgentKind::Intake);
-                        let truncated = truncate_str(&summary, 80);
                         self.tab2_state.push_banner(
                             &task_id,
-                            format!("{} completed: {}", agent.display_name(), truncated),
+                            format!("{} completed: {}", agent.display_name(), summary),
                         );
                         // Push the full summary to the review timeline when it is a CodeReview agent.
                         if agent == AgentKind::CodeReview {
@@ -815,14 +815,13 @@ impl App {
                     }) => {
                         let from = current_agent.unwrap_or(AgentKind::Intake);
                         let to = AgentKind::from_display_name(&target_agent).unwrap_or(from);
-                        let truncated_reason = truncate_str(&reason, 80);
                         self.tab2_state.push_banner(
                             &task_id,
                             format!(
                                 "{} kicked back to {}: {}",
                                 from.display_name(),
                                 to.display_name(),
-                                truncated_reason
+                                reason
                             ),
                         );
                         self.review_state.push_kickback(
