@@ -138,6 +138,10 @@ pub struct Tab2State {
     ///
     /// Set when a `PermissionAsked` message arrives; cleared when the user responds.
     pub pending_permission: Option<(TaskId, PermissionRequest)>,
+    /// Text input for typing a rejection explanation when the user presses `[r]`.
+    pub rejection_response: TextArea<'static>,
+    /// Whether the rejection response textarea currently has keyboard focus.
+    pub rejection_response_focused: bool,
     /// Per-task queued steering prompt (max 1).
     ///
     /// Set when the user submits a steering prompt while no session is active.
@@ -159,6 +163,12 @@ impl Tab2State {
                 .title("Steering Prompt")
                 .borders(Borders::ALL),
         );
+        let mut rejection_response = TextArea::default();
+        rejection_response.set_block(
+            Block::default()
+                .title("What should the agent do instead?")
+                .borders(Borders::ALL),
+        );
         Tab2State {
             buffers: HashMap::new(),
             scroll_offset: 0,
@@ -171,6 +181,8 @@ impl Tab2State {
             steering_input,
             steering_focused: false,
             pending_permission: None,
+            rejection_response,
+            rejection_response_focused: false,
             queued_steering_prompts: HashMap::new(),
             task_tokens: HashMap::new(),
         }
@@ -663,6 +675,29 @@ impl Tab2State {
         );
         self.steering_input = ta;
         self.steering_focused = false;
+    }
+
+    /// Sets the rejection response textarea to the focused (yellow border) style.
+    pub fn focus_rejection_response(&mut self) {
+        self.rejection_response.set_block(
+            Block::default()
+                .title("What should the agent do instead?")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+        self.rejection_response_focused = true;
+    }
+
+    /// Resets the rejection response textarea to empty with unfocused style.
+    pub fn reset_rejection_response(&mut self) {
+        let mut ta = TextArea::default();
+        ta.set_block(
+            Block::default()
+                .title("What should the agent do instead?")
+                .borders(Borders::ALL),
+        );
+        self.rejection_response = ta;
+        self.rejection_response_focused = false;
     }
 
     /// Stores `text` as the pending steering prompt for `task_id`, replacing any

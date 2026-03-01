@@ -110,6 +110,8 @@ pub enum FocusedInput {
     Comment,
     /// The steering textarea on Tab 2 (Agent Activity) is focused.
     Steering,
+    /// The rejection response textarea in the permission dialog is focused.
+    RejectionResponse,
     /// The general review comment textarea on Tab 6 or Tab 7 is focused.
     ReviewComment,
 }
@@ -156,6 +158,8 @@ pub fn footer_hint_text(
         "[Esc] cancel | [Enter] save | Editing comment"
     } else if matches!(focused_input, FocusedInput::Steering) {
         "[Esc] exit | [Enter] send | Editing steering prompt"
+    } else if matches!(focused_input, FocusedInput::RejectionResponse) {
+        "[Enter] submit | [Esc] cancel | Editing rejection response"
     } else if active_tab == 0 && is_malformed_task {
         "[f] request fix | [Enter] apply fix | [PgUp/PgDn] switch tasks | [Tab] next tab | [q] quit"
     } else if active_tab == 0 && is_startable_task {
@@ -169,7 +173,7 @@ pub fn footer_hint_text(
     } else if active_tab == 2 || active_tab == 3 {
         "[Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 4 && pending_permission {
-        "[y] approve | [a] always | [n] reject | [Tab] next tab | [q] quit"
+        "[y] approve | [a] always | [n] reject | [r] reject with response | [Tab] next tab | [q] quit"
     } else if active_tab == 4 {
         "[p] steer | [Enter] send | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 5 && awaiting_approval {
@@ -243,6 +247,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         FocusedInput::Comment
     } else if app.tab4_state.review_focused {
         FocusedInput::Review
+    } else if app.tab2_state.rejection_response_focused {
+        FocusedInput::RejectionResponse
     } else if app.tab2_state.steering_focused {
         FocusedInput::Steering
     } else {
@@ -341,7 +347,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     if let Some((ref _tid, ref request)) = app.tab2_state.pending_permission {
-        render_permission_dialog(frame, frame.area(), request);
+        render_permission_dialog(
+            frame,
+            frame.area(),
+            request,
+            app.tab2_state.rejection_response_focused,
+            &app.tab2_state.rejection_response,
+        );
     }
 
     if let Some(selected_idx) = app.show_status_picker {
@@ -397,10 +409,21 @@ fn render_quit_confirm_dialog(frame: &mut Frame, area: Rect) {
 /// Blanks a 60-column centered region using [`Clear`] then draws a
 /// yellow-bordered block titled ` Permission Request ` listing the permission
 /// type, each command pattern, and the available key bindings.
-fn render_permission_dialog(frame: &mut Frame, area: Rect, request: &PermissionRequest) {
+///
+/// When `rejection_focused` is `true`, expands the dialog by 4 rows and renders
+/// the `rejection_response` textarea in place of the normal hint line so the
+/// user can type an explanation to send to the agent.
+fn render_permission_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    request: &PermissionRequest,
+    rejection_focused: bool,
+    rejection_response: &tui_textarea::TextArea<'_>,
+) {
     let dialog_width = 60u16;
     let pattern_rows = request.patterns.len().min(7) as u16;
-    let dialog_height = (5u16 + pattern_rows).min(12);
+    let extra_rows = if rejection_focused { 4u16 } else { 0u16 };
+    let dialog_height = (5u16 + pattern_rows + extra_rows).min(16);
     let x = area.x + area.width.saturating_sub(dialog_width) / 2;
     let y = area.y + area.height.saturating_sub(dialog_height) / 2;
     let dialog_area = Rect::new(
@@ -415,16 +438,40 @@ fn render_permission_dialog(frame: &mut Frame, area: Rect, request: &PermissionR
         .title(" Permission Request ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
     let mut content_lines = vec![Line::from(format!("Type: {}", request.permission))];
     for p in request.patterns.iter().take(7) {
         content_lines.push(Line::from(format!("  cmd: {}", p)));
     }
     content_lines.push(Line::from(""));
-    content_lines.push(Line::from(
-        "[y] approve once | [a] always allow | [n] reject",
-    ));
-    let paragraph = Paragraph::new(content_lines).block(block);
-    frame.render_widget(paragraph, dialog_area);
+
+    if rejection_focused {
+        // Show the content up to the blank line, then the textarea.
+        let text_height = content_lines.len() as u16;
+        let hint_height = 1u16;
+        let textarea_height = inner.height.saturating_sub(text_height + hint_height);
+        let [text_area, rejection_area, hint_area] = ratatui::layout::Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(text_height),
+                Constraint::Length(textarea_height),
+                Constraint::Length(hint_height),
+            ])
+            .areas(inner);
+        frame.render_widget(Paragraph::new(content_lines), text_area);
+        frame.render_widget(rejection_response, rejection_area);
+        frame.render_widget(
+            Paragraph::new(Line::from("[Enter] submit | [Esc] cancel")),
+            hint_area,
+        );
+    } else {
+        content_lines.push(Line::from(
+            "[y] approve once | [a] always allow | [n] reject | [r] reject with response",
+        ));
+        frame.render_widget(Paragraph::new(content_lines), inner);
+    }
 }
 
 /// Renders a centered modal status picker dialog over the given area.
@@ -627,7 +674,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             }
         }
 
-        // When a permission dialog is visible, intercept y/a/n regardless of active tab.
+        // When a permission dialog is visible, intercept y/a/n/r regardless of active tab.
         let has_pending = app
             .selected_task()
             .map(|id| {
@@ -639,6 +686,39 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             })
             .unwrap_or(false);
         if has_pending {
+            // If the rejection response textarea is focused, handle its input first.
+            if app.tab2_state.rejection_response_focused {
+                match key.code {
+                    KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
+                        let text: String = app.tab2_state.rejection_response.lines().join("\n");
+                        app.tab2_state.reset_rejection_response();
+                        if let Some((task_id, request)) = app.tab2_state.pending_permission.clone()
+                        {
+                            let explanation = if text.trim().is_empty() {
+                                None
+                            } else {
+                                Some(format!("No, lets consider something else first. {}", text))
+                            };
+                            return Some(AppMessage::PermissionResolved {
+                                task_id,
+                                request,
+                                response: "reject".to_string(),
+                                explanation,
+                            });
+                        }
+                        return None;
+                    }
+                    KeyCode::Esc => {
+                        app.tab2_state.reset_rejection_response();
+                        return None;
+                    }
+                    _ => {
+                        app.tab2_state.rejection_response.input(Input::from(key));
+                        return None;
+                    }
+                }
+            }
+
             let response = match key.code {
                 KeyCode::Char('y') if key.modifiers == KeyModifiers::NONE => {
                     Some("once".to_string())
@@ -649,6 +729,10 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                 KeyCode::Char('n') if key.modifiers == KeyModifiers::NONE => {
                     Some("reject".to_string())
                 }
+                KeyCode::Char('r') if key.modifiers == KeyModifiers::NONE => {
+                    app.tab2_state.focus_rejection_response();
+                    return None;
+                }
                 _ => None,
             };
             if let Some(resp) = response {
@@ -657,6 +741,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                         task_id,
                         request,
                         response: resp,
+                        explanation: None,
                     });
                 }
             }
@@ -3151,6 +3236,86 @@ mod tests {
         assert_ne!(
             app.active_tab, initial_tab,
             "Tab key should cycle active_tab even when permission is pending"
+        );
+    }
+
+    /// Pressing `r` while a permission dialog is shown focuses the rejection response textarea
+    /// without emitting any message.
+    #[test]
+    fn test_r_key_focuses_rejection_response() {
+        let mut app = app_with_pending_permission();
+        assert!(
+            !app.tab2_state.rejection_response_focused,
+            "rejection response should start unfocused"
+        );
+
+        let result = handle_input(key_event(KeyCode::Char('r'), KeyModifiers::NONE), &mut app);
+
+        assert!(result.is_none(), "expected None from [r], got: {result:?}");
+        assert!(
+            app.tab2_state.rejection_response_focused,
+            "rejection response should be focused after [r]"
+        );
+    }
+
+    /// Pressing Esc while the rejection response is focused returns to the y/a/n/r dialog
+    /// without emitting any message and without rejecting.
+    #[test]
+    fn test_esc_in_rejection_response_returns_to_dialog() {
+        let mut app = app_with_pending_permission();
+        app.tab2_state.focus_rejection_response();
+
+        let result = handle_input(key_event(KeyCode::Esc, KeyModifiers::NONE), &mut app);
+
+        assert!(result.is_none(), "expected None from Esc, got: {result:?}");
+        assert!(
+            !app.tab2_state.rejection_response_focused,
+            "rejection response should be unfocused after Esc"
+        );
+        // Permission should still be pending.
+        assert!(
+            app.tab2_state.pending_permission.is_some(),
+            "permission should still be pending after Esc"
+        );
+    }
+
+    /// Pressing Enter while the rejection response textarea is focused emits `PermissionResolved`
+    /// with `response="reject"` and a prepended explanation string.
+    #[test]
+    fn test_enter_in_rejection_response_emits_resolved() {
+        use tui_textarea::Input;
+        let mut app = app_with_pending_permission();
+        app.tab2_state.focus_rejection_response();
+
+        // Type some text into the rejection response textarea.
+        for ch in "try a different approach".chars() {
+            app.tab2_state
+                .rejection_response
+                .input(Input::from(key_event(
+                    KeyCode::Char(ch),
+                    KeyModifiers::NONE,
+                )));
+        }
+
+        let result = handle_input(key_event(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+
+        assert!(
+            matches!(
+                result,
+                Some(AppMessage::PermissionResolved {
+                    ref response,
+                    explanation: Some(ref expl),
+                    ..
+                }) if response == "reject"
+                    && expl.starts_with("No, lets consider something else first.")
+                    && expl.contains("try a different approach")
+            ),
+            "expected PermissionResolved with reject + explanation, got: {result:?}"
+        );
+        // Textarea should be cleared and unfocused.
+        assert!(
+            !app.tab2_state.rejection_response_focused,
+            "rejection response should be unfocused after submit"
         );
     }
 }
