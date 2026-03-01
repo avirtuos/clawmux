@@ -843,24 +843,19 @@ impl App {
                         msgs
                     }
                     Err(_) => {
-                        // Fallback: advance pipeline with a placeholder summary.
                         let agent = current_agent.unwrap_or(AgentKind::Intake);
                         tracing::warn!(
-                            "Could not parse structured output for task {}; advancing with fallback",
+                            "Could not parse structured output for task {}; waiting for human steering",
                             task_id
                         );
                         self.tab2_state.push_banner(
                             &task_id,
-                            "Agent output could not be parsed; advancing".to_string(),
+                            format!(
+                                "{} could not produce a structured response. Use [p] to steer the agent.",
+                                agent.display_name()
+                            ),
                         );
-                        let mut msgs = self.workflow_engine.process(AppMessage::AgentCompleted {
-                            task_id: task_id.clone(),
-                            agent,
-                            summary: "(no structured output)".to_string(),
-                        });
-                        self.sync_task_with_workflow(&task_id, agent);
-                        msgs.push(AppMessage::TaskUpdated { task_id });
-                        msgs
+                        vec![AppMessage::TaskUpdated { task_id }]
                     }
                 }
             }
@@ -1107,6 +1102,7 @@ impl App {
                 task_id,
                 request,
                 response,
+                explanation,
             } => {
                 self.tab2_state.resolve_permission(&task_id);
                 let decision = match response.as_str() {
@@ -1119,36 +1115,57 @@ impl App {
                     &task_id,
                     format!("[Permission] {} {}", request.permission, decision),
                 );
-                let client = match self.opencode_client.clone() {
-                    Some(c) => c,
-                    None => {
-                        tracing::warn!("Cannot resolve permission: OpenCode client unavailable");
-                        return vec![];
+
+                // Spawn the API call to resolve the permission asynchronously (requires client).
+                if let Some(client) = self.opencode_client.clone() {
+                    let async_tx = self.async_tx.clone();
+                    let session_id = request.session_id.clone();
+                    let permission_id = request.id.clone();
+                    let task_id_for_spawn = task_id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = client
+                            .resolve_permission(&session_id, &permission_id, &response)
+                            .await
+                        {
+                            tracing::warn!("Failed to resolve permission {}: {}", permission_id, e);
+                            let _ = async_tx
+                                .send(AppMessage::PermissionAsked {
+                                    task_id: task_id_for_spawn,
+                                    request: crate::opencode::types::PermissionRequest {
+                                        id: permission_id,
+                                        session_id,
+                                        permission: "unknown".to_string(),
+                                        patterns: vec![],
+                                        always: vec![],
+                                    },
+                                })
+                                .await;
+                        }
+                    });
+                } else {
+                    tracing::warn!("Cannot resolve permission: OpenCode client unavailable");
+                }
+
+                // If a rejection explanation was provided, send it to the agent as a steering prompt.
+                if let Some(text) = explanation.filter(|t| !t.trim().is_empty()) {
+                    let active_session = self.workflow_engine.state(&task_id).and_then(|s| {
+                        use crate::workflow::transitions::WorkflowPhase;
+                        if s.phase == WorkflowPhase::Running {
+                            s.session_id.clone()
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(session_id) = active_session {
+                        self.tab2_state
+                            .push_banner(&task_id, format!("[You] {}", text));
+                        return vec![AppMessage::SendPrompt {
+                            task_id,
+                            session_id,
+                            prompt: text,
+                        }];
                     }
-                };
-                let async_tx = self.async_tx.clone();
-                let session_id = request.session_id.clone();
-                let permission_id = request.id.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = client
-                        .resolve_permission(&session_id, &permission_id, &response)
-                        .await
-                    {
-                        tracing::warn!("Failed to resolve permission {}: {}", permission_id, e);
-                        let _ = async_tx
-                            .send(AppMessage::PermissionAsked {
-                                task_id,
-                                request: crate::opencode::types::PermissionRequest {
-                                    id: permission_id,
-                                    session_id,
-                                    permission: "unknown".to_string(),
-                                    patterns: vec![],
-                                    always: vec![],
-                                },
-                            })
-                            .await;
-                    }
-                });
+                }
                 vec![]
             }
 
@@ -1887,20 +1904,36 @@ mod tests {
 
     #[test]
     fn test_handle_session_completed_unparseable_fallback() {
+        use crate::workflow::transitions::WorkflowPhase;
+
         let mut app = App::test_default();
         let task_id = make_task_in_progress(&mut app);
 
-        // Unparseable text should fallback to AgentCompleted.
+        // Unparseable response should keep the workflow in Running and emit only TaskUpdated.
         let msgs = app.handle_message(AppMessage::SessionCompleted {
             task_id: task_id.clone(),
             session_id: "sess-1".to_string(),
             response_text: "I could not produce structured output.".to_string(),
         });
 
-        // Fallback AgentCompleted -> pipeline advances -> CreateSession for Design.
+        // Workflow must NOT advance (no CreateSession for the next agent).
         assert!(
-            msgs.iter().any(|m| matches!(m, AppMessage::CreateSession { agent, .. } if *agent == AgentKind::Design)),
-            "expected CreateSession for Design after fallback, got: {msgs:?}"
+            !msgs
+                .iter()
+                .any(|m| matches!(m, AppMessage::CreateSession { .. })),
+            "parse failure must NOT advance to next agent, got: {msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AppMessage::TaskUpdated { .. })),
+            "expected TaskUpdated after parse failure, got: {msgs:?}"
+        );
+        // Phase must still be Running so the user can steer.
+        let state = app.workflow_engine.state(&task_id).unwrap();
+        assert_eq!(
+            state.phase,
+            WorkflowPhase::Running,
+            "workflow must remain in Running after parse failure"
         );
     }
 
@@ -3365,6 +3398,116 @@ mod tests {
         assert!(
             msgs.iter().any(|m| matches!(m, AppMessage::TaskUpdated { .. })),
             "SessionError with no registered session should still produce TaskUpdated, got: {msgs:?}"
+        );
+    }
+
+    /// Verifies that `PermissionResolved` with a non-empty explanation emits `SendPrompt`.
+    #[test]
+    fn test_reject_with_explanation_emits_send_prompt() {
+        use crate::opencode::types::PermissionRequest;
+
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        // Register the session so the workflow phase is Running with a known session_id.
+        app.handle_message(AppMessage::SessionCreated {
+            task_id: task_id.clone(),
+            session_id: "sess-abc".to_string(),
+        });
+
+        let request = PermissionRequest {
+            id: "perm-1".to_string(),
+            session_id: "sess-abc".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["rm -rf".to_string()],
+            always: vec![],
+        };
+
+        let msgs = app.handle_message(AppMessage::PermissionResolved {
+            task_id: task_id.clone(),
+            request,
+            response: "reject".to_string(),
+            explanation: Some(
+                "No, lets consider something else first. Try a safer approach.".to_string(),
+            ),
+        });
+
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AppMessage::SendPrompt { .. })),
+            "expected SendPrompt when explanation is provided, got: {msgs:?}"
+        );
+    }
+
+    /// Verifies that `PermissionResolved` without explanation does not emit `SendPrompt`.
+    #[test]
+    fn test_reject_without_explanation_no_send_prompt() {
+        use crate::opencode::types::PermissionRequest;
+
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        let request = PermissionRequest {
+            id: "perm-1".to_string(),
+            session_id: "sess-abc".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["rm -rf".to_string()],
+            always: vec![],
+        };
+
+        let msgs = app.handle_message(AppMessage::PermissionResolved {
+            task_id: task_id.clone(),
+            request,
+            response: "reject".to_string(),
+            explanation: None,
+        });
+
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, AppMessage::SendPrompt { .. })),
+            "expected no SendPrompt when explanation is None, got: {msgs:?}"
+        );
+    }
+
+    /// Verifies that `SessionCompleted` with an unparseable response does NOT advance the workflow.
+    ///
+    /// The workflow should stay in `Running` phase and only `TaskUpdated` is emitted, so the
+    /// user can steer the agent via `[p]` without losing the session.
+    #[test]
+    fn test_parse_failure_stays_in_running() {
+        use crate::workflow::transitions::WorkflowPhase;
+
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+        // make_task_in_progress -> StartTask -> phase=Running, session_id=None.
+        // The guard passes (expected_session=None), so the parse happens.
+
+        let msgs = app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-1".to_string(),
+            response_text: "this is not valid json at all".to_string(),
+        });
+
+        // Should emit TaskUpdated but NOT advance to a new agent session.
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AppMessage::TaskUpdated { .. })),
+            "expected TaskUpdated after parse failure, got: {msgs:?}"
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, AppMessage::CreateSession { .. })),
+            "parse failure must NOT advance to next agent, got: {msgs:?}"
+        );
+
+        // The workflow phase must still be Running so the user can steer.
+        let state = app.workflow_engine.state(&task_id).unwrap();
+        assert_eq!(
+            state.phase,
+            WorkflowPhase::Running,
+            "workflow must remain in Running after parse failure"
         );
     }
 }

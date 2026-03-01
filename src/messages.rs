@@ -147,6 +147,11 @@ pub enum AppMessage {
         request: PermissionRequest,
         /// One of "once", "always", or "reject".
         response: String,
+        /// Optional explanation to send to the agent when rejecting.
+        ///
+        /// When present and non-empty (only meaningful for `response == "reject"`),
+        /// the text is sent to the agent as a steering prompt so it can reconsider.
+        explanation: Option<String>,
     },
     /// An OpenCode agent asked a question via the `question.asked` SSE event.
     ///
