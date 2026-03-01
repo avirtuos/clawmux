@@ -1,11 +1,14 @@
 
 
-Code review comments don't work. I press 'R' to reject the code review and add a comment but then while typing if i hit 'a' that causes the review to get approved. 
-Can we change the code review tab to have a text box at the bottom for adding comments? Pressing 'p' should focus that box so I can type in it and press enter to submit
-or esc to exit that box. Actually can we apply the same logic "p" to enter the text box for any tab that has a human input box and enter to submit that box and escape to
-exit focus of that box.
+I just tried using clawdmux on a new task and when the Intake Agent completed, this the last text that appeared at the bottom of the "Agent Activity" tab. there are two issues with this. Firstly, it is showing me the raw JSON output of the Input Agent (see where is starts with {"action": ). That msg should have been processed by clawdmux as the "end" of the Intake Agent and then displayed as markdown. The second issue illustrated here is the very last line of the output, we are truncating it with a "...". We should be showing the entire message there. Can you present me a plan that explains why this is happening and also how we can correct these behaviors to match my expectations.
 
+---begin Agent Activity output---
+The task file is clear, complete, and well-specified. I have reviewed all relevant context including the task file (`tasks/3.1.md`), the system design document (`docs/design.md`), and the requirements document (`docs/requirements.md`). The task is unambiguous and contains all necessary information for downstream agents to proceed.
 
+{"action":"complete","summary":"Reviewed Task 3.1 (Next.js project scaffolding) — the task has a clear description covering Next.js 14+/App Router/TypeScript/Tailwind/shadcn/ui initialization, all required dependencies listed with version constraints, all config files enumerated, all .env.example keys specified, the root layout and shadcn/ui component list defined, a build/dev verification requirement, and six explicit acceptance test names; the design.md provides full project structure and architectural context needed by downstream agents. 
+
+Intake Agent completed: Reviewed Task 3.1 (Next.js project scaffolding) — the task has a clear descripti...
+---end Agent Activity output---
 
 
 

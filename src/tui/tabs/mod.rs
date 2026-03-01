@@ -109,7 +109,13 @@ pub fn render(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
         }
         6 => {
             let task_id = app.selected_task();
-            review::render(frame, content_area, task_id, &app.review_state);
+            review::render(
+                frame,
+                content_area,
+                task_id,
+                &app.review_state,
+                &app.tab4_state,
+            );
         }
         7 => {
             let task_id = app.selected_task();
