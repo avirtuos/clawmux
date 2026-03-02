@@ -421,11 +421,12 @@ fn render_permission_dialog(
     rejection_response: &tui_textarea::TextArea<'_>,
     permission_scroll: u16,
 ) {
-    // Fixed layout: 2 borders + 1 type + 4 pattern viewport + 1 spacer + 1 hint = 9 rows.
+    // Fixed layout: 2 borders + 1 type + 4 pattern viewport + 1 spacer + 2 hint = 10 rows.
+    // Hint is 2 rows to accommodate the wrapped key-binding text.
     // Rejection mode adds 4 rows for the guidance textarea.
     let dialog_width = 60u16;
     let extra_rows = if rejection_focused { 4u16 } else { 0u16 };
-    let dialog_height = 9u16 + extra_rows;
+    let dialog_height = 10u16 + extra_rows;
     let x = area.x + area.width.saturating_sub(dialog_width) / 2;
     let y = area.y + area.height.saturating_sub(dialog_height) / 2;
     let dialog_area = Rect::new(
@@ -475,14 +476,14 @@ fn render_permission_dialog(
             hint_area,
         );
     } else {
-        // Layout: type(1) | patterns(4) | spacer(1) | hint(1)
+        // Layout: type(1) | patterns(4) | spacer(1) | hint(2)
         let [type_area, patterns_area, _spacer, hint_area] = ratatui::layout::Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
                 Constraint::Length(4),
                 Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(2),
             ])
             .areas(inner);
         frame.render_widget(Paragraph::new(type_line), type_area);
@@ -495,7 +496,8 @@ fn render_permission_dialog(
         frame.render_widget(
             Paragraph::new(Line::from(
                 "[y] approve once | [a] always allow | [n] reject | [r] reject with response | [Up/Down] scroll",
-            )),
+            ))
+            .wrap(Wrap { trim: false }),
             hint_area,
         );
     }
@@ -724,7 +726,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                             let explanation = if text.trim().is_empty() {
                                 None
                             } else {
-                                Some(format!("No, lets consider something else first. {}", text))
+                                Some(format!("No, let's consider something else first. {}", text))
                             };
                             return Some(AppMessage::PermissionResolved {
                                 task_id,
@@ -754,8 +756,24 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     return None;
                 }
                 KeyCode::Down if key.modifiers == KeyModifiers::NONE => {
-                    app.tab2_state.permission_scroll =
-                        app.tab2_state.permission_scroll.saturating_add(1);
+                    let max_scroll = if let Some((_, req)) = &app.tab2_state.pending_permission {
+                        let lines: Vec<Line> = req
+                            .patterns
+                            .iter()
+                            .map(|p| Line::from(format!("  cmd: {}", p)))
+                            .collect();
+                        let total = Paragraph::new(lines)
+                            .wrap(Wrap { trim: false })
+                            .line_count(58); // dialog inner width (60 - 2 borders)
+                        u16::try_from(total.saturating_sub(4)).unwrap_or(u16::MAX)
+                    } else {
+                        0
+                    };
+                    app.tab2_state.permission_scroll = app
+                        .tab2_state
+                        .permission_scroll
+                        .saturating_add(1)
+                        .min(max_scroll);
                     return None;
                 }
                 _ => {}
@@ -787,6 +805,8 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     });
                 }
             }
+            // Consume all other keys while permission dialog is active.
+            return None;
         }
 
         // Tab 0 (Details): textarea focus and task actions.
@@ -3266,18 +3286,18 @@ mod tests {
         );
     }
 
-    /// A non-permission key (Tab) passes through and changes the active tab even when
-    /// a permission dialog is pending.
+    /// While a permission dialog is pending, non-permission keys are consumed and
+    /// do NOT pass through to tab-level handlers (fixes key-leak bug).
     #[test]
-    fn test_permission_popup_non_permission_key_passes_through() {
+    fn test_permission_popup_non_permission_key_blocked() {
         let mut app = app_with_pending_permission();
         let initial_tab = app.active_tab;
 
         handle_input(key_event(KeyCode::Tab, KeyModifiers::NONE), &mut app);
 
-        assert_ne!(
+        assert_eq!(
             app.active_tab, initial_tab,
-            "Tab key should cycle active_tab even when permission is pending"
+            "Tab key should be consumed by permission dialog and must not cycle active_tab"
         );
     }
 
@@ -3349,7 +3369,7 @@ mod tests {
                     explanation: Some(ref expl),
                     ..
                 }) if response == "reject"
-                    && expl.starts_with("No, lets consider something else first.")
+                    && expl.starts_with("No, let's consider something else first.")
                     && expl.contains("try a different approach")
             ),
             "expected PermissionResolved with reject + explanation, got: {result:?}"
@@ -3362,10 +3382,24 @@ mod tests {
     }
 
     /// Up/Down arrows while a permission dialog is pending adjust `permission_scroll`
-    /// and do NOT bubble up to the activity buffer scroll.
+    /// and do NOT bubble up to the activity buffer scroll. Down is bounded by the
+    /// wrapped line count of the pattern list (max_scroll = total_lines - 4 visible).
     #[test]
     fn test_up_down_adjust_permission_scroll() {
+        use crate::opencode::types::PermissionRequest;
         let mut app = app_with_pending_permission();
+
+        // Replace the single-pattern fixture with 6 patterns so the pattern area
+        // (4 visible rows) needs scrolling: max_scroll = 6 - 4 = 2.
+        let task_id = crate::tasks::TaskId::from_path("tasks/1.1.md");
+        let request = PermissionRequest {
+            id: "perm-scroll".to_string(),
+            session_id: "sess-1".to_string(),
+            permission: "bash".to_string(),
+            patterns: (1..=6).map(|i| format!("cmd-{}", i)).collect(),
+            always: vec![],
+        };
+        app.tab2_state.push_permission(task_id, request);
         assert_eq!(app.tab2_state.permission_scroll, 0);
 
         // Down increases scroll.
@@ -3375,6 +3409,13 @@ mod tests {
 
         handle_input(key_event(KeyCode::Down, KeyModifiers::NONE), &mut app);
         assert_eq!(app.tab2_state.permission_scroll, 2);
+
+        // Down clamps at max_scroll (2).
+        handle_input(key_event(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        assert_eq!(
+            app.tab2_state.permission_scroll, 2,
+            "Down should clamp at max_scroll"
+        );
 
         // Up decreases scroll.
         let result = handle_input(key_event(KeyCode::Up, KeyModifiers::NONE), &mut app);

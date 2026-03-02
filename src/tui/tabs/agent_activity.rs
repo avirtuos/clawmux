@@ -19,6 +19,9 @@ use crate::opencode::types::{DiffLineKind, DiffStatus, FileDiff, MessagePart, Pe
 use crate::tasks::TaskId;
 use crate::tui::markdown::markdown_to_lines;
 
+/// Title text used on the rejection response textarea.
+const REJECTION_PROMPT: &str = "What should the agent do instead?";
+
 /// Maximum number of buffer entries per task before old entries are trimmed.
 const MAX_BUFFER_ENTRIES: usize = 500;
 /// Maximum number of hunk lines shown in an inline diff preview.
@@ -168,7 +171,7 @@ impl Tab2State {
         let mut rejection_response = TextArea::default();
         rejection_response.set_block(
             Block::default()
-                .title("What should the agent do instead?")
+                .title(REJECTION_PROMPT)
                 .borders(Borders::ALL),
         );
         Tab2State {
@@ -686,7 +689,7 @@ impl Tab2State {
     pub fn focus_rejection_response(&mut self) {
         self.rejection_response.set_block(
             Block::default()
-                .title("What should the agent do instead?")
+                .title(REJECTION_PROMPT)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         );
@@ -698,7 +701,7 @@ impl Tab2State {
         let mut ta = TextArea::default();
         ta.set_block(
             Block::default()
-                .title("What should the agent do instead?")
+                .title(REJECTION_PROMPT)
                 .borders(Borders::ALL),
         );
         self.rejection_response = ta;

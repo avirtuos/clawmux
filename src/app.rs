@@ -855,6 +855,39 @@ impl App {
                                 agent.display_name()
                             ),
                         );
+                        // Clear the stale session_id so a fresh SessionCreated can register
+                        // the replacement session (prevents [p] from targeting a dead session).
+                        self.workflow_engine.reset_session_id(&task_id);
+                        if let Some(client) = self.opencode_client.clone() {
+                            let async_tx = self.async_tx.clone();
+                            let session_map = self.session_map.clone();
+                            let task_id_clone = task_id.clone();
+                            tokio::spawn(async move {
+                                match client.create_session().await {
+                                    Ok(new_session) => {
+                                        {
+                                            let mut map = session_map.write().await;
+                                            map.insert(
+                                                new_session.id.clone(),
+                                                (task_id_clone.clone(), agent),
+                                            );
+                                        }
+                                        let _ = async_tx
+                                            .send(AppMessage::SessionCreated {
+                                                task_id: task_id_clone,
+                                                session_id: new_session.id,
+                                            })
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to create replacement session after parse failure: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            });
+                        }
                         vec![AppMessage::TaskUpdated { task_id }]
                     }
                 }
@@ -1116,6 +1149,36 @@ impl App {
                     format!("[Permission] {} {}", request.permission, decision),
                 );
 
+                // Compute the steering prompt message before spawning so it is sent
+                // only after resolve_permission completes (avoids a race where the
+                // agent receives guidance before the permission is acknowledged).
+                let send_prompt_msg = if response == "reject" {
+                    if let Some(text) = explanation.filter(|t| !t.trim().is_empty()) {
+                        let active_session = self.workflow_engine.state(&task_id).and_then(|s| {
+                            if s.phase == WorkflowPhase::Running {
+                                s.session_id.clone()
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(sess_id) = active_session {
+                            self.tab2_state
+                                .push_banner(&task_id, format!("[You] {}", text));
+                            Some(AppMessage::SendPrompt {
+                                task_id: task_id.clone(),
+                                session_id: sess_id,
+                                prompt: text,
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 // Spawn the API call to resolve the permission asynchronously (requires client).
                 if let Some(client) = self.opencode_client.clone() {
                     let async_tx = self.async_tx.clone();
@@ -1140,30 +1203,18 @@ impl App {
                                     },
                                 })
                                 .await;
+                            return;
+                        }
+                        // Send the steering prompt after successful permission resolution.
+                        if let Some(msg) = send_prompt_msg {
+                            let _ = async_tx.send(msg).await;
                         }
                     });
                 } else {
                     tracing::warn!("Cannot resolve permission: OpenCode client unavailable");
-                }
-
-                // If a rejection explanation was provided, send it to the agent as a steering prompt.
-                if let Some(text) = explanation.filter(|t| !t.trim().is_empty()) {
-                    let active_session = self.workflow_engine.state(&task_id).and_then(|s| {
-                        use crate::workflow::transitions::WorkflowPhase;
-                        if s.phase == WorkflowPhase::Running {
-                            s.session_id.clone()
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(session_id) = active_session {
-                        self.tab2_state
-                            .push_banner(&task_id, format!("[You] {}", text));
-                        return vec![AppMessage::SendPrompt {
-                            task_id,
-                            session_id,
-                            prompt: text,
-                        }];
+                    // No client (test/dev mode): dispatch synchronously.
+                    if let Some(msg) = send_prompt_msg {
+                        return vec![msg];
                     }
                 }
                 vec![]
@@ -3446,6 +3497,14 @@ mod tests {
 
         let mut app = App::test_default();
         let task_id = make_task_in_progress(&mut app);
+
+        // Register the session so the workflow phase is Running with a known session_id.
+        // This ensures the test is non-vacuous: the handler *could* emit SendPrompt,
+        // but should not because explanation is None.
+        app.handle_message(AppMessage::SessionCreated {
+            task_id: task_id.clone(),
+            session_id: "sess-abc".to_string(),
+        });
 
         let request = PermissionRequest {
             id: "perm-1".to_string(),

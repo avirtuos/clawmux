@@ -89,6 +89,17 @@ impl WorkflowEngine {
         self.approval_gate_enabled = enabled;
     }
 
+    /// Clears the active session ID for a task without changing its phase or agent.
+    ///
+    /// Used after a parse failure to allow a fresh `SessionCreated` event to
+    /// register the replacement session without being silently dropped by the
+    /// duplicate-session guard in `App::handle_message`.
+    pub fn reset_session_id(&mut self, task_id: &TaskId) {
+        if let Some(state) = self.states.get_mut(task_id) {
+            state.session_id = None;
+        }
+    }
+
     /// Returns a reference to the workflow state for the given task, if any.
     pub fn state(&self, task_id: &TaskId) -> Option<&WorkflowState> {
         self.states.get(task_id)
