@@ -11,9 +11,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use tui_textarea::Input;
 
-use crate::app::App;
+use crate::app::{App, CommitDialogState};
 use crate::messages::AppMessage;
-use crate::opencode::types::PermissionRequest;
+use crate::opencode::types::{DiffStatus, PermissionRequest};
 use crate::tasks::models::{status_to_index, Task, TaskStatus, ALL_STATUSES};
 use crate::tasks::TaskId;
 use crate::workflow::agents::AgentKind;
@@ -346,6 +346,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         render_quit_confirm_dialog(frame, frame.area());
     }
 
+    if let Some(ref dialog) = app.commit_dialog {
+        render_commit_dialog(frame, frame.area(), dialog);
+    }
+
     if let Some((ref _tid, ref request)) = app.tab2_state.pending_permission {
         render_permission_dialog(
             frame,
@@ -403,6 +407,73 @@ fn render_quit_confirm_dialog(frame: &mut Frame, area: Rect) {
         .block(block)
         .alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(paragraph, dialog_area);
+}
+
+/// Renders a centered modal commit confirmation dialog over the given area.
+///
+/// Shows the list of changed files (capped at 10 visible rows) and an editable
+/// textarea pre-filled with the proposed commit message.
+/// `[Enter]` confirms; `[Esc]` cancels.
+fn render_commit_dialog(frame: &mut Frame, area: Rect, dialog: &CommitDialogState) {
+    let dialog_width = 70u16;
+    // Layout: 2 borders + file list (capped at 10) + 1 spacer + 6 editor rows + 1 hint = varies.
+    let file_rows = (dialog.file_summary.len() as u16).min(10);
+    let dialog_height = 2 + file_rows + 1 + 6 + 1;
+
+    let x = area.x + area.width.saturating_sub(dialog_width) / 2;
+    let y = area.y + area.height.saturating_sub(dialog_height) / 2;
+    let dialog_area = Rect::new(
+        x,
+        y,
+        dialog_width.min(area.width),
+        dialog_height.min(area.height),
+    );
+
+    frame.render_widget(Clear, dialog_area);
+    let block = Block::default()
+        .title(" Commit Changes ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    let [files_area, _spacer, editor_area, hint_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(file_rows),
+            Constraint::Length(1),
+            Constraint::Length(6),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+
+    // Render file list with status prefix and color.
+    let file_lines: Vec<Line> = dialog
+        .file_summary
+        .iter()
+        .take(10)
+        .map(|(path, status)| {
+            let (prefix, color) = match status {
+                DiffStatus::Added => ("[A]", Color::Green),
+                DiffStatus::Modified => ("[M]", Color::Yellow),
+                DiffStatus::Deleted => ("[D]", Color::Red),
+            };
+            Line::from(vec![
+                ratatui::text::Span::styled(format!("{} ", prefix), Style::default().fg(color)),
+                ratatui::text::Span::raw(path.clone()),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(file_lines), files_area);
+
+    // Render editable commit message textarea.
+    frame.render_widget(&dialog.editor, editor_area);
+
+    // Render hint line.
+    frame.render_widget(
+        Paragraph::new(Line::from("[Enter] commit | [Esc] cancel")),
+        hint_area,
+    );
 }
 
 /// Renders a centered modal permission request dialog over the given area.
@@ -672,6 +743,35 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     return None;
                 }
                 _ => return None,
+            }
+        }
+
+        // When the commit dialog is open, intercept all input.
+        if app.commit_dialog.is_some() {
+            match key.code {
+                KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
+                    let dialog = app.commit_dialog.take().unwrap();
+                    let message = dialog.editor.lines().join("\n");
+                    if !message.trim().is_empty() {
+                        return Some(AppMessage::HumanApprovedCommit {
+                            task_id: dialog.task_id,
+                            commit_message: message,
+                        });
+                    }
+                    return None;
+                }
+                KeyCode::Esc => {
+                    app.commit_dialog = None;
+                    return None;
+                }
+                _ => {
+                    app.commit_dialog
+                        .as_mut()
+                        .unwrap()
+                        .editor
+                        .input(Input::from(key));
+                    return None;
+                }
             }
         }
 
@@ -1090,7 +1190,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                 }
                 KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
                     if let Some(task_id) = app.selected_task().cloned() {
-                        return Some(AppMessage::HumanApprovedReview { task_id });
+                        app.open_commit_dialog(&task_id);
                     }
                     return None;
                 }
@@ -1207,7 +1307,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     }
                     KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
                         if let Some(task_id) = app.selected_task().cloned() {
-                            return Some(AppMessage::HumanApprovedReview { task_id });
+                            app.open_commit_dialog(&task_id);
                         }
                         return None;
                     }
@@ -1241,7 +1341,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                 }
                 KeyCode::Char('a') if key.modifiers == KeyModifiers::NONE => {
                     if let Some(task_id) = app.selected_task().cloned() {
-                        return Some(AppMessage::HumanApprovedReview { task_id });
+                        app.open_commit_dialog(&task_id);
                     }
                     return None;
                 }
@@ -1836,8 +1936,12 @@ mod tests {
 
         let result = handle_input(key_event(KeyCode::Char('a'), KeyModifiers::NONE), &mut app);
         assert!(
-            matches!(result, Some(AppMessage::HumanApprovedReview { .. })),
-            "pressing 'a' on Tab 6 should emit HumanApprovedReview; got: {result:?}"
+            result.is_none(),
+            "pressing 'a' on Tab 6 should return None (opens commit dialog)"
+        );
+        assert!(
+            app.commit_dialog.is_some(),
+            "pressing 'a' on Tab 6 should open the commit dialog"
         );
     }
 
@@ -3454,5 +3558,120 @@ mod tests {
             app.tab2_state.permission_scroll, 0,
             "push_permission should reset scroll to 0"
         );
+    }
+
+    /// Helper to create a task and set up task list selection.
+    fn setup_task_selected(app: &mut App, task_id: crate::tasks::TaskId) {
+        use crate::tasks::models::{Task, TaskStatus};
+        let task = Task {
+            id: task_id.clone(),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::PendingReview,
+            assigned_to: None,
+            description: String::new(),
+            starting_prompt: None,
+            questions: vec![],
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        app.task_store.insert(task);
+        app.refresh_stories();
+        app.task_list_state
+            .expanded_stories
+            .insert("1. Story".to_string());
+        app.task_list_state.refresh(&app.cached_stories);
+        // Story header is at index 0, task at index 1.
+        app.task_list_state.selected_index = 1;
+    }
+
+    /// Verifies that pressing `[a]` on Tab 6 opens the commit dialog instead of emitting
+    /// `HumanApprovedReview`.
+    #[test]
+    fn test_a_key_opens_commit_dialog_on_review_tab() {
+        let mut app = App::test_default();
+        let task_id = crate::tasks::TaskId::from_path("tasks/1.1.md");
+        setup_task_selected(&mut app, task_id.clone());
+        app.active_tab = 6;
+
+        let result = handle_input(key_event(KeyCode::Char('a'), KeyModifiers::NONE), &mut app);
+
+        assert!(
+            result.is_none(),
+            "pressing 'a' should return None (not HumanApprovedReview)"
+        );
+        assert!(
+            app.commit_dialog.is_some(),
+            "commit_dialog should be open after pressing 'a' on Tab 6"
+        );
+        assert_eq!(
+            app.commit_dialog.as_ref().unwrap().task_id,
+            task_id,
+            "commit_dialog should have the selected task_id"
+        );
+    }
+
+    /// Verifies that pressing `[Enter]` in the commit dialog emits `HumanApprovedCommit`.
+    #[test]
+    fn test_commit_dialog_enter_emits_approved_commit() {
+        let mut app = App::test_default();
+        let task_id = crate::tasks::TaskId::from_path("tasks/1.1.md");
+        app.open_commit_dialog(&task_id);
+
+        // Type some text into the editor.
+        app.commit_dialog
+            .as_mut()
+            .unwrap()
+            .editor
+            .insert_str("feat: my commit");
+
+        let result = handle_input(key_event(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+
+        assert!(
+            matches!(result, Some(AppMessage::HumanApprovedCommit { ref commit_message, .. }) if commit_message.contains("feat: my commit")),
+            "Enter in commit dialog should emit HumanApprovedCommit, got: {result:?}"
+        );
+        assert!(
+            app.commit_dialog.is_none(),
+            "commit_dialog should be closed after Enter"
+        );
+    }
+
+    /// Verifies that pressing `[Esc]` in the commit dialog closes it without emitting a message.
+    #[test]
+    fn test_commit_dialog_esc_cancels() {
+        let mut app = App::test_default();
+        let task_id = crate::tasks::TaskId::from_path("tasks/1.1.md");
+        app.open_commit_dialog(&task_id);
+        assert!(
+            app.commit_dialog.is_some(),
+            "dialog should be open before Esc"
+        );
+
+        let result = handle_input(key_event(KeyCode::Esc, KeyModifiers::NONE), &mut app);
+
+        assert!(result.is_none(), "Esc should return None");
+        assert!(
+            app.commit_dialog.is_none(),
+            "dialog should be closed after Esc"
+        );
+    }
+
+    /// Verifies that arbitrary keys in the commit dialog are consumed (go to editor, not tab handlers).
+    #[test]
+    fn test_commit_dialog_keys_consumed() {
+        let mut app = App::test_default();
+        let task_id = crate::tasks::TaskId::from_path("tasks/1.1.md");
+        app.open_commit_dialog(&task_id);
+
+        // 'q' should NOT quit -- it goes to the editor.
+        let result = handle_input(key_event(KeyCode::Char('q'), KeyModifiers::NONE), &mut app);
+        assert!(result.is_none(), "'q' in commit dialog should not quit");
+        assert!(app.commit_dialog.is_some(), "dialog should still be open");
+        assert!(!app.should_quit, "app should not quit");
     }
 }

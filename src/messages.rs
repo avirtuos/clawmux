@@ -61,6 +61,17 @@ pub enum AppMessage {
     },
     /// Signals that the human has approved the final code review.
     HumanApprovedReview { task_id: TaskId },
+    /// Human approved the commit message; triggers agent-mediated git commit.
+    HumanApprovedCommit {
+        task_id: TaskId,
+        commit_message: String,
+    },
+    /// Agent successfully committed changes; task should transition to Completed.
+    CommitCompleted { task_id: TaskId },
+    /// Agent commit failed; task stays in PendingReview for retry.
+    CommitFailed { task_id: TaskId, error: String },
+    /// Internal: registers a commit session_id so SessionCompleted can route it correctly.
+    RegisterCommitSession { task_id: TaskId, session_id: String },
     /// Carries revision comments from the human reviewer.
     HumanRequestedRevisions {
         task_id: TaskId,

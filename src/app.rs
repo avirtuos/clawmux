@@ -3,6 +3,7 @@
 //! The `App` struct holds all runtime state and coordinates between subsystems:
 //! the TUI layer, workflow engine, task store, and opencode client.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::messages::AppMessage;
 use crate::opencode::events::SessionMap;
+use crate::opencode::types::DiffStatus;
 use crate::opencode::OpenCodeClient;
 use crate::tasks::models::{status_to_index, Question, SuggestedFix, TaskStatus, WorkLogEntry};
 use crate::tasks::{Story, TaskId, TaskStore};
@@ -26,6 +28,20 @@ use crate::workflow::agents::AgentKind;
 use crate::workflow::prompt_composer::compose_user_message;
 use crate::workflow::response_parser::{parse_response, AgentResponse};
 use crate::workflow::transitions::{WorkflowEngine, WorkflowPhase};
+
+/// State for the commit confirmation dialog.
+///
+/// Shown when the human presses `[a]` on a task in `PendingReview`.  The
+/// `editor` textarea is pre-filled with the CodeReview agent's proposed commit
+/// message (or a default) and can be edited before confirmation.
+pub struct CommitDialogState {
+    /// The task being committed.
+    pub task_id: TaskId,
+    /// Editable commit message textarea.
+    pub editor: tui_textarea::TextArea<'static>,
+    /// Changed files from the latest diff snapshot: `(path, status)`.
+    pub file_summary: Vec<(String, DiffStatus)>,
+}
 
 /// Top-level application state.
 ///
@@ -75,6 +91,13 @@ pub struct App {
     pub pending_messages: Vec<AppMessage>,
     /// Timestamp of the last `GET /session/status` poll to throttle requests.
     pub last_status_poll: Instant,
+    /// When `Some`, the commit confirmation dialog is open.
+    pub commit_dialog: Option<CommitDialogState>,
+    /// Maps session_id to task_id for in-flight commit sessions.
+    ///
+    /// When a `SessionCompleted` arrives for a session_id found here, it is
+    /// routed to `CommitCompleted` instead of the normal agent pipeline.
+    pub pending_commit_sessions: HashMap<String, TaskId>,
 }
 
 impl App {
@@ -119,6 +142,8 @@ impl App {
             async_tx,
             pending_messages: Vec::new(),
             last_status_poll: Instant::now(),
+            commit_dialog: None,
+            pending_commit_sessions: HashMap::new(),
         }
     }
 
@@ -152,6 +177,39 @@ impl App {
         self.show_status_picker = None;
     }
 
+    /// Opens the commit confirmation dialog for the given task.
+    ///
+    /// Pre-fills the editor textarea with the commit message stored by the
+    /// CodeReview agent, falling back to `"Complete task <name>"` if none is
+    /// available. Populates `file_summary` from the current diff snapshot.
+    pub fn open_commit_dialog(&mut self, task_id: &TaskId) {
+        let commit_msg = self
+            .tab4_state
+            .get_commit_message(task_id)
+            .map(str::to_owned)
+            .or_else(|| {
+                self.task_store
+                    .get(task_id)
+                    .map(|t| format!("Complete task {}", t.name))
+            })
+            .unwrap_or_else(|| format!("Complete task {}", task_id));
+
+        let file_summary: Vec<(String, DiffStatus)> = self
+            .tab4_state
+            .diffs_for(task_id)
+            .iter()
+            .map(|d| (d.path.clone(), d.status.clone()))
+            .collect();
+
+        let mut editor = tui_textarea::TextArea::default();
+        editor.insert_str(&commit_msg);
+        self.commit_dialog = Some(CommitDialogState {
+            task_id: task_id.clone(),
+            editor,
+            file_summary,
+        });
+    }
+
     /// Returns the [`TaskId`] of the currently selected task, or `None` if on a story.
     ///
     /// Derived from [`TaskListState::selected_task_id`].
@@ -166,7 +224,6 @@ impl App {
     /// do not need to repeat the boilerplate.
     #[cfg(test)]
     pub fn test_default() -> Self {
-        use std::collections::HashMap;
         use std::sync::Arc;
         use tokio::sync::RwLock;
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
@@ -473,6 +530,14 @@ impl App {
                 session_id,
                 error,
             } => {
+                // Route commit session errors before the normal pipeline.
+                if let Some(commit_task_id) = self.pending_commit_sessions.remove(&session_id) {
+                    return vec![AppMessage::CommitFailed {
+                        task_id: commit_task_id,
+                        error,
+                    }];
+                }
+
                 // Guard: ignore errors from child sessions.  When the engine
                 // has a registered primary session_id, only that session's
                 // errors should advance the pipeline.  A None expected_session
@@ -643,6 +708,107 @@ impl App {
                 msgs
             }
 
+            AppMessage::HumanApprovedCommit {
+                task_id,
+                commit_message,
+            } => {
+                let first_line = commit_message.lines().next().unwrap_or("").to_string();
+                self.tab2_state
+                    .push_banner(&task_id, format!("[Commit] Committing: {}", first_line));
+
+                let client = match self.opencode_client.clone() {
+                    Some(c) => c,
+                    None => {
+                        return vec![AppMessage::CommitFailed {
+                            task_id,
+                            error: "OpenCode client unavailable".to_string(),
+                        }];
+                    }
+                };
+
+                let async_tx = self.async_tx.clone();
+                let session_map = self.session_map.clone();
+                let task_id_clone = task_id.clone();
+                tokio::spawn(async move {
+                    let session = match client.create_session().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = async_tx
+                                .send(AppMessage::CommitFailed {
+                                    task_id: task_id_clone,
+                                    error: format!("Failed to create commit session: {}", e),
+                                })
+                                .await;
+                            return;
+                        }
+                    };
+                    // Register in session_map so EventStreamConsumer routes SSE events.
+                    {
+                        let mut map = session_map.write().await;
+                        map.insert(
+                            session.id.clone(),
+                            (task_id_clone.clone(), AgentKind::Human),
+                        );
+                    }
+                    // Register in pending_commit_sessions via message so the main loop
+                    // routes SessionCompleted to CommitCompleted.
+                    let _ = async_tx
+                        .send(AppMessage::RegisterCommitSession {
+                            task_id: task_id_clone.clone(),
+                            session_id: session.id.clone(),
+                        })
+                        .await;
+
+                    // Build the commit prompt. Using single quotes around the message
+                    // ensures the agent passes it verbatim to git.
+                    let escaped = commit_message.replace('\'', "'\\''");
+                    let prompt = format!(
+                        "Run the following git commands exactly: git add -A && git commit -m '{}'. Report only whether the commit succeeded or failed.",
+                        escaped
+                    );
+                    if let Err(e) = client.send_prompt_async(&session.id, None, &prompt).await {
+                        let _ = async_tx
+                            .send(AppMessage::CommitFailed {
+                                task_id: task_id_clone,
+                                error: format!("Failed to send commit prompt: {}", e),
+                            })
+                            .await;
+                    }
+                });
+                vec![]
+            }
+
+            AppMessage::RegisterCommitSession {
+                task_id,
+                session_id,
+            } => {
+                self.pending_commit_sessions.insert(session_id, task_id);
+                vec![]
+            }
+
+            AppMessage::CommitCompleted { task_id } => {
+                self.review_state
+                    .push_banner(&task_id, "Review approved".to_string());
+                let mut msgs = self
+                    .workflow_engine
+                    .process(AppMessage::HumanApprovedReview {
+                        task_id: task_id.clone(),
+                    });
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    task.set_status(TaskStatus::Completed, AgentKind::Human);
+                    task.assign_to(Some(AgentKind::Human), AgentKind::Human);
+                }
+                msgs.push(AppMessage::TaskUpdated { task_id });
+                msgs
+            }
+
+            AppMessage::CommitFailed { task_id, error } => {
+                self.tab2_state
+                    .push_banner(&task_id, format!("[Commit] Commit failed: {}", error));
+                tracing::warn!("Commit failed for task {}: {}", task_id, error);
+                vec![]
+            }
+
             AppMessage::HumanApprovedTransition { task_id } => {
                 self.tab2_state
                     .push_banner(&task_id, "Transition approved by human".to_string());
@@ -684,6 +850,17 @@ impl App {
                 session_id,
                 response_text,
             } => {
+                // Route commit sessions before the normal pipeline.
+                if let Some(commit_task_id) = self.pending_commit_sessions.remove(&session_id) {
+                    self.tab2_state.push_banner(
+                        &commit_task_id,
+                        "[Commit] Changes committed successfully".to_string(),
+                    );
+                    return vec![AppMessage::CommitCompleted {
+                        task_id: commit_task_id,
+                    }];
+                }
+
                 // Guard: ignore completions from child sessions.  When the engine
                 // has a registered primary session_id, only that session's
                 // completion should advance the pipeline.  A None expected_session
@@ -732,7 +909,7 @@ impl App {
                     Ok(AgentResponse::Complete {
                         summary,
                         updates,
-                        commit_message: _,
+                        commit_message,
                     }) => {
                         if let Some(task) = self.task_store.get_mut(&task_id) {
                             if let Some(upd) = updates {
@@ -752,6 +929,12 @@ impl App {
                             });
                         }
                         let agent = current_agent.unwrap_or(AgentKind::Intake);
+                        // Store the commit message when CodeReview agent completes.
+                        if agent == AgentKind::CodeReview {
+                            if let Some(msg) = commit_message {
+                                self.tab4_state.set_commit_message(&task_id, msg);
+                            }
+                        }
                         self.tab2_state.push_banner(
                             &task_id,
                             format!("{} completed: {}", agent.display_name(), summary),
@@ -3567,6 +3750,197 @@ mod tests {
             state.phase,
             WorkflowPhase::Running,
             "workflow must remain in Running after parse failure"
+        );
+    }
+
+    /// Verifies that a CodeReview SessionCompleted with a commit_message stores it in Tab4State.
+    #[test]
+    fn test_commit_message_stored_from_code_review() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        // Advance pipeline through all agents before CodeReview.
+        for agent in [
+            AgentKind::Intake,
+            AgentKind::Design,
+            AgentKind::Planning,
+            AgentKind::Implementation,
+            AgentKind::CodeQuality,
+            AgentKind::SecurityReview,
+        ] {
+            app.workflow_engine.process(AppMessage::AgentCompleted {
+                task_id: task_id.clone(),
+                agent,
+                summary: "done".to_string(),
+            });
+        }
+
+        let response_json =
+            r#"{"action":"complete","summary":"LGTM","commit_message":"feat: add commit dialog"}"#;
+        app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "sess-cr".to_string(),
+            response_text: response_json.to_string(),
+        });
+
+        assert_eq!(
+            app.tab4_state.get_commit_message(&task_id),
+            Some("feat: add commit dialog"),
+            "commit_message from CodeReview should be stored in Tab4State"
+        );
+    }
+
+    /// Verifies that `CommitCompleted` transitions the task to Completed.
+    #[test]
+    fn test_commit_completed_sets_task_completed() {
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::PendingReview,
+            assigned_to: Some(AgentKind::Human),
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+
+        let msgs = app.handle_message(AppMessage::CommitCompleted {
+            task_id: task_id.clone(),
+        });
+
+        let task = app.task_store.get(&task_id).unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::Completed,
+            "status should be Completed after CommitCompleted"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AppMessage::TaskUpdated { .. })),
+            "CommitCompleted should emit TaskUpdated"
+        );
+    }
+
+    /// Verifies that `CommitFailed` pushes an error banner and leaves the task in PendingReview.
+    #[test]
+    fn test_commit_failed_keeps_pending_review() {
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::PendingReview,
+            assigned_to: Some(AgentKind::Human),
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+
+        let msgs = app.handle_message(AppMessage::CommitFailed {
+            task_id: task_id.clone(),
+            error: "git error".to_string(),
+        });
+
+        // Task should remain PendingReview.
+        let task = app.task_store.get(&task_id).unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::PendingReview,
+            "task should remain PendingReview after CommitFailed"
+        );
+        // No messages emitted.
+        assert!(
+            msgs.is_empty(),
+            "CommitFailed should emit no messages, got: {msgs:?}"
+        );
+    }
+
+    /// Verifies that `SessionCompleted` for a session in `pending_commit_sessions` is routed
+    /// to `CommitCompleted` instead of going through `parse_response`.
+    #[test]
+    fn test_commit_session_routed_via_pending_commit_sessions() {
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::PendingReview,
+            assigned_to: Some(AgentKind::Human),
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+
+        // Register a commit session.
+        app.pending_commit_sessions
+            .insert("commit-sess-1".to_string(), task_id.clone());
+
+        // SessionCompleted for the commit session should route to CommitCompleted.
+        let msgs = app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "commit-sess-1".to_string(),
+            response_text: "Committed successfully".to_string(),
+        });
+
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AppMessage::CommitCompleted { .. })),
+            "SessionCompleted for commit session should emit CommitCompleted, got: {msgs:?}"
+        );
+        // Session should be removed from pending_commit_sessions.
+        assert!(
+            !app.pending_commit_sessions.contains_key("commit-sess-1"),
+            "commit session should be removed from pending_commit_sessions after routing"
+        );
+    }
+
+    /// Verifies that `RegisterCommitSession` inserts the session into `pending_commit_sessions`.
+    #[test]
+    fn test_register_commit_session() {
+        let mut app = App::test_default();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+
+        let msgs = app.handle_message(AppMessage::RegisterCommitSession {
+            task_id: task_id.clone(),
+            session_id: "commit-sess-42".to_string(),
+        });
+
+        assert!(msgs.is_empty(), "RegisterCommitSession emits no messages");
+        assert_eq!(
+            app.pending_commit_sessions.get("commit-sess-42"),
+            Some(&task_id),
+            "session should be registered in pending_commit_sessions"
         );
     }
 }

@@ -184,6 +184,8 @@ pub struct Tab4State {
     pub review_comment_focused: bool,
     /// Accumulated general review comments submitted by the user.
     general_comments: Vec<String>,
+    /// Commit messages produced by the CodeReview agent, keyed by task ID.
+    commit_messages: HashMap<TaskId, String>,
 }
 
 impl Tab4State {
@@ -210,6 +212,7 @@ impl Tab4State {
             review_comment,
             review_comment_focused: false,
             general_comments: Vec::new(),
+            commit_messages: HashMap::new(),
         }
     }
 
@@ -221,6 +224,16 @@ impl Tab4State {
     /// Returns the diffs for the given task, or an empty slice if none are stored.
     pub fn diffs_for(&self, task_id: &TaskId) -> &[FileDiff] {
         self.diffs.get(task_id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Stores the commit message proposed by the CodeReview agent for a task.
+    pub fn set_commit_message(&mut self, task_id: &TaskId, msg: String) {
+        self.commit_messages.insert(task_id.clone(), msg);
+    }
+
+    /// Returns the commit message for the given task, if one has been stored.
+    pub fn get_commit_message(&self, task_id: &TaskId) -> Option<&str> {
+        self.commit_messages.get(task_id).map(String::as_str)
     }
 
     /// Returns the diffs for the currently displayed task.
@@ -1218,5 +1231,25 @@ mod tests {
             content.contains("src/foo.rs"),
             "inline comment header should appear in render; got: {content:?}"
         );
+    }
+
+    /// Verifies that `set_commit_message` and `get_commit_message` round-trip correctly.
+    #[test]
+    fn test_set_get_commit_message() {
+        let mut state = Tab4State::new();
+        let task_id = make_task_id();
+        state.set_commit_message(&task_id, "feat: add feature".to_string());
+        assert_eq!(
+            state.get_commit_message(&task_id),
+            Some("feat: add feature")
+        );
+    }
+
+    /// Verifies that `get_commit_message` returns `None` for an unknown task.
+    #[test]
+    fn test_get_commit_message_none_by_default() {
+        let state = Tab4State::new();
+        let task_id = make_task_id();
+        assert_eq!(state.get_commit_message(&task_id), None);
     }
 }
