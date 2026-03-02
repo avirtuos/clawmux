@@ -7,7 +7,7 @@ use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use tui_textarea::Input;
 
@@ -173,7 +173,7 @@ pub fn footer_hint_text(
     } else if active_tab == 2 || active_tab == 3 {
         "[Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 4 && pending_permission {
-        "[y] approve | [a] always | [n] reject | [r] reject with response | [Tab] next tab | [q] quit"
+        "[y] approve | [a] always | [n] reject | [r] reject with response | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 4 {
         "[p] steer | [Enter] send | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 5 && awaiting_approval {
@@ -353,6 +353,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             request,
             app.tab2_state.rejection_response_focused,
             &app.tab2_state.rejection_response,
+            app.tab2_state.permission_scroll,
         );
     }
 
@@ -406,24 +407,25 @@ fn render_quit_confirm_dialog(frame: &mut Frame, area: Rect) {
 
 /// Renders a centered modal permission request dialog over the given area.
 ///
-/// Blanks a 60-column centered region using [`Clear`] then draws a
-/// yellow-bordered block titled ` Permission Request ` listing the permission
-/// type, each command pattern, and the available key bindings.
+/// The dialog is fixed at 60 columns wide. Pattern lines are word-wrapped inside
+/// a 4-row scrollable viewport; `permission_scroll` shifts the viewport so the
+/// user can read long commands with Up/Down arrows.
 ///
-/// When `rejection_focused` is `true`, expands the dialog by 4 rows and renders
-/// the `rejection_response` textarea in place of the normal hint line so the
-/// user can type an explanation to send to the agent.
+/// When `rejection_focused` is `true`, the dialog expands by 4 rows and renders
+/// the `rejection_response` textarea so the user can type a guidance note.
 fn render_permission_dialog(
     frame: &mut Frame,
     area: Rect,
     request: &PermissionRequest,
     rejection_focused: bool,
     rejection_response: &tui_textarea::TextArea<'_>,
+    permission_scroll: u16,
 ) {
+    // Fixed layout: 2 borders + 1 type + 4 pattern viewport + 1 spacer + 1 hint = 9 rows.
+    // Rejection mode adds 4 rows for the guidance textarea.
     let dialog_width = 60u16;
-    let pattern_rows = request.patterns.len().min(7) as u16;
     let extra_rows = if rejection_focused { 4u16 } else { 0u16 };
-    let dialog_height = (5u16 + pattern_rows + extra_rows).min(16);
+    let dialog_height = 9u16 + extra_rows;
     let x = area.x + area.width.saturating_sub(dialog_width) / 2;
     let y = area.y + area.height.saturating_sub(dialog_height) / 2;
     let dialog_area = Rect::new(
@@ -441,36 +443,61 @@ fn render_permission_dialog(
     let inner = block.inner(dialog_area);
     frame.render_widget(block, dialog_area);
 
-    let mut content_lines = vec![Line::from(format!("Type: {}", request.permission))];
-    for p in request.patterns.iter().take(7) {
-        content_lines.push(Line::from(format!("  cmd: {}", p)));
-    }
-    content_lines.push(Line::from(""));
+    let type_line = Line::from(format!("Type: {}", request.permission));
+    let pattern_lines: Vec<Line> = request
+        .patterns
+        .iter()
+        .map(|p| Line::from(format!("  cmd: {}", p)))
+        .collect();
 
     if rejection_focused {
-        // Show the content up to the blank line, then the textarea.
-        let text_height = content_lines.len() as u16;
-        let hint_height = 1u16;
-        let textarea_height = inner.height.saturating_sub(text_height + hint_height);
-        let [text_area, rejection_area, hint_area] = ratatui::layout::Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(text_height),
-                Constraint::Length(textarea_height),
-                Constraint::Length(hint_height),
-            ])
-            .areas(inner);
-        frame.render_widget(Paragraph::new(content_lines), text_area);
+        // Layout: type(1) | patterns(4) | rejection textarea(4) | hint(1)
+        let [type_area, patterns_area, rejection_area, hint_area] =
+            ratatui::layout::Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(4),
+                    Constraint::Length(4),
+                    Constraint::Length(1),
+                ])
+                .areas(inner);
+        frame.render_widget(Paragraph::new(type_line), type_area);
+        frame.render_widget(
+            Paragraph::new(pattern_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((permission_scroll, 0)),
+            patterns_area,
+        );
         frame.render_widget(rejection_response, rejection_area);
         frame.render_widget(
             Paragraph::new(Line::from("[Enter] submit | [Esc] cancel")),
             hint_area,
         );
     } else {
-        content_lines.push(Line::from(
-            "[y] approve once | [a] always allow | [n] reject | [r] reject with response",
-        ));
-        frame.render_widget(Paragraph::new(content_lines), inner);
+        // Layout: type(1) | patterns(4) | spacer(1) | hint(1)
+        let [type_area, patterns_area, _spacer, hint_area] = ratatui::layout::Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(4),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .areas(inner);
+        frame.render_widget(Paragraph::new(type_line), type_area);
+        frame.render_widget(
+            Paragraph::new(pattern_lines)
+                .wrap(Wrap { trim: false })
+                .scroll((permission_scroll, 0)),
+            patterns_area,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(
+                "[y] approve once | [a] always allow | [n] reject | [r] reject with response | [Up/Down] scroll",
+            )),
+            hint_area,
+        );
     }
 }
 
@@ -717,6 +744,21 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                         return None;
                     }
                 }
+            }
+
+            // Up/Down scroll the pattern viewport; intercept before tab-level scroll handling.
+            match key.code {
+                KeyCode::Up if key.modifiers == KeyModifiers::NONE => {
+                    app.tab2_state.permission_scroll =
+                        app.tab2_state.permission_scroll.saturating_sub(1);
+                    return None;
+                }
+                KeyCode::Down if key.modifiers == KeyModifiers::NONE => {
+                    app.tab2_state.permission_scroll =
+                        app.tab2_state.permission_scroll.saturating_add(1);
+                    return None;
+                }
+                _ => {}
             }
 
             let response = match key.code {
@@ -3316,6 +3358,60 @@ mod tests {
         assert!(
             !app.tab2_state.rejection_response_focused,
             "rejection response should be unfocused after submit"
+        );
+    }
+
+    /// Up/Down arrows while a permission dialog is pending adjust `permission_scroll`
+    /// and do NOT bubble up to the activity buffer scroll.
+    #[test]
+    fn test_up_down_adjust_permission_scroll() {
+        let mut app = app_with_pending_permission();
+        assert_eq!(app.tab2_state.permission_scroll, 0);
+
+        // Down increases scroll.
+        let result = handle_input(key_event(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        assert!(result.is_none(), "Down should return None, got: {result:?}");
+        assert_eq!(app.tab2_state.permission_scroll, 1);
+
+        handle_input(key_event(KeyCode::Down, KeyModifiers::NONE), &mut app);
+        assert_eq!(app.tab2_state.permission_scroll, 2);
+
+        // Up decreases scroll.
+        let result = handle_input(key_event(KeyCode::Up, KeyModifiers::NONE), &mut app);
+        assert!(result.is_none(), "Up should return None, got: {result:?}");
+        assert_eq!(app.tab2_state.permission_scroll, 1);
+
+        // Up clamps at zero.
+        handle_input(key_event(KeyCode::Up, KeyModifiers::NONE), &mut app);
+        handle_input(key_event(KeyCode::Up, KeyModifiers::NONE), &mut app);
+        assert_eq!(
+            app.tab2_state.permission_scroll, 0,
+            "scroll should clamp at 0"
+        );
+    }
+
+    /// `push_permission` resets `permission_scroll` to 0 so a new request always starts
+    /// at the top of the viewport.
+    #[test]
+    fn test_push_permission_resets_scroll() {
+        use crate::opencode::types::PermissionRequest;
+
+        let mut app = app_with_pending_permission();
+        app.tab2_state.permission_scroll = 5;
+
+        let id = crate::tasks::TaskId::from_path("tasks/1.1.md");
+        let new_request = PermissionRequest {
+            id: "perm-2".to_string(),
+            session_id: "sess-1".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["cargo test".to_string()],
+            always: vec![],
+        };
+        app.tab2_state.push_permission(id, new_request);
+
+        assert_eq!(
+            app.tab2_state.permission_scroll, 0,
+            "push_permission should reset scroll to 0"
         );
     }
 }

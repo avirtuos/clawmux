@@ -142,6 +142,8 @@ pub struct Tab2State {
     pub rejection_response: TextArea<'static>,
     /// Whether the rejection response textarea currently has keyboard focus.
     pub rejection_response_focused: bool,
+    /// Vertical scroll offset for the pattern viewport in the permission dialog.
+    pub permission_scroll: u16,
     /// Per-task queued steering prompt (max 1).
     ///
     /// Set when the user submits a steering prompt while no session is active.
@@ -183,6 +185,7 @@ impl Tab2State {
             pending_permission: None,
             rejection_response,
             rejection_response_focused: false,
+            permission_scroll: 0,
             queued_steering_prompts: HashMap::new(),
             task_tokens: HashMap::new(),
         }
@@ -640,6 +643,7 @@ impl Tab2State {
             self.scroll_to_bottom(&task_id);
         }
         self.pending_permission = Some((task_id, request));
+        self.permission_scroll = 0;
     }
 
     /// Clears the pending permission request and marks the activity line as resolved.
@@ -648,6 +652,7 @@ impl Tab2State {
     /// the existing `PermissionRequest` activity line to show `resolved: true`.
     pub fn resolve_permission(&mut self, task_id: &TaskId) {
         self.pending_permission = None;
+        self.permission_scroll = 0;
         if let Some(buffer) = self.buffers.get_mut(task_id) {
             // Mark the last unresolved PermissionRequest line as resolved.
             for entry in buffer.iter_mut().rev() {
