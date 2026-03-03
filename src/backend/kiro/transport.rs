@@ -235,8 +235,8 @@ pub(crate) async fn route_message(
             }
         },
 
-        // Notification from agent (no id)
-        (false, _) => match serde_json::from_value::<RpcNotification>(value) {
+        // Notification from agent (no id, has method)
+        (false, true) => match serde_json::from_value::<RpcNotification>(value) {
             Ok(notif) => {
                 let _ = notification_tx
                     .send(IncomingMessage::Notification(notif))
@@ -246,6 +246,11 @@ pub(crate) async fn route_message(
                 tracing::warn!("failed to parse agent notification: {e}");
             }
         },
+
+        // Unknown message format: no id, no method -- log and ignore.
+        (false, false) => {
+            tracing::debug!("kiro-cli sent unrecognized message (no id, no method): {value}");
+        }
     }
 }
 

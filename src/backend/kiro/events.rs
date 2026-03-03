@@ -100,10 +100,21 @@ pub async fn run_event_loop(
                 match msg {
                     None => {
                         tracing::debug!("kiro incoming channel closed for task {task_id}");
+                        // If the process exited before sending turn_end, send completion
+                        // with whatever text we have accumulated so the workflow isn't stuck.
+                        if !accumulated_text.is_empty() {
+                            send_session_completed(
+                                &task_id,
+                                &session_id,
+                                accumulated_text.clone(),
+                                &async_tx,
+                            )
+                            .await;
+                        }
                         break;
                     }
                     Some(IncomingMessage::Notification(notif)) => {
-                        let is_terminal = notif.method == "turn_end" || notif.method == "session/error";
+                        let is_terminal = is_terminal_notification(&notif);
                         handle_notification(
                             &notif.method,
                             notif.params.as_ref(),
@@ -150,6 +161,24 @@ pub async fn run_event_loop(
     }
 }
 
+/// Returns `true` if `notif` represents a terminal event that should stop the event loop.
+fn is_terminal_notification(notif: &super::types::RpcNotification) -> bool {
+    match notif.method.as_str() {
+        // Legacy flat method names (kept as fallback)
+        "turn_end" | "session/error" => true,
+        // ACP envelope: terminal only when the inner update is turn_end
+        "session/update" => notif
+            .params
+            .as_ref()
+            .and_then(|p| p.get("update"))
+            .and_then(|u| u.get("sessionUpdate"))
+            .and_then(|s| s.as_str())
+            .map(|s| s == "turn_end")
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// Handle a single ACP notification, translating it to an [`AppMessage`].
 pub(crate) async fn handle_notification(
     method: &str,
@@ -160,6 +189,104 @@ pub(crate) async fn handle_notification(
     async_tx: &mpsc::Sender<AppMessage>,
 ) {
     match method {
+        // ACP envelope: kiro wraps all streaming events in session/update with a
+        // nested `sessionUpdate` discriminator field.
+        "session/update" => {
+            let Some(params) = params else { return };
+            let session_id_val = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if session_id_val != session_id {
+                return;
+            }
+            let update = match params.get("update") {
+                Some(u) => u,
+                None => {
+                    tracing::debug!("session/update missing update field");
+                    return;
+                }
+            };
+            let session_update = update
+                .get("sessionUpdate")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            match session_update {
+                "agent_message_chunk" => {
+                    // content: { type: "text", text: "..." }
+                    let text = update
+                        .get("content")
+                        .and_then(|c| c.get("text"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+                    if !text.is_empty() {
+                        accumulated_text.push_str(text);
+                        let msg = AppMessage::StreamingUpdate {
+                            task_id: task_id.clone(),
+                            session_id: session_id.to_string(),
+                            message_id: session_id.to_string(),
+                            parts: vec![MessagePart::Text {
+                                text: accumulated_text.clone(),
+                            }],
+                        };
+                        let _ = async_tx.send(msg).await;
+                    }
+                }
+                "tool_call" | "tool_call_update" => {
+                    // title (preferred) or name, plus status
+                    let tool_name = update
+                        .get("title")
+                        .or_else(|| update.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let status_str = update
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("pending");
+                    let status_display = match status_str {
+                        "pending" => "pending",
+                        "in_progress" => "executing",
+                        "completed" => "completed",
+                        "failed" => "failed",
+                        other => other,
+                    };
+                    let msg = AppMessage::ToolActivity {
+                        task_id: task_id.clone(),
+                        session_id: session_id.to_string(),
+                        tool: tool_name.to_string(),
+                        status: status_display.to_string(),
+                        detail: None,
+                    };
+                    let _ = async_tx.send(msg).await;
+                }
+                "turn_end" => {
+                    let stop_reason = update
+                        .get("stopReason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("end_turn");
+                    if stop_reason == "error" || stop_reason == "cancelled" {
+                        let msg = AppMessage::SessionError {
+                            task_id: task_id.clone(),
+                            session_id: session_id.to_string(),
+                            error: format!("session ended with stop reason: {stop_reason}"),
+                        };
+                        let _ = async_tx.send(msg).await;
+                    } else {
+                        send_session_completed(
+                            task_id,
+                            session_id,
+                            accumulated_text.clone(),
+                            async_tx,
+                        )
+                        .await;
+                    }
+                }
+                other => {
+                    tracing::debug!("kiro session/update unhandled type: {other}");
+                }
+            }
+        }
+
         "agent_message_chunk" => {
             let Some(params) = params else { return };
             let chunk: AgentMessageChunkParams = match serde_json::from_value(params.clone()) {
@@ -759,6 +886,155 @@ mod tests {
         .await;
 
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_session_update_agent_message_chunk() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut accumulated = String::new();
+
+        handle_notification(
+            "session/update",
+            Some(&serde_json::json!({
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "Hello world" }
+                }
+            })),
+            &task_id(),
+            "sess-1",
+            &mut accumulated,
+            &tx,
+        )
+        .await;
+
+        assert_eq!(accumulated, "Hello world");
+        let msg = rx.recv().await.unwrap();
+        if let AppMessage::StreamingUpdate { parts, .. } = msg {
+            if let MessagePart::Text { text } = &parts[0] {
+                assert_eq!(text, "Hello world");
+            } else {
+                panic!("expected Text part");
+            }
+        } else {
+            panic!("expected StreamingUpdate");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_update_tool_call() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut accumulated = String::new();
+
+        handle_notification(
+            "session/update",
+            Some(&serde_json::json!({
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-1",
+                    "title": "read_file",
+                    "kind": "read",
+                    "status": "in_progress"
+                }
+            })),
+            &task_id(),
+            "sess-1",
+            &mut accumulated,
+            &tx,
+        )
+        .await;
+
+        let msg = rx.recv().await.unwrap();
+        if let AppMessage::ToolActivity { tool, status, .. } = msg {
+            assert_eq!(tool, "read_file");
+            assert_eq!(status, "executing");
+        } else {
+            panic!("expected ToolActivity");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_update_turn_end_sends_completed() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut accumulated = "full response".to_string();
+
+        handle_notification(
+            "session/update",
+            Some(&serde_json::json!({
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "turn_end",
+                    "stopReason": "end_turn"
+                }
+            })),
+            &task_id(),
+            "sess-1",
+            &mut accumulated,
+            &tx,
+        )
+        .await;
+
+        let msg = rx.recv().await.unwrap();
+        if let AppMessage::SessionCompleted { response_text, .. } = msg {
+            assert_eq!(response_text, "full response");
+        } else {
+            panic!("expected SessionCompleted, got {:?}", msg);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_update_wrong_session_ignored() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut accumulated = String::new();
+
+        handle_notification(
+            "session/update",
+            Some(&serde_json::json!({
+                "sessionId": "other-session",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "ignored" }
+                }
+            })),
+            &task_id(),
+            "sess-1",
+            &mut accumulated,
+            &tx,
+        )
+        .await;
+
+        assert!(rx.try_recv().is_err());
+        assert!(accumulated.is_empty());
+    }
+
+    #[test]
+    fn test_is_terminal_notification_session_update_turn_end() {
+        use super::super::types::RpcNotification;
+        let notif = RpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "session/update".to_string(),
+            params: Some(serde_json::json!({
+                "sessionId": "sess-1",
+                "update": { "sessionUpdate": "turn_end" }
+            })),
+        };
+        assert!(is_terminal_notification(&notif));
+    }
+
+    #[test]
+    fn test_is_terminal_notification_session_update_chunk_not_terminal() {
+        use super::super::types::RpcNotification;
+        let notif = RpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: "session/update".to_string(),
+            params: Some(serde_json::json!({
+                "sessionId": "sess-1",
+                "update": { "sessionUpdate": "agent_message_chunk" }
+            })),
+        };
+        assert!(!is_terminal_notification(&notif));
     }
 
     #[tokio::test]

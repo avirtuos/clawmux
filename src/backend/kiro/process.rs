@@ -31,8 +31,8 @@ use crate::tasks::models::TaskId;
 use super::events::{run_event_loop, PermissionResponse};
 use super::transport::Transport;
 use super::types::{
-    ClientCapabilities, ClientInfo, ContentPart, InitializeParams, InitializeResult,
-    SessionNewParams, SessionNewResult, SessionPromptParams,
+    ClientCapabilities, ClientInfo, InitializeParams, InitializeResult, SessionNewParams,
+    SessionNewResult, SessionPromptParams,
 };
 
 /// Protocol version string sent during ACP initialization.
@@ -57,6 +57,7 @@ impl KiroProcess {
     /// # Arguments
     /// * `binary` – path or name of the kiro-cli binary (looked up in PATH if not absolute).
     /// * `agent_name` – kiro agent name, e.g. `"clawdmux-intake"`.
+    /// * `cwd` – absolute path to the project working directory, sent in `initialize`.
     /// * `task_id` – task this process belongs to.
     /// * `async_tx` – channel for forwarding [`AppMessage`] variants to the application.
     ///
@@ -64,6 +65,7 @@ impl KiroProcess {
     pub async fn spawn(
         binary: &str,
         agent_name: &str,
+        cwd: &str,
         task_id: TaskId,
         async_tx: mpsc::Sender<AppMessage>,
     ) -> Result<Self> {
@@ -109,7 +111,7 @@ impl KiroProcess {
         let (transport, reader_handle) = Transport::new(stdin, stdout, notification_tx);
 
         // ACP handshake: initialize + initialized
-        let session_id = Self::handshake(&transport, agent_name).await?;
+        let session_id = Self::handshake(&transport, agent_name, cwd).await?;
 
         tracing::info!(
             "kiro-cli session created: agent={agent_name} session_id={session_id} task={task_id}"
@@ -142,7 +144,7 @@ impl KiroProcess {
     /// Perform the ACP initialization handshake: `initialize` -> `initialized` -> `session/new`.
     ///
     /// Returns the new session ID on success.
-    async fn handshake(transport: &Transport, agent_name: &str) -> Result<String> {
+    async fn handshake(transport: &Transport, agent_name: &str, cwd: &str) -> Result<String> {
         // Send initialize request
         let params = InitializeParams {
             protocol_version: ACP_PROTOCOL_VERSION.to_string(),
@@ -175,7 +177,11 @@ impl KiroProcess {
         transport.notify("initialized", None).await?;
 
         // Create a new session
-        let session_params = SessionNewParams { metadata: None };
+        let session_params = SessionNewParams {
+            cwd: cwd.to_string(),
+            mcp_servers: vec![],
+            metadata: None,
+        };
         let session_result = transport
             .request("session/new", Some(serde_json::to_value(&session_params)?))
             .await?;
@@ -191,16 +197,64 @@ impl KiroProcess {
 
     /// Send a text prompt to the active session.
     ///
-    /// This is a fire-and-forget notification; the agent's response arrives
-    /// asynchronously via the event loop.
-    pub async fn send_prompt(&self, prompt: &str) -> Result<()> {
+    /// `session/prompt` is a JSON-RPC **request** (not a notification): kiro
+    /// responds when the turn completes with `{ stopReason: "end_turn" | ... }`.
+    /// A background task awaits that response and forwards any error to `async_tx`.
+    /// Streaming updates arrive separately via `session/update` notifications handled
+    /// by the event loop.
+    pub async fn send_prompt(
+        &self,
+        prompt: &str,
+        async_tx: mpsc::Sender<AppMessage>,
+    ) -> Result<()> {
         let params = SessionPromptParams {
             session_id: self.session_id.clone(),
-            content: vec![ContentPart::text(prompt)],
+            prompt: prompt.to_string(),
         };
-        self.transport
-            .notify("session/prompt", Some(serde_json::to_value(&params)?))
-            .await
+        let params_value = serde_json::to_value(&params)?;
+        let transport = self.transport.clone();
+        let task_id = self.task_id.clone();
+        let session_id = self.session_id.clone();
+
+        tokio::spawn(async move {
+            match transport
+                .request("session/prompt", Some(params_value))
+                .await
+            {
+                Ok(result) => {
+                    let stop_reason = result
+                        .get("stopReason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("end_turn");
+                    tracing::debug!(
+                        "session/prompt response: task={task_id} stop_reason={stop_reason}"
+                    );
+                    if stop_reason == "error" {
+                        let _ = async_tx
+                            .send(AppMessage::SessionError {
+                                task_id,
+                                session_id,
+                                error: "session/prompt returned error stop reason".to_string(),
+                            })
+                            .await;
+                    }
+                    // Normal completion is signaled via session/update { turn_end } in the
+                    // event loop; we don't send SessionCompleted here to avoid duplicates.
+                }
+                Err(e) => {
+                    tracing::error!("session/prompt failed for task={task_id}: {e}");
+                    let _ = async_tx
+                        .send(AppMessage::SessionError {
+                            task_id,
+                            session_id,
+                            error: e.to_string(),
+                        })
+                        .await;
+                }
+            }
+        });
+
+        Ok(())
     }
 
     /// Send a `session/cancel` notification to abort the current turn.
