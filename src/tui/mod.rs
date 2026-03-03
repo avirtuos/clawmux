@@ -35,7 +35,7 @@ const PERMISSION_DIALOG_INNER_WIDTH: u16 = 58;
 pub fn draw_loading_screen(frame: &mut Frame, status: &str) {
     let area = frame.area();
     let text = Text::from(vec![
-        Line::from("ClawdMux v0.1.0").centered(),
+        Line::from(concat!("ClawdMux v", env!("CARGO_PKG_VERSION"))).centered(),
         Line::from(""),
         Line::from(status).centered(),
     ]);
@@ -314,7 +314,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let footer_inner = footer_block.inner(areas.footer);
     frame.render_widget(footer_block, areas.footer);
 
-    const VERSION: &str = "ClawdMux v0.1.0 ";
+    const VERSION: &str = concat!("ClawdMux v", env!("CARGO_PKG_VERSION"), " ");
     let version_width = VERSION.len() as u16;
 
     if let Some(ref status_text) = right_status {

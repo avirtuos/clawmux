@@ -208,6 +208,11 @@ where
 /// Params for the `session/new` request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionNewParams {
+    /// Absolute path to the project working directory.
+    pub cwd: String,
+    /// MCP server configurations to pass to the agent session.
+    #[serde(rename = "mcpServers")]
+    pub mcp_servers: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
 }
@@ -219,30 +224,13 @@ pub struct SessionNewResult {
     pub session_id: String,
 }
 
-/// A content part in a session prompt.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContentPart {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub text: String,
-}
-
-impl ContentPart {
-    /// Create a plain text content part.
-    pub fn text(text: impl Into<String>) -> Self {
-        Self {
-            kind: "text".to_string(),
-            text: text.into(),
-        }
-    }
-}
-
-/// Params for the `session/prompt` notification.
+/// Params for the `session/prompt` request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionPromptParams {
     #[serde(rename = "sessionId")]
     pub session_id: String,
-    pub content: Vec<ContentPart>,
+    /// Plain-text prompt string (kiro-cli uses `prompt`, not `content`).
+    pub prompt: String,
 }
 
 /// Params for the `session/cancel` notification.
@@ -417,15 +405,6 @@ mod tests {
     }
 
     #[test]
-    fn test_content_part_text() {
-        let part = ContentPart::text("hello world");
-        assert_eq!(part.kind, "text");
-        assert_eq!(part.text, "hello world");
-        let json = serde_json::to_string(&part).unwrap();
-        assert!(json.contains("\"type\":\"text\""));
-    }
-
-    #[test]
     fn test_initialize_params_serialization() {
         let params = InitializeParams {
             protocol_version: "1.0".to_string(),
@@ -477,6 +456,20 @@ mod tests {
         let d = PermissionDecision::RejectAlways;
         let json = serde_json::to_string(&d).unwrap();
         assert_eq!(json, "\"reject_always\"");
+    }
+
+    #[test]
+    fn test_session_new_params_includes_cwd_and_mcp_servers() {
+        let params = SessionNewParams {
+            cwd: "/home/user/project".to_string(),
+            mcp_servers: vec![],
+            metadata: None,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains("\"cwd\":\"/home/user/project\""));
+        assert!(json.contains("\"mcpServers\":[]"));
+        // metadata: None should be omitted entirely
+        assert!(!json.contains("metadata"));
     }
 
     #[test]

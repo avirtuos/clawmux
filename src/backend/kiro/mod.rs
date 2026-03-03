@@ -43,6 +43,8 @@ use self::process::{check_kiro_available, resolve_binary, KiroProcess};
 pub struct KiroBackend {
     /// Resolved path or name of the kiro-cli binary.
     binary: String,
+    /// Absolute path to the project working directory, sent in `initialize`.
+    cwd: String,
     /// Active KiroProcess instances keyed by ACP session ID.
     processes: Arc<Mutex<HashMap<String, KiroProcess>>>,
 }
@@ -52,9 +54,11 @@ impl KiroBackend {
     ///
     /// # Arguments
     /// * `binary` – optional kiro binary path; defaults to `"kiro"` (PATH lookup).
-    pub fn new(binary: Option<String>) -> Self {
+    /// * `cwd` – absolute path to the project working directory.
+    pub fn new(binary: Option<String>, cwd: String) -> Self {
         Self {
             binary: resolve_binary(binary.as_deref()),
+            cwd,
             processes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -76,26 +80,32 @@ impl AgentBackend for KiroBackend {
         async_tx: mpsc::Sender<AppMessage>,
     ) {
         let binary = self.binary.clone();
+        let cwd = self.cwd.clone();
         let processes = self.processes.clone();
         tokio::spawn(async move {
             let agent_name = agent.kiro_agent_name();
-            let process =
-                match KiroProcess::spawn(&binary, agent_name, task_id.clone(), async_tx.clone())
-                    .await
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!("failed to spawn kiro-cli for task {task_id}: {e}");
-                        let _ = async_tx
-                            .send(AppMessage::SessionError {
-                                task_id,
-                                session_id: String::new(),
-                                error: e.to_string(),
-                            })
-                            .await;
-                        return;
-                    }
-                };
+            let process = match KiroProcess::spawn(
+                &binary,
+                agent_name,
+                &cwd,
+                task_id.clone(),
+                async_tx.clone(),
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("failed to spawn kiro-cli for task {task_id}: {e}");
+                    let _ = async_tx
+                        .send(AppMessage::SessionError {
+                            task_id,
+                            session_id: String::new(),
+                            error: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
 
             let session_id = process.session_id().to_string();
 
@@ -106,7 +116,7 @@ impl AgentBackend for KiroBackend {
             }
 
             // Send the initial prompt
-            if let Err(e) = process.send_prompt(&prompt).await {
+            if let Err(e) = process.send_prompt(&prompt, async_tx.clone()).await {
                 tracing::error!("failed to send prompt to kiro for task {task_id}: {e}");
                 let _ = async_tx
                     .send(AppMessage::SessionError {
@@ -138,26 +148,32 @@ impl AgentBackend for KiroBackend {
         async_tx: mpsc::Sender<AppMessage>,
     ) {
         let binary = self.binary.clone();
+        let cwd = self.cwd.clone();
         let processes = self.processes.clone();
         tokio::spawn(async move {
             let agent_name = agent.kiro_agent_name();
-            let process =
-                match KiroProcess::spawn(&binary, agent_name, task_id.clone(), async_tx.clone())
-                    .await
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::error!("failed to spawn idle kiro-cli for task {task_id}: {e}");
-                        let _ = async_tx
-                            .send(AppMessage::SessionError {
-                                task_id,
-                                session_id: String::new(),
-                                error: e.to_string(),
-                            })
-                            .await;
-                        return;
-                    }
-                };
+            let process = match KiroProcess::spawn(
+                &binary,
+                agent_name,
+                &cwd,
+                task_id.clone(),
+                async_tx.clone(),
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("failed to spawn idle kiro-cli for task {task_id}: {e}");
+                    let _ = async_tx
+                        .send(AppMessage::SessionError {
+                            task_id,
+                            session_id: String::new(),
+                            error: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            };
 
             let session_id = process.session_id().to_string();
             {
@@ -190,7 +206,7 @@ impl AgentBackend for KiroBackend {
             let result = {
                 let map = processes.lock().await;
                 if let Some(process) = map.get(&session_id) {
-                    process.send_prompt(&prompt).await
+                    process.send_prompt(&prompt, async_tx.clone()).await
                 } else {
                     Err(crate::error::ClawdMuxError::Kiro(format!(
                         "no active kiro session for session_id={session_id}"
@@ -557,26 +573,29 @@ mod tests {
 
     #[test]
     fn test_kiro_backend_name() {
-        let b = KiroBackend::new(None);
+        let b = KiroBackend::new(None, "/tmp".to_string());
         assert_eq!(b.name(), "kiro");
     }
 
     #[test]
     fn test_kiro_backend_binary_default() {
-        let b = KiroBackend::new(None);
+        let b = KiroBackend::new(None, "/tmp".to_string());
         assert_eq!(b.binary, "kiro");
     }
 
     #[test]
     fn test_kiro_backend_binary_custom() {
-        let b = KiroBackend::new(Some("/opt/kiro/bin/kiro".to_string()));
+        let b = KiroBackend::new(Some("/opt/kiro/bin/kiro".to_string()), "/tmp".to_string());
         assert_eq!(b.binary, "/opt/kiro/bin/kiro");
     }
 
     #[test]
     fn test_kiro_backend_is_available_nonexistent() {
         // Unless kiro is actually installed, should return false
-        let b = KiroBackend::new(Some("this-binary-does-not-exist-99999".to_string()));
+        let b = KiroBackend::new(
+            Some("this-binary-does-not-exist-99999".to_string()),
+            "/tmp".to_string(),
+        );
         assert!(!b.is_available());
     }
 

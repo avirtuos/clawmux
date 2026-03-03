@@ -87,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    tracing::info!("ClawdMux starting");
+    tracing::info!("ClawdMux starting v{}", env!("CARGO_PKG_VERSION"));
 
     match cli.command {
         Some(Commands::Init(args)) => {
@@ -245,7 +245,10 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     let backend: Box<dyn crate::backend::AgentBackend> = match config.backend {
         BackendKind::Kiro => {
             tracing::info!("using kiro backend (ACP)");
-            Box::new(KiroBackend::new(config.kiro.binary.clone()))
+            Box::new(KiroBackend::new(
+                config.kiro.binary.clone(),
+                project_root.to_string_lossy().into_owned(),
+            ))
         }
         BackendKind::OpenCode => {
             tracing::info!("using opencode backend");
