@@ -24,6 +24,10 @@ pub mod markdown;
 pub mod tabs;
 pub mod task_list;
 
+/// Inner width of the permission dialog (dialog_width - 2 border columns).
+/// Used when computing wrapped line counts for scroll bounds.
+const PERMISSION_DIALOG_INNER_WIDTH: u16 = 58;
+
 /// Draws a full-screen loading status indicator.
 ///
 /// Shows the app name centered above a status message. Used during
@@ -837,7 +841,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                                 .collect();
                             let total = Paragraph::new(lines)
                                 .wrap(Wrap { trim: false })
-                                .line_count(58); // dialog inner width (60 - 2 borders)
+                                .line_count(PERMISSION_DIALOG_INNER_WIDTH); // dialog_width - 2 borders
                             u16::try_from(total.saturating_sub(4)).unwrap_or(u16::MAX)
                         } else {
                             0

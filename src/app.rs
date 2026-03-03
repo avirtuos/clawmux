@@ -3918,7 +3918,7 @@ mod tests {
             request,
             response: "reject".to_string(),
             explanation: Some(
-                "No, lets consider something else first. Try a safer approach.".to_string(),
+                "No, let's consider something else first. Try a safer approach.".to_string(),
             ),
         });
 
