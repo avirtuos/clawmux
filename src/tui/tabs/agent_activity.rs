@@ -648,8 +648,10 @@ impl Tab2State {
         if self.current_task_id.as_ref() == Some(&task_id) {
             self.scroll_to_bottom(&task_id);
         }
+        if self.pending_permissions.is_empty() {
+            self.permission_scroll = 0;
+        }
         self.pending_permissions.push_back((task_id, request));
-        self.permission_scroll = 0;
     }
 
     /// Clears the pending permission request and marks the activity line as resolved.
@@ -657,7 +659,12 @@ impl Tab2State {
     /// Call this after the user has responded to a permission request. This updates
     /// the existing `PermissionRequest` activity line to show `resolved: true`.
     pub fn resolve_permission(&mut self, task_id: &TaskId) {
-        self.pending_permissions.pop_front();
+        if let Some((front_task_id, _)) = self.pending_permissions.pop_front() {
+            debug_assert_eq!(
+                &front_task_id, task_id,
+                "resolve_permission: popped task_id does not match argument"
+            );
+        }
         self.permission_scroll = 0;
         if let Some(buffer) = self.buffers.get_mut(task_id) {
             // Mark the first unresolved PermissionRequest line as resolved (FIFO).
