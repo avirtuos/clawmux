@@ -258,8 +258,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .selected_task()
         .map(|id| {
             app.tab2_state
-                .pending_permission
-                .as_ref()
+                .pending_permissions
+                .front()
                 .map(|(tid, _)| tid == id)
                 .unwrap_or(false)
         })
@@ -350,7 +350,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         render_commit_dialog(frame, frame.area(), dialog);
     }
 
-    if let Some((ref _tid, ref request)) = app.tab2_state.pending_permission {
+    if let Some((ref _tid, ref request)) = app.tab2_state.pending_permissions.front() {
         render_permission_dialog(
             frame,
             frame.area(),
@@ -779,8 +779,8 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             .selected_task()
             .map(|id| {
                 app.tab2_state
-                    .pending_permission
-                    .as_ref()
+                    .pending_permissions
+                    .front()
                     .map(|(tid, _)| tid == id)
                     .unwrap_or(false)
             })
@@ -792,7 +792,8 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
                         let text: String = app.tab2_state.rejection_response.lines().join("\n");
                         app.tab2_state.reset_rejection_response();
-                        if let Some((task_id, request)) = app.tab2_state.pending_permission.clone()
+                        if let Some((task_id, request)) =
+                            app.tab2_state.pending_permissions.front().cloned()
                         {
                             let explanation = if text.trim().is_empty() {
                                 None
@@ -827,19 +828,20 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                     return None;
                 }
                 KeyCode::Down if key.modifiers == KeyModifiers::NONE => {
-                    let max_scroll = if let Some((_, req)) = &app.tab2_state.pending_permission {
-                        let lines: Vec<Line> = req
-                            .patterns
-                            .iter()
-                            .map(|p| Line::from(format!("  cmd: {}", p)))
-                            .collect();
-                        let total = Paragraph::new(lines)
-                            .wrap(Wrap { trim: false })
-                            .line_count(58); // dialog inner width (60 - 2 borders)
-                        u16::try_from(total.saturating_sub(4)).unwrap_or(u16::MAX)
-                    } else {
-                        0
-                    };
+                    let max_scroll =
+                        if let Some((_, req)) = app.tab2_state.pending_permissions.front() {
+                            let lines: Vec<Line> = req
+                                .patterns
+                                .iter()
+                                .map(|p| Line::from(format!("  cmd: {}", p)))
+                                .collect();
+                            let total = Paragraph::new(lines)
+                                .wrap(Wrap { trim: false })
+                                .line_count(58); // dialog inner width (60 - 2 borders)
+                            u16::try_from(total.saturating_sub(4)).unwrap_or(u16::MAX)
+                        } else {
+                            0
+                        };
                     app.tab2_state.permission_scroll = app
                         .tab2_state
                         .permission_scroll
@@ -867,7 +869,9 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                 _ => None,
             };
             if let Some(resp) = response {
-                if let Some((task_id, request)) = app.tab2_state.pending_permission.clone() {
+                if let Some((task_id, request)) =
+                    app.tab2_state.pending_permissions.front().cloned()
+                {
                     return Some(AppMessage::PermissionResolved {
                         task_id,
                         request,
@@ -3455,7 +3459,7 @@ mod tests {
         );
         // Permission should still be pending.
         assert!(
-            app.tab2_state.pending_permission.is_some(),
+            !app.tab2_state.pending_permissions.is_empty(),
             "permission should still be pending after Esc"
         );
     }
@@ -3508,8 +3512,9 @@ mod tests {
         use crate::opencode::types::PermissionRequest;
         let mut app = app_with_pending_permission();
 
-        // Replace the single-pattern fixture with 6 patterns so the pattern area
+        // Replace the fixture permission with a 6-pattern one so the pattern area
         // (4 visible rows) needs scrolling: max_scroll = 6 - 4 = 2.
+        app.tab2_state.pending_permissions.clear();
         let task_id = crate::tasks::TaskId::from_path("tasks/1.1.md");
         let request = PermissionRequest {
             id: "perm-scroll".to_string(),

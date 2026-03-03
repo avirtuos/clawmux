@@ -841,7 +841,7 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
         }
         // Known events we intentionally do not act on.
         "session.updated" | "server.heartbeat" | "server.connected" | "project.updated"
-        | "message.created" | "session.status" => {
+        | "message.created" | "session.status" | "permission.replied" => {
             debug!("SSE event '{}': ignoring (props: {})", event_type, props);
             OpenCodeEvent::Unknown
         }
@@ -2055,6 +2055,18 @@ mod tests {
                 } if session_id == "ses_xyz" && input_tokens == 7873 && output_tokens == 212
             ),
             "expected TokensUpdated from step-finish part, got: {event:?}"
+        );
+    }
+
+    /// Verifies that `permission.replied` is treated as a known-ignored event and returns
+    /// `Unknown` without hitting the catch-all warn branch.
+    #[test]
+    fn test_parse_permission_replied_is_ignored() {
+        let json = r#"{"payload":{"type":"permission.replied","properties":{}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(event, OpenCodeEvent::Unknown),
+            "permission.replied should parse as Unknown (known-ignored), got: {event:?}"
         );
     }
 
