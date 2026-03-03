@@ -142,7 +142,10 @@ pub struct ClientCapabilities {
 /// Result returned by the agent from the `initialize` request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitializeResult {
-    #[serde(rename = "protocolVersion")]
+    #[serde(
+        rename = "protocolVersion",
+        deserialize_with = "deserialize_string_or_int"
+    )]
     pub protocol_version: String,
     #[serde(rename = "agentInfo")]
     pub agent_info: AgentInfo,
@@ -154,7 +157,48 @@ pub struct InitializeResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub name: String,
+    #[serde(deserialize_with = "deserialize_string_or_int")]
     pub version: String,
+}
+
+/// Deserialize a field that kiro-cli may send as either a JSON string or a JSON integer.
+///
+/// Some versions of kiro-cli return numeric fields (e.g. `protocolVersion`, `version`)
+/// as bare integers (`1`) rather than strings (`"1"`). This helper accepts both and
+/// converts integers to their decimal string representation.
+fn deserialize_string_or_int<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+
+    struct StringOrInt;
+
+    impl<'de> Visitor<'de> for StringOrInt {
+        type Value = String;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or integer")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<String, E> {
+            Ok(v.to_string())
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> std::result::Result<String, E> {
+            Ok(v)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<String, E> {
+            Ok(v.to_string())
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<String, E> {
+            Ok(v.to_string())
+        }
+    }
+
+    deserializer.deserialize_any(StringOrInt)
 }
 
 // ---------------------------------------------------------------------------
@@ -440,5 +484,23 @@ mod tests {
         let json = r#"{"sessionId":"sess-123"}"#;
         let result: SessionNewResult = serde_json::from_str(json).unwrap();
         assert_eq!(result.session_id, "sess-123");
+    }
+
+    #[test]
+    fn test_initialize_result_string_version() {
+        let json =
+            r#"{"protocolVersion":"1.0","agentInfo":{"name":"clawdmux-intake","version":"0.1.0"}}"#;
+        let result: InitializeResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.protocol_version, "1.0");
+        assert_eq!(result.agent_info.version, "0.1.0");
+    }
+
+    #[test]
+    fn test_initialize_result_integer_version() {
+        // kiro-cli may return version fields as bare integers rather than strings.
+        let json = r#"{"protocolVersion":1,"agentInfo":{"name":"clawdmux-intake","version":1}}"#;
+        let result: InitializeResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.protocol_version, "1");
+        assert_eq!(result.agent_info.version, "1");
     }
 }
