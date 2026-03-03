@@ -839,9 +839,33 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
             debug!("SSE event 'message.updated': ignoring (no token data in props)");
             OpenCodeEvent::Unknown
         }
+        // session.status with type=idle is the primary session-completion signal in
+        // OpenCode >= 1.2.11. Other status values (e.g. "busy") are ignored.
+        "session.status" => {
+            let session_id = props["sessionID"]
+                .as_str()
+                .or_else(|| props["sessionId"].as_str());
+            if props["status"]["type"].as_str() == Some("idle") {
+                match session_id {
+                    Some(sid) => OpenCodeEvent::SessionCompleted {
+                        session_id: sid.to_string(),
+                    },
+                    None => {
+                        warn!("session.status idle missing session id: {}", json_data);
+                        OpenCodeEvent::Unknown
+                    }
+                }
+            } else {
+                debug!(
+                    "SSE event 'session.status': non-idle status, ignoring (props: {})",
+                    props
+                );
+                OpenCodeEvent::Unknown
+            }
+        }
         // Known events we intentionally do not act on.
         "session.updated" | "server.heartbeat" | "server.connected" | "project.updated"
-        | "message.created" | "session.status" | "permission.replied" => {
+        | "message.created" | "permission.replied" => {
             debug!("SSE event '{}': ignoring (props: {})", event_type, props);
             OpenCodeEvent::Unknown
         }
@@ -1662,14 +1686,25 @@ mod tests {
         );
     }
 
-    /// Verifies that session.status is treated as a known-ignored event.
+    /// Verifies that session.status with type=idle maps to SessionCompleted.
     #[test]
-    fn test_parse_wire_event_session_status_ignored() {
-        let json = r#"{"payload":{"type":"session.status","properties":{"sessionID":"ses_abc","status":"busy"}}}"#;
+    fn test_session_status_idle_maps_to_completed() {
+        let json = r#"{"payload":{"type":"session.status","properties":{"sessionID":"ses_abc","status":{"type":"idle"}}}}"#;
+        let event = parse_wire_event(json);
+        assert!(
+            matches!(&event, OpenCodeEvent::SessionCompleted { session_id } if session_id == "ses_abc"),
+            "session.status idle should return SessionCompleted, got: {event:?}"
+        );
+    }
+
+    /// Verifies that session.status with type=busy returns Unknown.
+    #[test]
+    fn test_session_status_busy_ignored() {
+        let json = r#"{"payload":{"type":"session.status","properties":{"sessionID":"ses_abc","status":{"type":"busy"}}}}"#;
         let event = parse_wire_event(json);
         assert!(
             matches!(event, OpenCodeEvent::Unknown),
-            "session.status should return Unknown, got: {event:?}"
+            "session.status busy should return Unknown, got: {event:?}"
         );
     }
 

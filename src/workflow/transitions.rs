@@ -131,6 +131,21 @@ impl WorkflowEngine {
         }]
     }
 
+    /// Sets the workflow phase back to `Running` without emitting a new session.
+    ///
+    /// Called when the human has answered an OpenCode-native question and the
+    /// original session is already resuming via `reply_question`. Avoids spawning
+    /// a duplicate session that the standard `HumanAnswered` handler would create.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - The task whose phase should be set to `Running`.
+    pub fn resume_from_answer(&mut self, task_id: &TaskId) {
+        if let Some(state) = self.states.get_mut(task_id) {
+            state.phase = WorkflowPhase::Running;
+        }
+    }
+
     /// Applies a message to the engine, mutating state and returning side effects.
     ///
     /// The returned `Vec<AppMessage>` contains zero or more messages that the
@@ -962,6 +977,35 @@ mod tests {
         let state = engine.state(&tid).expect("state");
         assert_eq!(state.current_agent, AgentKind::Intake);
         assert_eq!(state.phase, WorkflowPhase::Running);
+    }
+
+    #[test]
+    fn test_resume_from_answer_sets_running_without_create_session() {
+        let mut engine = WorkflowEngine::new(false);
+        let tid = task("6.1");
+        engine.process(AppMessage::StartTask {
+            task_id: tid.clone(),
+        });
+        engine.process(AppMessage::AgentAskedQuestion {
+            task_id: tid.clone(),
+            agent: AgentKind::Intake,
+            question: "What is the scope?".to_string(),
+        });
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(
+            state.phase,
+            WorkflowPhase::AwaitingAnswer { question_index: 0 }
+        );
+
+        engine.resume_from_answer(&tid);
+
+        let state = engine.state(&tid).expect("state");
+        assert_eq!(
+            state.phase,
+            WorkflowPhase::Running,
+            "phase should be Running after resume_from_answer"
+        );
+        // No session is created -- the caller is responsible for resuming via reply_question.
     }
 
     #[test]

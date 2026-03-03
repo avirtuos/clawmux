@@ -508,6 +508,36 @@ When a task is interrupted — by a session error or an app crash/restart — it
 - `WorkflowEngine::new(approval_gate_enabled: bool)` -- gate flag wired from `AppConfig::workflow.approval_gate`
 - `WorkflowConfig` struct in `src/config/mod.rs` with `approval_gate: bool` (default: `true`)
 
+### Session Completion Detection
+
+OpenCode signals session completion via SSE. ClawdMux uses two complementary mechanisms:
+
+**Primary: `session.status` SSE event (OpenCode >= 1.2.11)**
+When `props["status"]["type"] == "idle"`, `parse_wire_event` returns `OpenCodeEvent::SessionCompleted`. This is instant — the session completes as soon as the SSE event is received.
+
+**Secondary: `session.idle` SSE event (older OpenCode builds)**
+Same mapping: returns `OpenCodeEvent::SessionCompleted`. Included for backward compatibility.
+
+**Fallback: Tick-based liveness poll**
+If neither SSE event arrives (e.g., a dropped event), the `Tick` handler calls `tab2_state.check_timeouts(IDLE_TIMEOUT)` and emits `SessionError` for tasks where the timer has expired. This is a safety net, not the primary path.
+
+### Question-Answer Flow
+
+There are two kinds of questions an agent can ask:
+
+**OpenCode-native questions (`question.asked` SSE event)**
+OpenCode pauses the session mid-run and broadcasts `question.asked` with a request ID. The session is still alive and waiting. When the human answers:
+1. `reply_question(&req_id, &answer)` resumes the original session (no new session needed).
+2. `WorkflowEngine::resume_from_answer(task_id)` sets `phase = Running` without emitting `CreateSession`.
+3. The idle timer is restarted via `set_awaiting_response` so the resumed session gets a fresh liveness window.
+
+**Parsed questions (agent output contains a question)**
+The agent has already completed its session and embedded a question in its structured output. The session is gone. When the human answers:
+1. `WorkflowEngine::process(HumanAnswered)` is called, which sets `phase = Running` and emits `CreateSession` to start a new session with the answer as context.
+
+**Idle timer during question phase**
+When `OpenCodeQuestionAsked` is received, `clear_awaiting` and `clear_thinking` are called immediately to stop the idle timer. While the human is composing an answer, no timeout should fire. The timer is restarted only when the answer is submitted (OpenCode-native path) or when the new session is created (parsed-question path).
+
 ### OpenCode Client Layer
 
 ```rust

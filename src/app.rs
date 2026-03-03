@@ -637,8 +637,11 @@ impl App {
                 } else {
                     None
                 };
-                // If this question came from OpenCode, send the reply back.
-                if let Some(req_id) = opencode_request_id {
+                // Branch on whether this is an OpenCode-native question (has a request ID)
+                // or a parsed question extracted from agent output.
+                let mut msgs = if let Some(req_id) = opencode_request_id {
+                    // OpenCode-native: the original session is already resumed via
+                    // reply_question. Set phase to Running without creating a new session.
                     if let Some(client) = self.opencode_client.clone() {
                         let async_tx = self.async_tx.clone();
                         let answer_clone = answer.clone();
@@ -660,17 +663,29 @@ impl App {
                             }
                         });
                     }
-                }
+                    self.workflow_engine.resume_from_answer(&task_id);
+                    // Restart the idle timer so the resumed session gets a fresh window.
+                    let agent_name = self
+                        .workflow_engine
+                        .state(&task_id)
+                        .map(|s| s.current_agent.display_name().to_string())
+                        .unwrap_or_default();
+                    self.tab2_state.set_awaiting_response(&task_id, agent_name);
+                    vec![]
+                } else {
+                    // Parsed question: the session already completed, so the engine
+                    // must create a new session to continue the workflow.
+                    self.workflow_engine.process(AppMessage::HumanAnswered {
+                        task_id: task_id.clone(),
+                        question_index,
+                        answer,
+                    })
+                };
                 // Rebuild answer textareas so the answered question's textarea is removed.
                 if let Some(task) = self.task_store.get(&task_id) {
                     let task = task.clone();
                     self.questions_state.sync_answer_inputs(&task);
                 }
-                let mut msgs = self.workflow_engine.process(AppMessage::HumanAnswered {
-                    task_id: task_id.clone(),
-                    question_index,
-                    answer,
-                });
                 let next_agent = self
                     .workflow_engine
                     .state(&task_id)
@@ -1504,6 +1519,9 @@ impl App {
                         agent.display_name()
                     ),
                 );
+                // Stop the idle timer while the human is answering; clear thinking indicator.
+                self.tab2_state.clear_awaiting(&task_id);
+                self.tab2_state.clear_thinking(&task_id);
                 let mut msgs = self
                     .workflow_engine
                     .process(AppMessage::AgentAskedQuestion {
@@ -2543,6 +2561,144 @@ mod tests {
             task.questions[0].answer,
             Some("Minimal scope.".to_string()),
             "question.answer should be recorded after HumanAnswered"
+        );
+    }
+
+    /// Verifies that HumanAnswered with an opencode_request_id does NOT emit CreateSession
+    /// and leaves the workflow phase as Running.
+    #[test]
+    fn test_human_answered_opencode_question_resumes_not_creates() {
+        use crate::tasks::models::{Question, Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: None,
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: vec![Question {
+                agent: AgentKind::Intake,
+                text: "What is the scope?".to_string(),
+                answer: None,
+                opencode_request_id: Some("req-opencode-1".to_string()),
+            }],
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+        app.workflow_engine.process(AppMessage::StartTask {
+            task_id: task_id.clone(),
+        });
+        app.workflow_engine.process(AppMessage::AgentAskedQuestion {
+            task_id: task_id.clone(),
+            agent: AgentKind::Intake,
+            question: "What is the scope?".to_string(),
+        });
+
+        let msgs = app.handle_message(AppMessage::HumanAnswered {
+            task_id: task_id.clone(),
+            question_index: 0,
+            answer: "Full scope.".to_string(),
+        });
+
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, AppMessage::CreateSession { .. })),
+            "OpenCode-native answer must NOT emit CreateSession, got: {msgs:?}"
+        );
+        let state = app.workflow_engine.state(&task_id).expect("state");
+        assert_eq!(
+            state.phase,
+            WorkflowPhase::Running,
+            "workflow phase must be Running after OpenCode-native answer"
+        );
+    }
+
+    /// Verifies that HumanAnswered without an opencode_request_id DOES emit CreateSession
+    /// (parsed-question path: session already completed, engine must create a new one).
+    #[test]
+    fn test_human_answered_parsed_question_creates_session() {
+        use crate::tasks::models::{Question, Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: None,
+            description: "desc".to_string(),
+            starting_prompt: None,
+            questions: vec![Question {
+                agent: AgentKind::Intake,
+                text: "What is the scope?".to_string(),
+                answer: None,
+                opencode_request_id: None,
+            }],
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        let task_id = task.id.clone();
+        app.task_store.insert(task);
+        app.workflow_engine.process(AppMessage::StartTask {
+            task_id: task_id.clone(),
+        });
+        app.workflow_engine.process(AppMessage::AgentAskedQuestion {
+            task_id: task_id.clone(),
+            agent: AgentKind::Intake,
+            question: "What is the scope?".to_string(),
+        });
+
+        let msgs = app.handle_message(AppMessage::HumanAnswered {
+            task_id: task_id.clone(),
+            question_index: 0,
+            answer: "Full scope.".to_string(),
+        });
+
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AppMessage::CreateSession { .. })),
+            "parsed-question answer must emit CreateSession, got: {msgs:?}"
+        );
+    }
+
+    /// Verifies that OpenCodeQuestionAsked clears prompt_sent_at so check_timeouts returns empty.
+    #[test]
+    fn test_opencode_question_clears_awaiting() {
+        use std::time::Duration;
+
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        // Simulate a prompt being sent (starts idle timer).
+        app.tab2_state
+            .set_awaiting_response(&task_id, "Intake Agent".to_string());
+
+        // A question arrives -- should clear the timer.
+        app.handle_message(AppMessage::OpenCodeQuestionAsked {
+            task_id: task_id.clone(),
+            request_id: "req-1".to_string(),
+            question: "What is the scope?".to_string(),
+        });
+
+        // The timer must be cleared: check_timeouts with zero duration returns empty.
+        let timed_out = app.tab2_state.check_timeouts(Duration::ZERO);
+        assert!(
+            timed_out.is_empty(),
+            "check_timeouts should be empty after OpenCodeQuestionAsked clears the timer"
         );
     }
 
