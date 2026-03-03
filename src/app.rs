@@ -732,6 +732,7 @@ impl App {
             AppMessage::HumanApprovedCommit {
                 task_id,
                 commit_message,
+                file_paths,
             } => {
                 let first_line = commit_message.lines().next().unwrap_or("").to_string();
                 self.tab2_state
@@ -781,12 +782,29 @@ impl App {
                         })
                         .await;
 
+                    // Build a targeted `git add` from the known changed files so that
+                    // unrelated working-tree files (e.g. .env, editor temp files) are
+                    // not staged. Fall back to `git add -A` only when the diff snapshot
+                    // was unavailable (file_paths is empty).
+                    let git_add_cmd = if file_paths.is_empty() {
+                        tracing::warn!(
+                            "No file paths in commit dialog; falling back to git add -A"
+                        );
+                        "git add -A".to_string()
+                    } else {
+                        let quoted: Vec<String> = file_paths
+                            .iter()
+                            .map(|p| format!("'{}'", p.replace('\'', "'\\''")))
+                            .collect();
+                        format!("git add -- {}", quoted.join(" "))
+                    };
+
                     // Build the commit prompt. Using single quotes around the message
                     // ensures the agent passes it verbatim to git.
                     let escaped = commit_message.replace('\'', "'\\''");
                     let prompt = format!(
-                        "Run the following git commands exactly: git add -A && git commit -m '{}'. Report only whether the commit succeeded or failed.",
-                        escaped
+                        "Run the following git commands exactly: {} && git commit -m '{}'. Report only whether the commit succeeded or failed.",
+                        git_add_cmd, escaped
                     );
                     if let Err(e) = client
                         .send_prompt_async(&session.id, None, default_model.as_ref(), &prompt)
@@ -812,19 +830,19 @@ impl App {
             }
 
             AppMessage::CommitCompleted { task_id } => {
-                self.review_state
-                    .push_banner(&task_id, "Review approved".to_string());
-                let mut msgs = self
-                    .workflow_engine
+                self.tab2_state.push_banner(
+                    &task_id,
+                    "[Commit] Changes committed successfully".to_string(),
+                );
+                // Transition the workflow engine to Completed.
+                self.workflow_engine
                     .process(AppMessage::HumanApprovedReview {
                         task_id: task_id.clone(),
                     });
                 if let Some(task) = self.task_store.get_mut(&task_id) {
                     task.set_status(TaskStatus::Completed, AgentKind::Human);
-                    task.assign_to(Some(AgentKind::Human), AgentKind::Human);
                 }
-                msgs.push(AppMessage::TaskUpdated { task_id });
-                msgs
+                vec![AppMessage::TaskUpdated { task_id }]
             }
 
             AppMessage::CommitFailed { task_id, error } => {
@@ -1546,6 +1564,31 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verifies that single quotes in commit messages are shell-escaped correctly.
+    ///
+    /// The escaping strategy (`replace('\'', "'\\''")`) is the standard POSIX trick for
+    /// embedding a literal single-quote inside a single-quoted shell string:
+    ///   `it's` → `it'\''s`
+    /// which the shell interprets as: `'it'` + `\'` + `'s'` = `it's`.
+    #[test]
+    fn test_commit_message_single_quote_escaping() {
+        let raw = "fix: it's broken";
+        let escaped = raw.replace('\'', "'\\''");
+        assert_eq!(
+            escaped, "fix: it'\\''s broken",
+            "single quote should be escaped to '\\''"
+        );
+
+        // A message with no single quotes should pass through unchanged.
+        let plain = "feat: add feature";
+        assert_eq!(plain.replace('\'', "'\\''"), "feat: add feature");
+
+        // Multiple single quotes are each escaped independently.
+        let multi = "fix: can't won't don't";
+        let escaped_multi = multi.replace('\'', "'\\''");
+        assert_eq!(escaped_multi, "fix: can'\\''t won'\\''t don'\\''t");
+    }
 
     #[test]
     fn test_truncate_str_ascii() {

@@ -413,7 +413,7 @@ fn render_quit_confirm_dialog(frame: &mut Frame, area: Rect) {
 ///
 /// Shows the list of changed files (capped at 10 visible rows) and an editable
 /// textarea pre-filled with the proposed commit message.
-/// `[Enter]` confirms; `[Esc]` cancels.
+/// `[Alt+Enter]` confirms; `[Enter]` inserts a newline; `[Esc]` cancels.
 fn render_commit_dialog(frame: &mut Frame, area: Rect, dialog: &CommitDialogState) {
     let dialog_width = 70u16;
     // Layout: 2 borders + file list (capped at 10) + 1 spacer + 6 editor rows + 1 hint = varies.
@@ -471,7 +471,7 @@ fn render_commit_dialog(frame: &mut Frame, area: Rect, dialog: &CommitDialogStat
 
     // Render hint line.
     frame.render_widget(
-        Paragraph::new(Line::from("[Enter] commit | [Esc] cancel")),
+        Paragraph::new(Line::from("[Alt+Enter] commit | [Esc] cancel")),
         hint_area,
     );
 }
@@ -746,35 +746,6 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             }
         }
 
-        // When the commit dialog is open, intercept all input.
-        if app.commit_dialog.is_some() {
-            match key.code {
-                KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
-                    let dialog = app.commit_dialog.take().unwrap();
-                    let message = dialog.editor.lines().join("\n");
-                    if !message.trim().is_empty() {
-                        return Some(AppMessage::HumanApprovedCommit {
-                            task_id: dialog.task_id,
-                            commit_message: message,
-                        });
-                    }
-                    return None;
-                }
-                KeyCode::Esc => {
-                    app.commit_dialog = None;
-                    return None;
-                }
-                _ => {
-                    app.commit_dialog
-                        .as_mut()
-                        .unwrap()
-                        .editor
-                        .input(Input::from(key));
-                    return None;
-                }
-            }
-        }
-
         // When the status picker is open, intercept all input.
         if let Some(selected_idx) = app.show_status_picker {
             match key.code {
@@ -907,6 +878,50 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             }
             // Consume all other keys while permission dialog is active.
             return None;
+        }
+
+        // When the commit dialog is open, intercept all input.
+        // This block runs AFTER the permission dialog check so that a permission
+        // request arriving while the commit dialog is open is handled correctly.
+        if app.commit_dialog.is_some() {
+            match key.code {
+                // Alt+Enter confirms (mirrors steering textarea convention).
+                // Bare Enter falls through to the textarea to insert a newline.
+                KeyCode::Enter if key.modifiers == KeyModifiers::ALT => {
+                    // Check for empty message without consuming the dialog.
+                    let message = app
+                        .commit_dialog
+                        .as_ref()
+                        .unwrap()
+                        .editor
+                        .lines()
+                        .join("\n");
+                    if message.trim().is_empty() {
+                        // Keep dialog open; user must provide a message.
+                        return None;
+                    }
+                    let dialog = app.commit_dialog.take().unwrap();
+                    let file_paths: Vec<String> =
+                        dialog.file_summary.iter().map(|(p, _)| p.clone()).collect();
+                    return Some(AppMessage::HumanApprovedCommit {
+                        task_id: dialog.task_id,
+                        commit_message: message,
+                        file_paths,
+                    });
+                }
+                KeyCode::Esc => {
+                    app.commit_dialog = None;
+                    return None;
+                }
+                _ => {
+                    app.commit_dialog
+                        .as_mut()
+                        .unwrap()
+                        .editor
+                        .input(Input::from(key));
+                    return None;
+                }
+            }
         }
 
         // Tab 0 (Details): textarea focus and task actions.
@@ -3615,7 +3630,7 @@ mod tests {
         );
     }
 
-    /// Verifies that pressing `[Enter]` in the commit dialog emits `HumanApprovedCommit`.
+    /// Verifies that pressing `[Alt+Enter]` in the commit dialog emits `HumanApprovedCommit`.
     #[test]
     fn test_commit_dialog_enter_emits_approved_commit() {
         let mut app = App::test_default();
@@ -3629,15 +3644,68 @@ mod tests {
             .editor
             .insert_str("feat: my commit");
 
-        let result = handle_input(key_event(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+        let result = handle_input(key_event(KeyCode::Enter, KeyModifiers::ALT), &mut app);
 
         assert!(
             matches!(result, Some(AppMessage::HumanApprovedCommit { ref commit_message, .. }) if commit_message.contains("feat: my commit")),
-            "Enter in commit dialog should emit HumanApprovedCommit, got: {result:?}"
+            "Alt+Enter in commit dialog should emit HumanApprovedCommit, got: {result:?}"
         );
         assert!(
             app.commit_dialog.is_none(),
-            "commit_dialog should be closed after Enter"
+            "commit_dialog should be closed after Alt+Enter"
+        );
+    }
+
+    /// Verifies that bare `[Enter]` inserts a newline rather than confirming the dialog.
+    #[test]
+    fn test_commit_dialog_bare_enter_inserts_newline() {
+        let mut app = App::test_default();
+        let task_id = crate::tasks::TaskId::from_path("tasks/1.1.md");
+        app.open_commit_dialog(&task_id);
+
+        app.commit_dialog
+            .as_mut()
+            .unwrap()
+            .editor
+            .insert_str("line one");
+
+        let result = handle_input(key_event(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+
+        assert!(
+            result.is_none(),
+            "bare Enter should return None, not confirm"
+        );
+        assert!(
+            app.commit_dialog.is_some(),
+            "dialog should remain open after bare Enter"
+        );
+        let lines = app.commit_dialog.as_ref().unwrap().editor.lines();
+        assert!(
+            lines.len() >= 2,
+            "editor should have at least 2 lines after bare Enter, got {lines:?}"
+        );
+    }
+
+    /// Verifies that `[Alt+Enter]` with an empty editor keeps the dialog open.
+    #[test]
+    fn test_commit_dialog_empty_message_keeps_open() {
+        let mut app = App::test_default();
+        let task_id = crate::tasks::TaskId::from_path("tasks/1.1.md");
+        app.open_commit_dialog(&task_id);
+
+        // The dialog pre-fills the editor; replace it with a blank one.
+        app.commit_dialog.as_mut().unwrap().editor = tui_textarea::TextArea::default();
+
+        // Alt+Enter on an empty message should NOT confirm.
+        let result = handle_input(key_event(KeyCode::Enter, KeyModifiers::ALT), &mut app);
+
+        assert!(
+            result.is_none(),
+            "Alt+Enter on empty message should return None"
+        );
+        assert!(
+            app.commit_dialog.is_some(),
+            "dialog should remain open when message is empty"
         );
     }
 
