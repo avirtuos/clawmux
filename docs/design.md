@@ -44,7 +44,7 @@ OpenCode (`anomalyco/opencode`) is an open-source AI coding agent with a client-
 
 ---
 
-## Architecture: Event-Driven OpenCode Client
+## Architecture: Backend-Abstracted Event-Driven Agent Client
 
 ### High-Level Overview
 
@@ -58,18 +58,60 @@ OpenCode (`anomalyco/opencode`) is an open-source AI coding agent with a client-
               +--------------+--------------+
               |              |              |
     +---------v--+  +--------v-----+  +----v----------+
-    |  TUI Layer |  |  Workflow    |  |  OpenCode     |
-    |  (ratatui) |  |  Engine     |  |  Client       |
+    |  TUI Layer |  |  Workflow    |  |  AgentBackend |
+    |  (ratatui) |  |  Engine     |  |  (trait)      |
     +-----+------+  +------+------+  +-------+-------+
           |                |                  |
-          |         +------v------+    +------v------+
-          |         |  Task Store |    |  opencode   |
-          |         +-------------+    |  serve      |
-          |                            +-------------+
+          |         +------v------+    +------v------+  +------v------+
+          |         |  Task Store |    |  OpenCode   |  |   Kiro-CLI  |
+          |         +-------------+    |  (HTTP+SSE) |  |  (ACP/RPC)  |
+          |                            +-------------+  +-------------+
           +------- async mpsc channels -------+
 ```
 
-ClawdMux remains a single Rust binary with internal async subsystems communicating via `mpsc` channels. The key change is the **Session Manager is replaced by an OpenCode Client** that communicates with an opencode server over HTTP + SSE.
+ClawdMux is a single Rust binary with internal async subsystems communicating via `mpsc` channels. The **AgentBackend trait** decouples the application from any specific AI coding assistant, enabling pluggable backends. Two backends are implemented:
+
+- **OpenCodeBackend** (default): communicates with an opencode server over HTTP REST + Server-Sent Events (SSE).
+- **KiroBackend**: communicates with kiro-cli via the Agent Client Protocol (ACP) -- JSON-RPC 2.0 over stdin/stdout, one process per agent stage.
+
+Backend selection is configured in `.clawdmux/config.toml`:
+```toml
+backend = "opencode"  # or "kiro"
+
+[kiro]
+# binary = "/usr/local/bin/kiro"  # optional path, defaults to PATH lookup
+```
+
+### KiroBackend: Agent Client Protocol (ACP)
+
+When `backend = "kiro"` is configured, ClawdMux communicates with kiro-cli via ACP
+(JSON-RPC 2.0 over newline-delimited stdin/stdout). One fresh kiro-cli process is
+spawned per agent stage to avoid context compaction across pipeline stages.
+
+**Process lifecycle per agent stage:**
+1. Spawn `kiro --acp --agent clawdmux-<stage>` with piped stdin/stdout
+2. Send `initialize` request; receive capabilities; send `initialized` notification
+3. Send `session/new`; receive `sessionId`
+4. Send `session/prompt` notification with task prompt
+5. Event loop translates ACP notifications to `AppMessage` variants
+6. On `turn_end`, process exits; next stage spawns a fresh process
+
+**ACP notifications handled:**
+- `agent_message_chunk` -> `AppMessage::StreamingUpdate` (accumulated text)
+- `tool_call` / `tool_call_update` -> `AppMessage::ToolActivity`
+- `turn_end` -> `AppMessage::SessionCompleted` or `SessionError`
+- `session/error` -> `AppMessage::SessionError`
+- `session/request_permission` (bidirectional) -> `AppMessage::PermissionAsked`
+
+**Kiro agent configs** are scaffolded into `.kiro/agents/clawdmux-*.json` during
+`clawdmux init`. Tool permissions are scoped per agent role:
+- Read-only (Intake, Design, SecurityReview): `["read", "search", "think"]`
+- Read + execute (Planning, CodeQuality, CodeReview): `["read", "execute", "search", "think"]`
+- Full access (Implementation): `["read", "edit", "delete", "execute", "search", "think"]`
+
+**Diff support**: Run `git diff HEAD` after `SessionCompleted` (no ACP diff endpoint).
+
+**Git commits**: Performed directly via `git add` + `git commit` (no agent needed).
 
 ### OpenCode Server Lifecycle
 

@@ -66,6 +66,10 @@ pub enum ClawdMuxError {
     /// An internal error that does not fit another category.
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// An error from the kiro-cli backend (process lifecycle, protocol, etc.).
+    #[error("Kiro error: {0}")]
+    Kiro(String),
 }
 
 /// Convenience alias for `Result<T, ClawdMuxError>`.
@@ -151,6 +155,20 @@ mod tests {
                 "display for {input:?} should contain input string, got: {display}"
             );
         }
+    }
+
+    #[test]
+    fn test_kiro_error_display() {
+        let err = ClawdMuxError::Kiro("process exited unexpectedly".to_string());
+        let display = err.to_string();
+        assert!(
+            display.contains("process exited unexpectedly"),
+            "Kiro error display should contain message: {display}"
+        );
+        assert!(
+            matches!(err, ClawdMuxError::Kiro(_)),
+            "expected Kiro variant"
+        );
     }
 
     #[test]

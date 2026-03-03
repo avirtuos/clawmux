@@ -28,6 +28,28 @@ pub enum ServerMode {
     External,
 }
 
+/// Which agent backend ClawdMux uses for session operations.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendKind {
+    /// Use the OpenCode HTTP REST + SSE backend (default).
+    #[default]
+    OpenCode,
+    /// Use the kiro-cli ACP (JSON-RPC 2.0 over stdin/stdout) backend.
+    Kiro,
+}
+
+/// Configuration for the kiro-cli backend.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct KiroConfig {
+    /// Optional path to the kiro binary.
+    ///
+    /// When `None`, ClawdMux searches `PATH` for `kiro`.
+    pub binary: Option<String>,
+}
+
 /// Project-level opencode connection settings from `.clawdmux/config.toml`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -78,7 +100,11 @@ impl Default for WorkflowConfig {
 #[derive(Debug, Deserialize, Default)]
 struct ProjectConfigFile {
     #[serde(default)]
+    backend: BackendKind,
+    #[serde(default)]
     opencode: OpenCodeConfig,
+    #[serde(default)]
+    kiro: KiroConfig,
     #[serde(default)]
     workflow: WorkflowConfig,
 }
@@ -91,8 +117,12 @@ struct ProjectConfigFile {
 pub struct AppConfig {
     /// Global LLM provider credentials.
     pub global: GlobalConfig,
+    /// Which agent backend to use for session operations.
+    pub backend: BackendKind,
     /// Opencode server connection settings for the current project.
     pub opencode: OpenCodeConfig,
+    /// Kiro-cli backend settings for the current project.
+    pub kiro: KiroConfig,
     /// Workflow behavior settings.
     pub workflow: WorkflowConfig,
 }
@@ -163,24 +193,32 @@ impl AppConfig {
         // --- Project config ---
         let project_config_path = project_root.join(".clawdmux").join("config.toml");
 
-        let (opencode, workflow) = match std::fs::read_to_string(&project_config_path) {
-            Ok(contents) => {
-                let file: ProjectConfigFile = toml::from_str(&contents)?;
-                (file.opencode, file.workflow)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::info!(
-                    path = %project_config_path.display(),
-                    "project config not found, using defaults"
-                );
-                (OpenCodeConfig::default(), WorkflowConfig::default())
-            }
-            Err(e) => return Err(ClawdMuxError::Io(e)),
-        };
+        let (backend, opencode, kiro, workflow) =
+            match std::fs::read_to_string(&project_config_path) {
+                Ok(contents) => {
+                    let file: ProjectConfigFile = toml::from_str(&contents)?;
+                    (file.backend, file.opencode, file.kiro, file.workflow)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::info!(
+                        path = %project_config_path.display(),
+                        "project config not found, using defaults"
+                    );
+                    (
+                        BackendKind::default(),
+                        OpenCodeConfig::default(),
+                        KiroConfig::default(),
+                        WorkflowConfig::default(),
+                    )
+                }
+                Err(e) => return Err(ClawdMuxError::Io(e)),
+            };
 
         Ok(AppConfig {
             global,
+            backend,
             opencode,
+            kiro,
             workflow,
         })
     }
@@ -300,12 +338,14 @@ password = "mypassword"
                 provider: ProviderSection::default(),
                 opencode_password: global_pw.map(str::to_string),
             },
+            backend: BackendKind::default(),
             opencode: OpenCodeConfig {
                 mode: ServerMode::Auto,
                 hostname: "127.0.0.1".to_string(),
                 port: 4096,
                 password: project_pw.map(str::to_string),
             },
+            kiro: KiroConfig::default(),
             workflow: WorkflowConfig::default(),
         }
     }
@@ -357,5 +397,84 @@ password = "mypassword"
     fn test_has_explicit_password_true_when_global_set() {
         let config = make_app_config(Some("global-pw"), None);
         assert!(config.has_explicit_password());
+    }
+
+    #[test]
+    fn test_backend_kind_default_is_opencode() {
+        assert_eq!(BackendKind::default(), BackendKind::OpenCode);
+    }
+
+    #[test]
+    fn test_backend_kind_serde() {
+        #[derive(Debug, Deserialize, Serialize, PartialEq)]
+        struct Wrapper {
+            #[serde(default)]
+            backend: BackendKind,
+        }
+
+        let opencode_toml = r#"backend = "opencode""#;
+        let kiro_toml = r#"backend = "kiro""#;
+        let empty_toml = "";
+
+        let w: Wrapper = toml::from_str(opencode_toml).unwrap();
+        assert_eq!(w.backend, BackendKind::OpenCode);
+
+        let w: Wrapper = toml::from_str(kiro_toml).unwrap();
+        assert_eq!(w.backend, BackendKind::Kiro);
+
+        // Empty TOML falls back to default (opencode) via #[serde(default)].
+        let w: Wrapper = toml::from_str(empty_toml).unwrap();
+        assert_eq!(w.backend, BackendKind::OpenCode);
+
+        // Round-trip serialization.
+        let serialized = toml::to_string_pretty(&Wrapper {
+            backend: BackendKind::Kiro,
+        })
+        .unwrap();
+        assert!(serialized.contains("kiro"), "serialized: {serialized}");
+    }
+
+    #[test]
+    fn test_kiro_config_defaults() {
+        let config: KiroConfig = toml::from_str("").unwrap();
+        assert!(config.binary.is_none());
+    }
+
+    #[test]
+    fn test_kiro_config_binary() {
+        let toml = r#"binary = "/usr/local/bin/kiro""#;
+        let config: KiroConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.binary.as_deref(), Some("/usr/local/bin/kiro"));
+    }
+
+    #[test]
+    fn test_app_config_includes_backend_and_kiro_defaults() {
+        let global_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let global_path = global_dir.path().join("config.toml");
+        let config = AppConfig::load_from(&global_path, project_dir.path()).unwrap();
+        assert_eq!(config.backend, BackendKind::OpenCode);
+        assert!(config.kiro.binary.is_none());
+    }
+
+    #[test]
+    fn test_app_config_kiro_backend_from_project_config() {
+        let global_dir = TempDir::new().unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let clawdmux_dir = project_dir.path().join(".clawdmux");
+        std::fs::create_dir_all(&clawdmux_dir).unwrap();
+        std::fs::write(
+            clawdmux_dir.join("config.toml"),
+            r#"backend = "kiro"
+
+[kiro]
+binary = "/opt/kiro/bin/kiro"
+"#,
+        )
+        .unwrap();
+        let global_path = global_dir.path().join("config.toml");
+        let config = AppConfig::load_from(&global_path, project_dir.path()).unwrap();
+        assert_eq!(config.backend, BackendKind::Kiro);
+        assert_eq!(config.kiro.binary.as_deref(), Some("/opt/kiro/bin/kiro"));
     }
 }
