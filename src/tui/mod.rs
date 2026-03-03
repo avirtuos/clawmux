@@ -3555,28 +3555,44 @@ mod tests {
         );
     }
 
-    /// `push_permission` resets `permission_scroll` to 0 so a new request always starts
-    /// at the top of the viewport.
+    /// `push_permission` resets `permission_scroll` to 0 only on the empty-to-non-empty
+    /// transition so the first dialog starts at the top. A second push while a dialog is
+    /// already visible must not disturb the user's current scroll position.
     #[test]
     fn test_push_permission_resets_scroll() {
         use crate::opencode::types::PermissionRequest;
 
-        let mut app = app_with_pending_permission();
-        app.tab2_state.permission_scroll = 5;
-
+        let mut app = App::test_default();
         let id = crate::tasks::TaskId::from_path("tasks/1.1.md");
-        let new_request = PermissionRequest {
+
+        // First push onto an empty queue: scroll should reset to 0.
+        app.tab2_state.permission_scroll = 5;
+        let req1 = PermissionRequest {
+            id: "perm-1".to_string(),
+            session_id: "sess-1".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["cargo build".to_string()],
+            always: vec![],
+        };
+        app.tab2_state.push_permission(id.clone(), req1);
+        assert_eq!(
+            app.tab2_state.permission_scroll, 0,
+            "first push should reset scroll to 0"
+        );
+
+        // Second push onto a non-empty queue: scroll must not be disturbed.
+        app.tab2_state.permission_scroll = 3;
+        let req2 = PermissionRequest {
             id: "perm-2".to_string(),
             session_id: "sess-1".to_string(),
             permission: "bash".to_string(),
             patterns: vec!["cargo test".to_string()],
             always: vec![],
         };
-        app.tab2_state.push_permission(id, new_request);
-
+        app.tab2_state.push_permission(id, req2);
         assert_eq!(
-            app.tab2_state.permission_scroll, 0,
-            "push_permission should reset scroll to 0"
+            app.tab2_state.permission_scroll, 3,
+            "second push must not reset scroll while a dialog is already showing"
         );
     }
 
