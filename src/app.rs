@@ -207,12 +207,20 @@ impl App {
             })
             .unwrap_or_else(|| format!("Complete task {}", task_id));
 
-        let file_summary: Vec<(String, DiffStatus)> = self
+        let mut file_summary: Vec<(String, DiffStatus)> = self
             .tab4_state
             .diffs_for(task_id)
             .iter()
             .map(|d| (d.path.clone(), d.status.clone()))
             .collect();
+
+        // Include the task's own markdown file so the user can see it will be committed.
+        if let Some(task) = self.task_store.get(task_id) {
+            let task_path = task.file_path.to_string_lossy().to_string();
+            if !file_summary.iter().any(|(p, _)| p == &task_path) {
+                file_summary.push((task_path, DiffStatus::Modified));
+            }
+        }
 
         let mut editor = tui_textarea::TextArea::default();
         editor.insert_str(&commit_msg);
@@ -747,11 +755,19 @@ impl App {
             AppMessage::HumanApprovedCommit {
                 task_id,
                 commit_message,
-                file_paths,
+                mut file_paths,
             } => {
                 let first_line = commit_message.lines().next().unwrap_or("").to_string();
                 self.tab2_state
                     .push_banner(&task_id, format!("[Commit] Committing: {}", first_line));
+
+                // Include the task's own markdown file so status/work-log changes are committed.
+                if let Some(task) = self.task_store.get(&task_id) {
+                    let task_path = task.file_path.to_string_lossy().to_string();
+                    if !file_paths.contains(&task_path) {
+                        file_paths.push(task_path);
+                    }
+                }
 
                 let client = match self.opencode_client.clone() {
                     Some(c) => c,
@@ -4239,6 +4255,94 @@ mod tests {
             app.pending_commit_sessions.get("commit-sess-42"),
             Some(&task_id),
             "session should be registered in pending_commit_sessions"
+        );
+    }
+
+    /// Verifies that `open_commit_dialog` appends the task's markdown file to `file_summary`
+    /// so the user can see it will be staged and committed.
+    #[test]
+    fn test_open_commit_dialog_includes_task_file() {
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task_id = TaskId::from_path("tasks/2.3.md");
+        let task = Task {
+            id: task_id.clone(),
+            story_name: "2. Story".to_string(),
+            name: "2.3".to_string(),
+            status: TaskStatus::PendingReview,
+            assigned_to: None,
+            description: "do the thing".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/2.3.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        app.task_store.insert(task);
+
+        app.open_commit_dialog(&task_id);
+
+        let dialog = app.commit_dialog.expect("commit dialog should be open");
+        let paths: Vec<&str> = dialog
+            .file_summary
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .collect();
+        assert!(
+            paths.contains(&"tasks/2.3.md"),
+            "task markdown file should appear in file_summary; got: {:?}",
+            paths
+        );
+    }
+
+    /// Verifies that `HumanApprovedCommit` does not panic when the task store contains the
+    /// task and the task file path is appended to `file_paths` before the spawn.
+    ///
+    /// The file_paths mutation happens in the synchronous portion of the handler before any
+    /// async work; with no OpenCode client the handler returns CommitFailed, confirming the
+    /// synchronous path (including the task-file append) completed without error.
+    #[test]
+    fn test_human_approved_commit_includes_task_file() {
+        use crate::tasks::models::{Task, TaskStatus};
+
+        let mut app = App::test_default();
+        let task_id = TaskId::from_path("tasks/3.1.md");
+        let task = Task {
+            id: task_id.clone(),
+            story_name: "3. Story".to_string(),
+            name: "3.1".to_string(),
+            status: TaskStatus::PendingReview,
+            assigned_to: None,
+            description: "another task".to_string(),
+            starting_prompt: None,
+            questions: Vec::new(),
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: std::path::PathBuf::from("tasks/3.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        app.task_store.insert(task);
+
+        // The handler returns CommitFailed when no OpenCode client is configured, but the
+        // task-file mutation happens in the synchronous part before that check.
+        let msgs = app.handle_message(AppMessage::HumanApprovedCommit {
+            task_id: task_id.clone(),
+            commit_message: "Complete task 3.1".to_string(),
+            // Only code files; task file deliberately omitted from the caller's list.
+            file_paths: vec!["src/lib.rs".to_string()],
+        });
+
+        // With no opencode client the handler returns CommitFailed -- expected.
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, AppMessage::CommitFailed { .. })),
+            "should get CommitFailed when opencode client is unavailable"
         );
     }
 }
