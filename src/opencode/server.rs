@@ -603,12 +603,14 @@ mod tests {
                 provider: ProviderSection::default(),
                 opencode_password: None,
             },
+            backend: crate::config::BackendKind::default(),
             opencode: OpenCodeConfig {
                 mode,
                 hostname: "127.0.0.1".to_string(),
                 port,
                 password: None,
             },
+            kiro: crate::config::KiroConfig::default(),
             workflow: crate::config::WorkflowConfig::default(),
         }
     }

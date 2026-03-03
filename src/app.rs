@@ -1,18 +1,17 @@
 //! Top-level application state and message dispatcher.
 //!
 //! The `App` struct holds all runtime state and coordinates between subsystems:
-//! the TUI layer, workflow engine, task store, and opencode client.
+//! the TUI layer, workflow engine, task store, and agent backend.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
+use crate::backend::AgentBackend;
 use crate::messages::AppMessage;
 use crate::opencode::events::SessionMap;
 use crate::opencode::types::{DiffStatus, ModelId};
-use crate::opencode::OpenCodeClient;
 use crate::tasks::models::{status_to_index, Question, SuggestedFix, TaskStatus, WorkLogEntry};
 use crate::tasks::{Story, TaskId, TaskStore};
 use crate::tui::tabs::agent_activity::Tab2State;
@@ -81,8 +80,8 @@ pub struct App {
     pub tab4_state: Tab4State,
     /// UI state for Tab 6 (Review Discussion): per-task review timeline.
     pub review_state: ReviewTabState,
-    /// Shared HTTP client for async opencode session operations.
-    pub opencode_client: Option<Arc<OpenCodeClient>>,
+    /// Agent backend for all session lifecycle operations.
+    pub backend: Box<dyn AgentBackend>,
     /// Shared map from session ID to (TaskId, AgentKind), used by EventStreamConsumer.
     pub session_map: SessionMap,
     /// Sender used by tokio::spawn callbacks to post results back to the main loop.
@@ -113,7 +112,7 @@ impl App {
     /// # Arguments
     ///
     /// * `task_store` - The in-memory task store loaded from disk.
-    /// * `opencode_client` - Optional shared HTTP client for opencode session operations.
+    /// * `backend` - Agent backend for all session lifecycle operations.
     /// * `session_map` - Shared map correlating session IDs to tasks and agents.
     /// * `async_tx` - Channel sender for routing async task results back to the event loop.
     /// * `approval_gate` - When `true`, pause and require human approval between agents.
@@ -121,7 +120,7 @@ impl App {
     /// * `default_model` - Fallback model for sessions without a dedicated agent.
     pub fn new(
         task_store: TaskStore,
-        opencode_client: Option<Arc<OpenCodeClient>>,
+        backend: Box<dyn AgentBackend>,
         session_map: SessionMap,
         async_tx: mpsc::Sender<AppMessage>,
         approval_gate: bool,
@@ -148,7 +147,7 @@ impl App {
             tab3_state: Tab3State::new(),
             tab4_state: Tab4State::new(),
             review_state: ReviewTabState::new(),
-            opencode_client,
+            backend,
             session_map,
             async_tx,
             pending_messages: Vec::new(),
@@ -241,8 +240,8 @@ impl App {
 
     /// Creates a default [`App`] for use in unit tests.
     ///
-    /// Wires up a local mpsc channel and an empty session map so callers
-    /// do not need to repeat the boilerplate.
+    /// Wires up a local mpsc channel, an empty session map, and a [`NullBackend`]
+    /// so callers do not need to repeat the boilerplate.
     #[cfg(test)]
     pub fn test_default() -> Self {
         use std::sync::Arc;
@@ -251,7 +250,7 @@ impl App {
         let session_map = Arc::new(RwLock::new(HashMap::new()));
         App::new(
             TaskStore::new(),
-            None,
+            Box::new(crate::backend::NullBackend),
             session_map,
             tx,
             false,
@@ -335,65 +334,8 @@ impl App {
                         .collect();
 
                     if !sessions_to_check.is_empty() {
-                        if let Some(client) = self.opencode_client.clone() {
-                            let async_tx = self.async_tx.clone();
-                            tokio::spawn(async move {
-                                let statuses = match client.get_session_statuses().await {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        tracing::warn!("Session status poll failed: {}", e);
-                                        return;
-                                    }
-                                };
-                                for (task_id, session_id) in sessions_to_check {
-                                    let is_idle = matches!(
-                                        statuses.get(&session_id),
-                                        Some(crate::opencode::types::SessionStatus::Idle) | None
-                                    );
-                                    if !is_idle {
-                                        continue;
-                                    }
-                                    // Session idle: fetch messages for error details.
-                                    let error = match client.get_session_messages(&session_id).await {
-                                        Ok(messages) => messages
-                                            .iter()
-                                            .rev()
-                                            .find_map(|entry| {
-                                                if entry.info.role
-                                                    == crate::opencode::types::MessageRole::Assistant
-                                                {
-                                                    if let Some(ref err) = entry.info.error {
-                                                        return err.message.clone();
-                                                    }
-                                                    if entry.info.finish.as_deref() == Some("error") {
-                                                        return Some(
-                                                            "Session finished with error status"
-                                                                .to_string(),
-                                                        );
-                                                    }
-                                                }
-                                                None
-                                            })
-                                            .unwrap_or_else(|| {
-                                                "Session was idle after prompt -- OpenCode may have crashed silently".to_string()
-                                            }),
-                                        Err(e) => {
-                                            format!(
-                                                "Session was idle after prompt (message fetch failed: {})",
-                                                e
-                                            )
-                                        }
-                                    };
-                                    let _ = async_tx
-                                        .send(AppMessage::VerifySessionIdle {
-                                            task_id,
-                                            session_id,
-                                            error,
-                                        })
-                                        .await;
-                                }
-                            });
-                        }
+                        self.backend
+                            .check_session_statuses(sessions_to_check, self.async_tx.clone());
                     }
                 }
                 msgs
@@ -645,55 +587,25 @@ impl App {
                 } else {
                     None
                 };
-                // Branch on whether this is an OpenCode-native question (has a request ID)
-                // or a parsed question extracted from agent output.
-                let mut msgs = if let Some(req_id) = opencode_request_id {
-                    // OpenCode-native: the original session is already resumed via
-                    // reply_question. Set phase to Running without creating a new session.
-                    if let Some(client) = self.opencode_client.clone() {
-                        let async_tx = self.async_tx.clone();
-                        let answer_clone = answer.clone();
-                        let task_id_clone = task_id.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = client.reply_question(&req_id, &answer_clone).await {
-                                tracing::warn!(
-                                    "Failed to reply to OpenCode question {}: {}",
-                                    req_id,
-                                    e
-                                );
-                                let _ = async_tx
-                                    .send(AppMessage::SessionError {
-                                        task_id: task_id_clone,
-                                        session_id: String::new(),
-                                        error: format!("Question reply failed: {}", e),
-                                    })
-                                    .await;
-                            }
-                        });
-                    }
-                    self.workflow_engine.resume_from_answer(&task_id);
-                    // Restart the idle timer so the resumed session gets a fresh window.
-                    let agent_name = self
-                        .workflow_engine
-                        .state(&task_id)
-                        .map(|s| s.current_agent.display_name().to_string())
-                        .unwrap_or_default();
-                    self.tab2_state.set_awaiting_response(&task_id, agent_name);
-                    vec![]
-                } else {
-                    // Parsed question: the session already completed, so the engine
-                    // must create a new session to continue the workflow.
-                    self.workflow_engine.process(AppMessage::HumanAnswered {
-                        task_id: task_id.clone(),
-                        question_index,
-                        answer,
-                    })
-                };
+                // If this question came from the backend, send the reply back.
+                if let Some(req_id) = opencode_request_id {
+                    self.backend.reply_question(
+                        task_id.clone(),
+                        req_id,
+                        answer.clone(),
+                        self.async_tx.clone(),
+                    );
+                }
                 // Rebuild answer textareas so the answered question's textarea is removed.
                 if let Some(task) = self.task_store.get(&task_id) {
                     let task = task.clone();
                     self.questions_state.sync_answer_inputs(&task);
                 }
+                let mut msgs = self.workflow_engine.process(AppMessage::HumanAnswered {
+                    task_id: task_id.clone(),
+                    question_index,
+                    answer,
+                });
                 let next_agent = self
                     .workflow_engine
                     .state(&task_id)
@@ -768,20 +680,6 @@ impl App {
                         file_paths.push(task_path);
                     }
                 }
-
-                let client = match self.opencode_client.clone() {
-                    Some(c) => c,
-                    None => {
-                        return vec![AppMessage::CommitFailed {
-                            task_id,
-                            error: "OpenCode client unavailable".to_string(),
-                        }];
-                    }
-                };
-
-                let async_tx = self.async_tx.clone();
-                let session_map = self.session_map.clone();
-                let task_id_clone = task_id.clone();
                 // Use the CodeReview agent's configured model (from its frontmatter) so
                 // the commit session uses the same Sonnet build as the rest of the pipeline,
                 // rather than the global provider default which may not be a valid model id.
@@ -790,72 +688,15 @@ impl App {
                     .get(&AgentKind::CodeReview)
                     .cloned()
                     .or_else(|| self.default_model.clone());
-                tokio::spawn(async move {
-                    let session = match client.create_session().await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let _ = async_tx
-                                .send(AppMessage::CommitFailed {
-                                    task_id: task_id_clone,
-                                    error: format!("Failed to create commit session: {}", e),
-                                })
-                                .await;
-                            return;
-                        }
-                    };
-                    // Register in session_map so EventStreamConsumer routes SSE events.
-                    {
-                        let mut map = session_map.write().await;
-                        map.insert(
-                            session.id.clone(),
-                            (task_id_clone.clone(), AgentKind::Human),
-                        );
-                    }
-                    // Register in pending_commit_sessions via message so the main loop
-                    // routes SessionCompleted to CommitCompleted.
-                    let _ = async_tx
-                        .send(AppMessage::RegisterCommitSession {
-                            task_id: task_id_clone.clone(),
-                            session_id: session.id.clone(),
-                        })
-                        .await;
 
-                    // Build a targeted `git add` from the known changed files so that
-                    // unrelated working-tree files (e.g. .env, editor temp files) are
-                    // not staged. Fall back to `git add -A` only when the diff snapshot
-                    // was unavailable (file_paths is empty).
-                    let git_add_cmd = if file_paths.is_empty() {
-                        tracing::warn!(
-                            "No file paths in commit dialog; falling back to git add -A"
-                        );
-                        "git add -A".to_string()
-                    } else {
-                        let quoted: Vec<String> = file_paths
-                            .iter()
-                            .map(|p| format!("'{}'", p.replace('\'', "'\\''")))
-                            .collect();
-                        format!("git add -- {}", quoted.join(" "))
-                    };
-
-                    // Build the commit prompt. Using single quotes around the message
-                    // ensures the agent passes it verbatim to git.
-                    let escaped = commit_message.replace('\'', "'\\''");
-                    let prompt = format!(
-                        "Run the following git commands exactly: {} && git commit -m '{}'. Report only whether the commit succeeded or failed.",
-                        git_add_cmd, escaped
-                    );
-                    if let Err(e) = client
-                        .send_prompt_async(&session.id, None, commit_model.as_ref(), &prompt)
-                        .await
-                    {
-                        let _ = async_tx
-                            .send(AppMessage::CommitFailed {
-                                task_id: task_id_clone,
-                                error: format!("Failed to send commit prompt: {}", e),
-                            })
-                            .await;
-                    }
-                });
+                self.backend.commit_changes(
+                    task_id,
+                    commit_message,
+                    file_paths,
+                    commit_model,
+                    self.session_map.clone(),
+                    self.async_tx.clone(),
+                );
                 vec![]
             }
 
@@ -1123,36 +964,12 @@ impl App {
                         // Clear the stale session_id so a fresh SessionCreated can register
                         // the replacement session (prevents [p] from targeting a dead session).
                         self.workflow_engine.reset_session_id(&task_id);
-                        if let Some(client) = self.opencode_client.clone() {
-                            let async_tx = self.async_tx.clone();
-                            let session_map = self.session_map.clone();
-                            let task_id_clone = task_id.clone();
-                            tokio::spawn(async move {
-                                match client.create_session().await {
-                                    Ok(new_session) => {
-                                        {
-                                            let mut map = session_map.write().await;
-                                            map.insert(
-                                                new_session.id.clone(),
-                                                (task_id_clone.clone(), agent),
-                                            );
-                                        }
-                                        let _ = async_tx
-                                            .send(AppMessage::SessionCreated {
-                                                task_id: task_id_clone,
-                                                session_id: new_session.id,
-                                            })
-                                            .await;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "Failed to create replacement session after parse failure: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            });
-                        }
+                        self.backend.create_idle_session(
+                            task_id.clone(),
+                            agent,
+                            self.session_map.clone(),
+                            self.async_tx.clone(),
+                        );
                         vec![AppMessage::TaskUpdated { task_id }]
                     }
                 }
@@ -1202,61 +1019,14 @@ impl App {
                 self.tab2_state
                     .push_banner(&task_id, format!("[Prompt] {}", prompt_preview));
 
-                let client = match self.opencode_client.clone() {
-                    Some(c) => c,
-                    None => {
-                        return vec![AppMessage::SessionError {
-                            task_id,
-                            session_id: String::new(),
-                            error: "OpenCode client unavailable".to_string(),
-                        }];
-                    }
-                };
-                let async_tx = self.async_tx.clone();
-                let session_map = self.session_map.clone();
-                tokio::spawn(async move {
-                    let session = match client.create_session().await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let _ = async_tx
-                                .send(AppMessage::SessionError {
-                                    task_id,
-                                    session_id: String::new(),
-                                    error: format!("Failed to create session: {e}"),
-                                })
-                                .await;
-                            return;
-                        }
-                    };
-                    // Populate session map before sending SessionCreated to prevent TOCTOU
-                    // race with EventStreamConsumer.
-                    {
-                        let mut map = session_map.write().await;
-                        map.insert(session.id.clone(), (task_id.clone(), agent));
-                    }
-                    if let Err(e) = client
-                        .send_prompt_async(&session.id, Some(&agent), model.as_ref(), &prompt)
-                        .await
-                    {
-                        session_map.write().await.remove(&session.id);
-                        let _ = async_tx
-                            .send(AppMessage::SessionError {
-                                task_id,
-                                session_id: session.id,
-                                error: format!("Failed to send prompt: {e}"),
-                            })
-                            .await;
-                    } else {
-                        let _ = async_tx
-                            .send(AppMessage::PromptSent {
-                                task_id,
-                                session_id: session.id,
-                            })
-                            .await;
-                    }
-                    // SessionCreated is sent by EventStreamConsumer when it sees the SSE
-                    // event; sending it again here would cause double-processing.
-                });
+                self.backend.create_session(
+                    task_id,
+                    agent,
+                    prompt,
+                    model,
+                    self.session_map.clone(),
+                    self.async_tx.clone(),
+                );
                 vec![]
             }
 
@@ -1265,52 +1035,25 @@ impl App {
                 session_id,
                 prompt,
             } => {
-                let client = match self.opencode_client.clone() {
-                    Some(c) => c,
-                    None => {
-                        return vec![AppMessage::SessionError {
-                            task_id,
-                            session_id,
-                            error: "OpenCode client unavailable".to_string(),
-                        }];
-                    }
-                };
-                let async_tx = self.async_tx.clone();
-                let session_map = self.session_map.clone();
-                let agent_models = self.agent_models.clone();
-                let default_model = self.default_model.clone();
-                tokio::spawn(async move {
-                    let agent = {
-                        let map = session_map.read().await;
-                        map.get(&session_id).map(|(_, a)| *a)
-                    };
-                    let agent = match agent {
-                        Some(a) => a,
-                        None => {
-                            let _ = async_tx
-                                .send(AppMessage::SessionError {
-                                    task_id,
-                                    session_id,
-                                    error: "Session not found in session map".to_string(),
-                                })
-                                .await;
-                            return;
-                        }
-                    };
-                    let model = agent_models.get(&agent).cloned().or(default_model);
-                    if let Err(e) = client
-                        .send_prompt_async(&session_id, Some(&agent), model.as_ref(), &prompt)
-                        .await
-                    {
-                        let _ = async_tx
-                            .send(AppMessage::SessionError {
-                                task_id,
-                                session_id,
-                                error: format!("Failed to send prompt: {}", e),
-                            })
-                            .await;
-                    }
-                });
+                // Look up the current agent from the workflow engine (avoids async session_map read).
+                let agent = self
+                    .workflow_engine
+                    .state(&task_id)
+                    .map(|s| s.current_agent)
+                    .unwrap_or(AgentKind::Intake);
+                let model = self
+                    .agent_models
+                    .get(&agent)
+                    .cloned()
+                    .or_else(|| self.default_model.clone());
+                self.backend.send_prompt(
+                    task_id,
+                    session_id,
+                    agent,
+                    prompt,
+                    model,
+                    self.async_tx.clone(),
+                );
                 vec![]
             }
 
@@ -1354,28 +1097,8 @@ impl App {
                 task_id,
                 session_id,
             } => {
-                let client = match self.opencode_client.clone() {
-                    Some(c) => c,
-                    None => {
-                        return vec![AppMessage::SessionError {
-                            task_id,
-                            session_id,
-                            error: "OpenCode client unavailable".to_string(),
-                        }];
-                    }
-                };
-                let async_tx = self.async_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = client.abort_session(&session_id).await {
-                        let _ = async_tx
-                            .send(AppMessage::SessionError {
-                                task_id,
-                                session_id,
-                                error: format!("Failed to abort session: {}", e),
-                            })
-                            .await;
-                    }
-                });
+                self.backend
+                    .abort_session(task_id, session_id, self.async_tx.clone());
                 vec![]
             }
 
@@ -1463,44 +1186,13 @@ impl App {
                     None
                 };
 
-                // Spawn the API call to resolve the permission asynchronously (requires client).
-                if let Some(client) = self.opencode_client.clone() {
-                    let async_tx = self.async_tx.clone();
-                    let session_id = request.session_id.clone();
-                    let permission_id = request.id.clone();
-                    let task_id_for_spawn = task_id.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = client
-                            .resolve_permission(&session_id, &permission_id, &response)
-                            .await
-                        {
-                            tracing::warn!("Failed to resolve permission {}: {}", permission_id, e);
-                            let _ = async_tx
-                                .send(AppMessage::PermissionAsked {
-                                    task_id: task_id_for_spawn,
-                                    request: crate::opencode::types::PermissionRequest {
-                                        id: permission_id,
-                                        session_id,
-                                        permission: "unknown".to_string(),
-                                        patterns: vec![],
-                                        always: vec![],
-                                    },
-                                })
-                                .await;
-                            return;
-                        }
-                        // Send the steering prompt after successful permission resolution.
-                        if let Some(msg) = send_prompt_msg {
-                            let _ = async_tx.send(msg).await;
-                        }
-                    });
-                } else {
-                    tracing::warn!("Cannot resolve permission: OpenCode client unavailable");
-                    // No client (test/dev mode): dispatch synchronously.
-                    if let Some(msg) = send_prompt_msg {
-                        return vec![msg];
-                    }
-                }
+                self.backend.resolve_permission(
+                    task_id,
+                    request,
+                    response,
+                    send_prompt_msg,
+                    self.async_tx.clone(),
+                );
                 vec![]
             }
 
@@ -1557,27 +1249,8 @@ impl App {
                 task_id,
                 session_id,
             } => {
-                let client = match self.opencode_client.clone() {
-                    Some(c) => c,
-                    None => return vec![],
-                };
-                let async_tx = self.async_tx.clone();
-                tokio::spawn(async move {
-                    match client.get_session_diffs(&session_id).await {
-                        Ok(diffs) => {
-                            let _ = async_tx
-                                .send(AppMessage::DiffReady { task_id, diffs })
-                                .await;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to fetch diffs for session {}: {}",
-                                session_id,
-                                e
-                            );
-                        }
-                    }
-                });
+                self.backend
+                    .get_diffs(task_id, session_id, self.async_tx.clone());
                 vec![]
             }
 
@@ -3908,12 +3581,28 @@ mod tests {
         );
     }
 
-    /// Verifies that `PermissionResolved` with a non-empty explanation emits `SendPrompt`.
-    #[test]
-    fn test_reject_with_explanation_emits_send_prompt() {
+    /// Verifies that `PermissionResolved` with a non-empty explanation dispatches `SendPrompt`.
+    ///
+    /// The message is now sent via `async_tx` rather than returned synchronously,
+    /// so this test uses a tokio runtime and reads from the channel.
+    #[tokio::test]
+    async fn test_reject_with_explanation_emits_send_prompt() {
         use crate::opencode::types::PermissionRequest;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
 
-        let mut app = App::test_default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let session_map = Arc::new(RwLock::new(HashMap::new()));
+        let mut app = App::new(
+            crate::tasks::TaskStore::new(),
+            Box::new(crate::backend::NullBackend),
+            session_map,
+            tx,
+            false,
+            HashMap::new(),
+            None,
+        );
         let task_id = make_task_in_progress(&mut app);
 
         // Register the session so the workflow phase is Running with a known session_id.
@@ -3930,7 +3619,7 @@ mod tests {
             always: vec![],
         };
 
-        let msgs = app.handle_message(AppMessage::PermissionResolved {
+        app.handle_message(AppMessage::PermissionResolved {
             task_id: task_id.clone(),
             request,
             response: "reject".to_string(),
@@ -3939,10 +3628,14 @@ mod tests {
             ),
         });
 
+        // The SendPrompt message is sent asynchronously via async_tx.
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("timed out waiting for SendPrompt")
+            .expect("channel closed");
         assert!(
-            msgs.iter()
-                .any(|m| matches!(m, AppMessage::SendPrompt { .. })),
-            "expected SendPrompt when explanation is provided, got: {msgs:?}"
+            matches!(msg, AppMessage::SendPrompt { .. }),
+            "expected SendPrompt when explanation is provided, got: {msg:?}"
         );
     }
 
