@@ -65,6 +65,9 @@ pub enum AppMessage {
     HumanApprovedCommit {
         task_id: TaskId,
         commit_message: String,
+        /// Paths of files changed by the agent, used to build a targeted `git add`.
+        /// Empty only if the diff snapshot was unavailable; falls back to `git add -A`.
+        file_paths: Vec<String>,
     },
     /// Agent successfully committed changes; task should transition to Completed.
     CommitCompleted { task_id: TaskId },
