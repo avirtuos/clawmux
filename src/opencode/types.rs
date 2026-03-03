@@ -15,6 +15,53 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Identifies a specific LLM model within a provider.
+///
+/// Used to pass an explicit model selection in `POST /session/:id/prompt_async`
+/// requests, which takes highest precedence in OpenCode's model resolution order:
+/// request body > agent frontmatter > last session model > global default.
+///
+/// OpenCode's `parseModel` splits on the first `/` only, so
+/// `"openrouter/anthropic/claude-sonnet-4.6"` yields
+/// `providerID: "openrouter"`, `modelID: "anthropic/claude-sonnet-4.6"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelId {
+    /// The provider identifier (e.g. `"openrouter"`, `"anthropic"`).
+    #[serde(rename = "providerID")]
+    pub provider_id: String,
+    /// The model identifier within the provider (e.g. `"anthropic/claude-sonnet-4.6"`).
+    #[serde(rename = "modelID")]
+    pub model_id: String,
+}
+
+impl ModelId {
+    /// Parses a combined provider/model string into a [`ModelId`].
+    ///
+    /// Splits on the first `/`. Returns `None` if no `/` is present.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use clawdmux::opencode::types::ModelId;
+    /// let m = ModelId::parse("openrouter/anthropic/claude-sonnet-4.6").unwrap();
+    /// assert_eq!(m.provider_id, "openrouter");
+    /// assert_eq!(m.model_id, "anthropic/claude-sonnet-4.6");
+    /// ```
+    pub fn parse(s: &str) -> Option<Self> {
+        let idx = s.find('/')?;
+        Some(ModelId {
+            provider_id: s[..idx].to_string(),
+            model_id: s[idx + 1..].to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for ModelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.provider_id, self.model_id)
+    }
+}
+
 /// A part of an opencode agent message.
 ///
 /// Agents can produce text, tool calls, reasoning traces, and file content.
@@ -287,6 +334,9 @@ pub struct SendMessageRequest {
     /// Optional agent identifier to route the message to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Explicit model selection; takes highest priority in OpenCode's resolution order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelId>,
 }
 
 /// Response body for `POST /session` (create session).
@@ -377,6 +427,53 @@ pub struct MessageEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- ModelId ---
+
+    #[test]
+    fn test_model_id_parse() {
+        let m = ModelId::parse("openrouter/anthropic/claude-sonnet-4.6").expect("should parse");
+        assert_eq!(m.provider_id, "openrouter");
+        assert_eq!(m.model_id, "anthropic/claude-sonnet-4.6");
+    }
+
+    #[test]
+    fn test_model_id_parse_no_slash() {
+        assert!(
+            ModelId::parse("noslash").is_none(),
+            "should return None when no slash present"
+        );
+    }
+
+    #[test]
+    fn test_model_id_display() {
+        let m = ModelId {
+            provider_id: "openrouter".to_string(),
+            model_id: "anthropic/claude-sonnet-4.6".to_string(),
+        };
+        assert_eq!(m.to_string(), "openrouter/anthropic/claude-sonnet-4.6");
+    }
+
+    #[test]
+    fn test_model_id_serialization() {
+        let m = ModelId {
+            provider_id: "openrouter".to_string(),
+            model_id: "anthropic/claude-sonnet-4.6".to_string(),
+        };
+        let json = serde_json::to_string(&m).expect("serialize");
+        assert!(
+            json.contains("\"providerID\""),
+            "must use providerID key, got: {json}"
+        );
+        assert!(
+            json.contains("\"modelID\""),
+            "must use modelID key, got: {json}"
+        );
+        assert!(
+            !json.contains("\"providerId\""),
+            "must not use providerId (wrong case), got: {json}"
+        );
+    }
 
     // --- MessagePart ---
 
@@ -492,6 +589,7 @@ mod tests {
                 text: "hello".to_string(),
             }],
             agent: None,
+            model: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(
@@ -512,6 +610,7 @@ mod tests {
                 text: "hello".to_string(),
             }],
             agent: Some("claude".to_string()),
+            model: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(

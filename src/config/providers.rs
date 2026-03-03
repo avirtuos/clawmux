@@ -10,6 +10,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ClawdMuxError, Result};
+use crate::opencode::types::ModelId;
 
 /// Configuration for a single LLM provider (API key and default model).
 ///
@@ -116,6 +117,18 @@ impl GlobalConfig {
             (key_var.to_string(), provider.api_key.clone()),
             (model_var.to_string(), provider.default_model.clone()),
         ]
+    }
+
+    /// Returns a [`ModelId`] for the active provider's default model.
+    ///
+    /// Combines `provider.default` (the provider ID) with the active provider's
+    /// `default_model` field. Returns `None` if no provider is configured, the
+    /// provider block is absent, or the combined string cannot be parsed as a
+    /// `provider/model` pair.
+    pub fn default_model_id(&self) -> Option<ModelId> {
+        let provider = self.active_provider()?;
+        let combined = format!("{}/{}", self.provider.default, provider.default_model);
+        ModelId::parse(&combined)
     }
 
     /// Return a reference to the [`ProviderConfig`] for the currently active provider.
@@ -322,6 +335,41 @@ default_model = "claude-opus-4-6"
             "OPENROUTER_DEFAULT_MODEL".to_string(),
             "openrouter/openrouter/auto".to_string()
         )));
+    }
+
+    #[test]
+    fn test_default_model_id_anthropic() {
+        let config = anthropic_config();
+        let model = config.default_model_id().expect("should return a ModelId");
+        assert_eq!(model.provider_id, "anthropic");
+        assert_eq!(model.model_id, "claude-opus-4-6");
+    }
+
+    #[test]
+    fn test_default_model_id_openrouter() {
+        let config = GlobalConfig {
+            provider: ProviderSection {
+                default: "openrouter".to_string(),
+                anthropic: None,
+                openai: None,
+                google: None,
+                openrouter: Some(ProviderConfig {
+                    api_key: "sk-or-test".to_string(),
+                    default_model: "anthropic/claude-sonnet-4.6".to_string(),
+                }),
+            },
+            opencode_password: None,
+        };
+        let model = config.default_model_id().expect("should return a ModelId");
+        assert_eq!(model.provider_id, "openrouter");
+        assert_eq!(model.model_id, "anthropic/claude-sonnet-4.6");
+        assert_eq!(model.to_string(), "openrouter/anthropic/claude-sonnet-4.6");
+    }
+
+    #[test]
+    fn test_default_model_id_no_provider() {
+        let config = GlobalConfig::default();
+        assert!(config.default_model_id().is_none());
     }
 
     #[test]

@@ -22,11 +22,12 @@ use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::App;
+use crate::config::init::build_agent_model_map;
 use crate::config::AppConfig;
 use crate::messages::AppMessage;
 use crate::opencode::events::EventStreamConsumer;
 use crate::opencode::server::OpenCodeServer;
-use crate::opencode::types::{MessagePart, OpenCodeEvent};
+use crate::opencode::types::{MessagePart, ModelId, OpenCodeEvent};
 use crate::opencode::OpenCodeClient;
 use crate::tasks::models::TaskId;
 use crate::tasks::TaskStore;
@@ -180,6 +181,11 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     terminal.draw(|f| tui::draw_loading_screen(f, "Loading configuration..."))?;
     let config = AppConfig::load(&project_root)?;
 
+    // Build per-agent model map from embedded agent frontmatter.
+    let agent_models = build_agent_model_map();
+    // Determine the default model from the global provider config.
+    let default_model: Option<ModelId> = config.global.default_model_id();
+
     // 5. Loading phase: server (callback redraws loading screen on each status change).
     // Use a crossterm EventStream to detect Ctrl+C in raw mode (ratatui disables
     // the kernel ISIG flag, so tokio::signal::ctrl_c() is ineffective here).
@@ -253,6 +259,8 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&session_map),
         async_tx.clone(),
         config.workflow.approval_gate,
+        agent_models,
+        default_model,
     );
     let mut event_stream = crossterm::event::EventStream::new();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(250));
@@ -286,7 +294,14 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(msg) = queue.pop_front() {
             // Intercept RequestTaskFix to spawn an async fix task.
             if let AppMessage::RequestTaskFix { ref task_id } = msg {
-                spawn_fix_request(task_id, &app, &server, &config, async_tx.clone());
+                spawn_fix_request(
+                    task_id,
+                    &app,
+                    &server,
+                    &config,
+                    async_tx.clone(),
+                    app.default_model.clone(),
+                );
             }
             queue.extend(app.handle_message(msg));
         }
@@ -377,6 +392,7 @@ fn spawn_fix_request(
     server: &Option<OpenCodeServer>,
     config: &AppConfig,
     async_tx: tokio::sync::mpsc::Sender<AppMessage>,
+    default_model: Option<ModelId>,
 ) {
     let base_url = match server {
         Some(s) => s.base_url().to_string(),
@@ -428,7 +444,10 @@ fn spawn_fix_request(
         let prompt = build_fix_prompt(&error_message, &raw_content);
         // Use no agent (None) so OpenCode uses its default model without requiring
         // a custom `.opencode/agents/clawdmux/` definition file.
-        if let Err(e) = client.send_prompt_async(&session.id, None, &prompt).await {
+        if let Err(e) = client
+            .send_prompt_async(&session.id, None, default_model.as_ref(), &prompt)
+            .await
+        {
             let _ = async_tx
                 .send(AppMessage::TaskFixFailed {
                     task_id,

@@ -6,11 +6,13 @@
 //! 3. Scaffolds `.clawdmux/config.toml`, `.opencode/agents/clawdmux/`, and `tasks/`.
 //! 4. Logs a success message.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
 
 use crate::config::providers::{GlobalConfig, ProviderConfig, ProviderSection};
 use crate::error::{ClawdMuxError, Result};
+use crate::opencode::types::ModelId;
 use crate::workflow::agents::AgentKind;
 
 // ---------------------------------------------------------------------------
@@ -44,6 +46,55 @@ const TASK_SEED_FILES: &[(&str, &str)] = &[
     ("1.2.md", TASK_1_2),
     ("2.1.md", TASK_2_1),
 ];
+
+// ---------------------------------------------------------------------------
+// Model extraction from agent frontmatter
+// ---------------------------------------------------------------------------
+
+/// Extracts the `model:` value from YAML frontmatter in an agent definition file.
+///
+/// The frontmatter block must start with `---` on the first line and end with
+/// another `---` line. The first `model:` entry found is returned as a trimmed
+/// string.  Returns `None` if no frontmatter is present or no `model:` key is
+/// found.
+fn extract_model_from_frontmatter(content: &str) -> Option<String> {
+    let content = content.strip_prefix("---")?;
+    let end = content.find("\n---")?;
+    let frontmatter = &content[..end];
+    for line in frontmatter.lines() {
+        if let Some(value) = line.strip_prefix("model:") {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Builds a map from each [`AgentKind`] to the [`ModelId`] declared in its
+/// embedded agent definition file frontmatter.
+///
+/// Agent kinds without a definition file (i.e. [`AgentKind::Human`]) or whose
+/// frontmatter lacks a parseable `model:` field are omitted from the map.
+pub fn build_agent_model_map() -> HashMap<AgentKind, ModelId> {
+    let mut map = HashMap::new();
+    for agent in AgentKind::all() {
+        let Some(content) = agent_definition_content(agent) else {
+            continue;
+        };
+        let Some(model_str) = extract_model_from_frontmatter(content) else {
+            continue;
+        };
+        let Some(model_id) = ModelId::parse(&model_str) else {
+            tracing::warn!(
+                agent = agent.display_name(),
+                model = %model_str,
+                "Could not parse model string from agent frontmatter"
+            );
+            continue;
+        };
+        map.insert(*agent, model_id);
+    }
+    map
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -435,6 +486,64 @@ mod tests {
     use super::*;
     use crate::config::providers::{ProviderConfig, ProviderSection};
     use tempfile::TempDir;
+
+    // --- extract_model_from_frontmatter tests ---
+
+    #[test]
+    fn test_extract_model_from_frontmatter() {
+        let content = "---\ndescription: test agent\nmodel: openrouter/anthropic/claude-sonnet-4.6\nsteps: 10\n---\n\nBody text.";
+        let model = extract_model_from_frontmatter(content);
+        assert_eq!(
+            model.as_deref(),
+            Some("openrouter/anthropic/claude-sonnet-4.6")
+        );
+    }
+
+    #[test]
+    fn test_extract_model_no_frontmatter() {
+        let content = "No frontmatter here.\nJust body text.";
+        assert!(extract_model_from_frontmatter(content).is_none());
+    }
+
+    #[test]
+    fn test_extract_model_frontmatter_no_model_key() {
+        let content = "---\ndescription: test agent\nsteps: 10\n---\n\nBody text.";
+        assert!(extract_model_from_frontmatter(content).is_none());
+    }
+
+    // --- build_agent_model_map tests ---
+
+    #[test]
+    fn test_build_agent_model_map() {
+        let map = build_agent_model_map();
+        // All 7 pipeline agents should have entries.
+        for agent in AgentKind::all() {
+            assert!(
+                map.contains_key(agent),
+                "Expected model entry for {:?}",
+                agent
+            );
+        }
+        assert_eq!(map.len(), 7, "Should have exactly 7 entries");
+    }
+
+    #[test]
+    fn test_build_agent_model_map_parses_correctly() {
+        let map = build_agent_model_map();
+        // All agents use openrouter/anthropic/claude-sonnet-4.6.
+        for (agent, model) in &map {
+            assert_eq!(
+                model.provider_id, "openrouter",
+                "Wrong provider for {:?}",
+                agent
+            );
+            assert!(
+                !model.model_id.is_empty(),
+                "model_id should not be empty for {:?}",
+                agent
+            );
+        }
+    }
 
     /// Write a minimal pre-configured global config to `path` so that
     /// `configure_provider_from_reader` returns immediately (no prompts).
