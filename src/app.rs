@@ -751,7 +751,14 @@ impl App {
                 let async_tx = self.async_tx.clone();
                 let session_map = self.session_map.clone();
                 let task_id_clone = task_id.clone();
-                let default_model = self.default_model.clone();
+                // Use the CodeReview agent's configured model (from its frontmatter) so
+                // the commit session uses the same Sonnet build as the rest of the pipeline,
+                // rather than the global provider default which may not be a valid model id.
+                let commit_model = self
+                    .agent_models
+                    .get(&AgentKind::CodeReview)
+                    .cloned()
+                    .or_else(|| self.default_model.clone());
                 tokio::spawn(async move {
                     let session = match client.create_session().await {
                         Ok(s) => s,
@@ -807,7 +814,7 @@ impl App {
                         git_add_cmd, escaped
                     );
                     if let Err(e) = client
-                        .send_prompt_async(&session.id, None, default_model.as_ref(), &prompt)
+                        .send_prompt_async(&session.id, None, commit_model.as_ref(), &prompt)
                         .await
                     {
                         let _ = async_tx
