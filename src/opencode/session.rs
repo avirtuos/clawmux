@@ -8,7 +8,7 @@ use reqwest::Method;
 
 use crate::error::{ClawdMuxError, Result};
 use crate::opencode::types::{
-    ContentPart, CreateSessionResponse, FileDiff, MessageEntry, OpenCodeSession,
+    ContentPart, CreateSessionResponse, FileDiff, MessageEntry, ModelId, OpenCodeSession,
     SendMessageRequest, SessionStatusResponse,
 };
 use crate::workflow::agents::AgentKind;
@@ -49,13 +49,15 @@ impl OpenCodeClient {
     ///
     /// Sends `POST /session/{session_id}/prompt_async`. When `agent` is `Some`, the agent
     /// name is forwarded so the server can route the request to the appropriate agent
-    /// definition. When `None`, the server uses its default model without a custom agent.
-    /// Returns `Ok(())` on success; the server streams results via SSE.
+    /// definition. When `model` is `Some`, it is included in the request body and takes
+    /// highest precedence in OpenCode's model resolution order. Returns `Ok(())` on
+    /// success; the server streams results via SSE.
     ///
     /// # Arguments
     ///
     /// * `session_id` - The ID of the target session.
     /// * `agent` - The pipeline agent to route the message to, or `None` for the default.
+    /// * `model` - Explicit model selection, or `None` to defer to OpenCode's resolution.
     /// * `prompt` - The text prompt to send.
     ///
     /// # Errors
@@ -66,6 +68,7 @@ impl OpenCodeClient {
         &self,
         session_id: &str,
         agent: Option<&AgentKind>,
+        model: Option<&ModelId>,
         prompt: &str,
     ) -> Result<()> {
         let path = format!("/session/{session_id}/prompt_async");
@@ -74,11 +77,15 @@ impl OpenCodeClient {
                 text: prompt.to_string(),
             }],
             agent: agent.map(|a| a.opencode_agent_name().to_string()),
+            model: model.cloned(),
         };
         tracing::debug!(
-            "send_prompt_async: session={}, agent={}",
+            "send_prompt_async: session={}, agent={}, model={}",
             session_id,
-            agent.map(|a| a.display_name()).unwrap_or("(default)")
+            agent.map(|a| a.display_name()).unwrap_or("(default)"),
+            model
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "(default)".to_string())
         );
         let resp = self.request(Method::POST, &path).json(&body).send().await?;
         let status = resp.status();
@@ -393,7 +400,12 @@ mod tests {
 
         let client = make_client(&server.url());
         client
-            .send_prompt_async("abc", Some(&AgentKind::Implementation), "do the thing")
+            .send_prompt_async(
+                "abc",
+                Some(&AgentKind::Implementation),
+                None,
+                "do the thing",
+            )
             .await
             .expect("should succeed");
         mock.assert_async().await;
@@ -412,7 +424,7 @@ mod tests {
 
         let client = make_client(&server.url());
         client
-            .send_prompt_async("abc", None, "fix this")
+            .send_prompt_async("abc", None, None, "fix this")
             .await
             .expect("should succeed");
         mock.assert_async().await;

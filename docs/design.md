@@ -180,13 +180,23 @@ ClawdMux controls model selection at three layers (highest priority first):
 
 | Priority | Mechanism | How to Set |
 |----------|-----------|------------|
-| 1 | **Per-prompt user override** | User types a model name into the supplemental prompt field in Tab 1; passed as `model` in the API request body |
+| 1 | **Per-prompt explicit model** | `model: { providerID, modelID }` passed in the `POST /session/:id/prompt_async` request body — ClawdMux always sets this from agent frontmatter or the global default |
 | 2 | **Per-agent default** | `model:` field in `.opencode/agents/clawdmux/<agent>.md` frontmatter |
 | 3 | **Global ClawdMux default** | `[provider.<name>].default_model` in `~/.config/clawdmux/config.toml`; used as the fallback in agent definition files via a `{global_default}` placeholder resolved at agent file generation time |
 
+#### Per-Turn Model Selection (implementation)
+
+At startup, `build_agent_model_map()` in `config/init.rs` reads the embedded agent `.md` files, extracts the `model:` frontmatter field from each, and parses it into a `HashMap<AgentKind, ModelId>`. The global default model is read from the active provider's `default_model` field via `GlobalConfig::default_model_id()`.
+
+Both are passed to `App::new()` and stored as `agent_models` and `default_model`. On every `CreateSession` and `SendPrompt` message, the handler looks up the agent's `ModelId` from `agent_models` (falling back to `default_model`) and passes it to `OpenCodeClient::send_prompt_async()`, which serializes it as `"model": { "providerID": "...", "modelID": "..." }` in the JSON body.
+
+The `ModelId::parse(s)` function splits on the first `/` only, matching OpenCode's `parseModel` behavior: `"openrouter/anthropic/claude-sonnet-4.6"` → `providerID: "openrouter"`, `modelID: "anthropic/claude-sonnet-4.6"`.
+
+Commit and fix sessions (which have no dedicated agent) use `default_model` directly.
+
 This means:
 - Agents use their own model by default (e.g., Implementation uses a capable model, Intake uses a lighter/faster one)
-- The user can override any specific prompt without changing config
+- The explicit per-turn model in the request body takes the highest OpenCode resolution priority, overriding agent frontmatter and session history
 - The global default seeds all agent files at `clawdmux init` time but each can be hand-edited independently
 
 ### Crate & Module Structure

@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::messages::AppMessage;
 use crate::opencode::events::SessionMap;
-use crate::opencode::types::DiffStatus;
+use crate::opencode::types::{DiffStatus, ModelId};
 use crate::opencode::OpenCodeClient;
 use crate::tasks::models::{status_to_index, Question, SuggestedFix, TaskStatus, WorkLogEntry};
 use crate::tasks::{Story, TaskId, TaskStore};
@@ -98,6 +98,13 @@ pub struct App {
     /// When a `SessionCompleted` arrives for a session_id found here, it is
     /// routed to `CommitCompleted` instead of the normal agent pipeline.
     pub pending_commit_sessions: HashMap<String, TaskId>,
+    /// Model IDs parsed from each agent's embedded `.md` frontmatter at startup.
+    ///
+    /// Used to pass an explicit model in every `send_prompt_async` call, taking
+    /// highest priority in OpenCode's resolution order.
+    pub agent_models: HashMap<AgentKind, ModelId>,
+    /// Default model from the global provider config, used for commit/fix sessions.
+    pub default_model: Option<ModelId>,
 }
 
 impl App {
@@ -110,12 +117,16 @@ impl App {
     /// * `session_map` - Shared map correlating session IDs to tasks and agents.
     /// * `async_tx` - Channel sender for routing async task results back to the event loop.
     /// * `approval_gate` - When `true`, pause and require human approval between agents.
+    /// * `agent_models` - Per-agent model IDs parsed from embedded agent frontmatter.
+    /// * `default_model` - Fallback model for sessions without a dedicated agent.
     pub fn new(
         task_store: TaskStore,
         opencode_client: Option<Arc<OpenCodeClient>>,
         session_map: SessionMap,
         async_tx: mpsc::Sender<AppMessage>,
         approval_gate: bool,
+        agent_models: HashMap<AgentKind, ModelId>,
+        default_model: Option<ModelId>,
     ) -> Self {
         let cached_stories = task_store.stories();
         let mut task_list_state = TaskListState::new();
@@ -144,6 +155,8 @@ impl App {
             last_status_poll: Instant::now(),
             commit_dialog: None,
             pending_commit_sessions: HashMap::new(),
+            agent_models,
+            default_model,
         }
     }
 
@@ -228,7 +241,15 @@ impl App {
         use tokio::sync::RwLock;
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let session_map = Arc::new(RwLock::new(HashMap::new()));
-        App::new(TaskStore::new(), None, session_map, tx, false)
+        App::new(
+            TaskStore::new(),
+            None,
+            session_map,
+            tx,
+            false,
+            HashMap::new(),
+            None,
+        )
     }
 
     /// Reads the workflow engine's post-transition state for a task and syncs
@@ -729,6 +750,7 @@ impl App {
                 let async_tx = self.async_tx.clone();
                 let session_map = self.session_map.clone();
                 let task_id_clone = task_id.clone();
+                let default_model = self.default_model.clone();
                 tokio::spawn(async move {
                     let session = match client.create_session().await {
                         Ok(s) => s,
@@ -766,7 +788,10 @@ impl App {
                         "Run the following git commands exactly: git add -A && git commit -m '{}'. Report only whether the commit succeeded or failed.",
                         escaped
                     );
-                    if let Err(e) = client.send_prompt_async(&session.id, None, &prompt).await {
+                    if let Err(e) = client
+                        .send_prompt_async(&session.id, None, default_model.as_ref(), &prompt)
+                        .await
+                    {
                         let _ = async_tx
                             .send(AppMessage::CommitFailed {
                                 task_id: task_id_clone,
@@ -1087,6 +1112,22 @@ impl App {
                 let agent_name = agent.display_name().to_string();
                 self.tab2_state
                     .push_banner(&task_id, format!("--- {} ---", agent_name));
+
+                // Look up the model for this agent; fall back to the global default.
+                let model = self
+                    .agent_models
+                    .get(&agent)
+                    .cloned()
+                    .or_else(|| self.default_model.clone());
+                let model_display = model
+                    .as_ref()
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "default".to_string());
+                self.tab2_state.push_banner(
+                    &task_id,
+                    format!("[{}] Starting with model: {}", agent_name, model_display),
+                );
+
                 self.tab2_state
                     .push_banner(&task_id, "Creating session...".to_string());
 
@@ -1137,7 +1178,7 @@ impl App {
                         map.insert(session.id.clone(), (task_id.clone(), agent));
                     }
                     if let Err(e) = client
-                        .send_prompt_async(&session.id, Some(&agent), &prompt)
+                        .send_prompt_async(&session.id, Some(&agent), model.as_ref(), &prompt)
                         .await
                     {
                         session_map.write().await.remove(&session.id);
@@ -1179,6 +1220,8 @@ impl App {
                 };
                 let async_tx = self.async_tx.clone();
                 let session_map = self.session_map.clone();
+                let agent_models = self.agent_models.clone();
+                let default_model = self.default_model.clone();
                 tokio::spawn(async move {
                     let agent = {
                         let map = session_map.read().await;
@@ -1197,8 +1240,9 @@ impl App {
                             return;
                         }
                     };
+                    let model = agent_models.get(&agent).cloned().or(default_model);
                     if let Err(e) = client
-                        .send_prompt_async(&session_id, Some(&agent), &prompt)
+                        .send_prompt_async(&session_id, Some(&agent), model.as_ref(), &prompt)
                         .await
                     {
                         let _ = async_tx
@@ -2244,9 +2288,10 @@ mod tests {
         });
 
         let lines = app.tab2_state.lines_for(&task_id);
+        // Banners (in order): agent name, model, "Creating session...", [Prompt]
         assert!(
-            lines.len() >= 2,
-            "expected at least 2 banner lines, got {}",
+            lines.len() >= 3,
+            "expected at least 3 banner lines, got {}",
             lines.len()
         );
         assert!(
@@ -2255,9 +2300,14 @@ mod tests {
             lines[0]
         );
         assert!(
-            matches!(&lines[1], ActivityLine::AgentBanner { message } if message.contains("Creating session")),
-            "second line should be 'Creating session...': {:?}",
+            matches!(&lines[1], ActivityLine::AgentBanner { message } if message.contains("model")),
+            "second line should be the model banner: {:?}",
             lines[1]
+        );
+        assert!(
+            matches!(&lines[2], ActivityLine::AgentBanner { message } if message.contains("Creating session")),
+            "third line should be 'Creating session...': {:?}",
+            lines[2]
         );
     }
 
@@ -3922,6 +3972,48 @@ mod tests {
         assert!(
             !app.pending_commit_sessions.contains_key("commit-sess-1"),
             "commit session should be removed from pending_commit_sessions after routing"
+        );
+    }
+
+    /// Verifies that `CreateSession` pushes a model banner to the activity log.
+    #[test]
+    fn test_create_session_includes_model_in_banner() {
+        use crate::opencode::types::ModelId;
+        use crate::tui::tabs::agent_activity::ActivityLine;
+
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        // Install a known model for the Intake agent.
+        let expected_model = ModelId {
+            provider_id: "openrouter".to_string(),
+            model_id: "anthropic/claude-sonnet-4.6".to_string(),
+        };
+        app.agent_models
+            .insert(AgentKind::Intake, expected_model.clone());
+
+        // Fire CreateSession (no real opencode client; the session spawn will fail silently).
+        app.handle_message(AppMessage::CreateSession {
+            task_id: task_id.clone(),
+            agent: AgentKind::Intake,
+            context: None,
+            prompt: String::new(),
+        });
+
+        // The activity log should contain a banner with the model string.
+        let model_str = expected_model.to_string();
+        let lines = app.tab2_state.lines_for(&task_id);
+        let found = lines.iter().any(|line| {
+            if let ActivityLine::AgentBanner { message } = line {
+                message.contains(&model_str)
+            } else {
+                false
+            }
+        });
+        assert!(
+            found,
+            "Expected model '{}' in activity banners, got: {:?}",
+            model_str, lines
         );
     }
 
