@@ -5,7 +5,7 @@
 //! emulation with structured streaming text display.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -137,10 +137,13 @@ pub struct Tab2State {
     pub steering_input: TextArea<'static>,
     /// Whether the steering textarea currently has keyboard focus.
     pub steering_focused: bool,
-    /// The currently pending permission request for the displayed task, if any.
+    /// Queue of pending permission requests.
     ///
-    /// Set when a `PermissionAsked` message arrives; cleared when the user responds.
-    pub pending_permission: Option<(TaskId, PermissionRequest)>,
+    /// The AI model may send multiple parallel tool calls that each require permission,
+    /// resulting in several `PermissionAsked` messages arriving in quick succession.
+    /// Each is enqueued here and presented to the user one at a time (FIFO). The front
+    /// entry is the one currently displayed in the dialog; `resolve_permission` pops it.
+    pub pending_permissions: VecDeque<(TaskId, PermissionRequest)>,
     /// Text input for typing a rejection explanation when the user presses `[r]`.
     pub rejection_response: TextArea<'static>,
     /// Whether the rejection response textarea currently has keyboard focus.
@@ -185,7 +188,7 @@ impl Tab2State {
             thinking_tasks: HashMap::new(),
             steering_input,
             steering_focused: false,
-            pending_permission: None,
+            pending_permissions: VecDeque::new(),
             rejection_response,
             rejection_response_focused: false,
             permission_scroll: 0,
@@ -645,7 +648,7 @@ impl Tab2State {
         if self.current_task_id.as_ref() == Some(&task_id) {
             self.scroll_to_bottom(&task_id);
         }
-        self.pending_permission = Some((task_id, request));
+        self.pending_permissions.push_back((task_id, request));
         self.permission_scroll = 0;
     }
 
@@ -654,11 +657,11 @@ impl Tab2State {
     /// Call this after the user has responded to a permission request. This updates
     /// the existing `PermissionRequest` activity line to show `resolved: true`.
     pub fn resolve_permission(&mut self, task_id: &TaskId) {
-        self.pending_permission = None;
+        self.pending_permissions.pop_front();
         self.permission_scroll = 0;
         if let Some(buffer) = self.buffers.get_mut(task_id) {
-            // Mark the last unresolved PermissionRequest line as resolved.
-            for entry in buffer.iter_mut().rev() {
+            // Mark the first unresolved PermissionRequest line as resolved (FIFO).
+            for entry in buffer.iter_mut() {
                 if let BufferEntry::Banner(ActivityLine::PermissionRequest {
                     ref mut resolved,
                     ..
@@ -1666,10 +1669,10 @@ mod tests {
 
         // The pending permission should be stored.
         assert!(
-            state.pending_permission.is_some(),
-            "pending_permission should be set after push_permission"
+            !state.pending_permissions.is_empty(),
+            "pending_permissions should be non-empty after push_permission"
         );
-        let (stored_task_id, stored_req) = state.pending_permission.as_ref().unwrap();
+        let (stored_task_id, stored_req) = state.pending_permissions.front().unwrap();
         assert_eq!(*stored_task_id, id);
         assert_eq!(stored_req.id, "perm-1");
 
@@ -1702,14 +1705,14 @@ mod tests {
             always: vec![],
         };
         state.push_permission(id.clone(), request);
-        assert!(state.pending_permission.is_some());
+        assert!(!state.pending_permissions.is_empty());
 
         state.resolve_permission(&id);
 
         // Pending permission should be cleared.
         assert!(
-            state.pending_permission.is_none(),
-            "pending_permission should be None after resolve_permission"
+            state.pending_permissions.is_empty(),
+            "pending_permissions should be empty after resolve_permission"
         );
 
         // The activity line should be marked as resolved.
@@ -1722,6 +1725,129 @@ mod tests {
             ),
             "activity line should be resolved, got: {:?}",
             lines[0]
+        );
+    }
+
+    /// Verifies that multiple push_permission calls enqueue in FIFO order.
+    #[test]
+    fn test_push_permission_queues_multiple() {
+        use crate::opencode::types::PermissionRequest;
+
+        let mut state = Tab2State::new();
+        let id = task_id();
+        let req_a = PermissionRequest {
+            id: "perm-A".to_string(),
+            session_id: "sess-1".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["cargo build".to_string()],
+            always: vec![],
+        };
+        let req_b = PermissionRequest {
+            id: "perm-B".to_string(),
+            session_id: "sess-1".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec!["cargo test".to_string()],
+            always: vec![],
+        };
+        state.push_permission(id.clone(), req_a);
+        state.push_permission(id.clone(), req_b);
+
+        assert_eq!(
+            state.pending_permissions.len(),
+            2,
+            "both permissions should be queued"
+        );
+        assert_eq!(
+            state.pending_permissions.front().unwrap().1.id,
+            "perm-A",
+            "front of queue should be the first permission pushed"
+        );
+    }
+
+    /// Verifies that resolve_permission dequeues in FIFO order.
+    #[test]
+    fn test_resolve_permission_fifo_order() {
+        use crate::opencode::types::PermissionRequest;
+
+        let mut state = Tab2State::new();
+        let id = task_id();
+        let req_a = PermissionRequest {
+            id: "perm-A".to_string(),
+            session_id: "sess-1".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec![],
+            always: vec![],
+        };
+        let req_b = PermissionRequest {
+            id: "perm-B".to_string(),
+            session_id: "sess-1".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec![],
+            always: vec![],
+        };
+        state.push_permission(id.clone(), req_a);
+        state.push_permission(id.clone(), req_b);
+
+        state.resolve_permission(&id);
+        assert_eq!(
+            state.pending_permissions.front().unwrap().1.id,
+            "perm-B",
+            "after first resolve, perm-B should be at front"
+        );
+
+        state.resolve_permission(&id);
+        assert!(
+            state.pending_permissions.is_empty(),
+            "queue should be empty after resolving both"
+        );
+    }
+
+    /// Verifies that resolve_permission marks activity banners in FIFO order.
+    #[test]
+    fn test_resolve_permission_marks_banners_in_order() {
+        use crate::opencode::types::PermissionRequest;
+
+        let mut state = Tab2State::new();
+        let id = task_id();
+        let req_a = PermissionRequest {
+            id: "perm-A".to_string(),
+            session_id: "sess-1".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec![],
+            always: vec![],
+        };
+        let req_b = PermissionRequest {
+            id: "perm-B".to_string(),
+            session_id: "sess-1".to_string(),
+            permission: "bash".to_string(),
+            patterns: vec![],
+            always: vec![],
+        };
+        state.push_permission(id.clone(), req_a);
+        state.push_permission(id.clone(), req_b);
+
+        // Resolve the first (perm-A).
+        state.resolve_permission(&id);
+
+        let lines = state.lines_for(&id);
+        assert_eq!(lines.len(), 2);
+        // perm-A banner should be resolved.
+        assert!(
+            matches!(
+                &lines[0],
+                ActivityLine::PermissionRequest { id, resolved, .. } if id == "perm-A" && *resolved
+            ),
+            "perm-A banner should be resolved, got: {:?}",
+            lines[0]
+        );
+        // perm-B banner should still be unresolved.
+        assert!(
+            matches!(
+                &lines[1],
+                ActivityLine::PermissionRequest { id, resolved, .. } if id == "perm-B" && !resolved
+            ),
+            "perm-B banner should still be unresolved, got: {:?}",
+            lines[1]
         );
     }
 
