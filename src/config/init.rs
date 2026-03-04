@@ -434,20 +434,31 @@ fn build_kiro_agent_json(agent: &AgentKind) -> String {
     let prompt_json = serde_json::to_string(&prompt).unwrap_or_else(|_| "\"\"".to_string());
 
     // Determine tool set and model based on agent role.
-    let (tools_json, model) = match agent {
+    // `tools` declares which tools are available; `allowed_tools` are auto-approved without user
+    // prompting. Tools in `tools` but NOT in `allowed_tools` trigger a TUI permission dialog.
+    //
+    // Tool names here are kiro-cli built-in names (write, shell, glob, grep, thinking),
+    // NOT the ACP protocol-level tool kind names (edit, execute, search, think).
+    let (tools_json, allowed_tools_json, model) = match agent {
         AgentKind::Implementation => (
-            r#"["read","edit","delete","execute","search","think"]"#,
+            r#"["read","write","glob","grep","shell","thinking"]"#,
+            r#"["read","glob","grep","thinking"]"#,
             "claude-sonnet-4-6",
         ),
         AgentKind::Planning | AgentKind::CodeQuality | AgentKind::CodeReview => (
-            r#"["read","execute","search","think"]"#,
+            r#"["read","glob","grep","shell","thinking"]"#,
+            r#"["read","glob","grep","thinking"]"#,
             "claude-sonnet-4-6",
         ),
-        _ => (r#"["read","search","think"]"#, "claude-sonnet-4-6"),
+        _ => (
+            r#"["read","glob","grep","thinking"]"#,
+            r#"["read","glob","grep","thinking"]"#,
+            "claude-sonnet-4-6",
+        ),
     };
 
     format!(
-        "{{\n  \"name\": \"{name}\",\n  \"description\": \"{description}\",\n  \"prompt\": {prompt_json},\n  \"model\": \"{model}\",\n  \"tools\": {tools_json},\n  \"allowedTools\": {tools_json},\n  \"resources\": [\"file://CLAUDE.md\"]\n}}\n"
+        "{{\n  \"name\": \"{name}\",\n  \"description\": \"{description}\",\n  \"prompt\": {prompt_json},\n  \"model\": \"{model}\",\n  \"tools\": {tools_json},\n  \"allowedTools\": {allowed_tools_json},\n  \"resources\": [\"file://CLAUDE.md\"]\n}}\n"
     )
 }
 

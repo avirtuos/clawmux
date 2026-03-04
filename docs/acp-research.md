@@ -67,7 +67,7 @@ OpenCode has no equivalent. ClawdMux currently assumes all OpenCode features are
 |---------|-----|----------|-------------------|
 | **Structured plans** | `plan` updates with priority (high/medium/low) and status (pending/in_progress/completed) per entry | None | Native plan visualization in the Plan tab; agents report structured progress |
 | **Inline diffs** | `{ type: "diff", path, oldText?, newText }` in tool call content | Requires polling `GET /session/:id/diff` | Real-time diff display without polling; diffs arrive with the tool call that produced them |
-| **Tool kind categories** | 9 kinds: `read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`, `other` | Unstructured tool names | Richer Agent Activity tab -- group/filter by kind, show icons per category |
+| **Tool kind categories** | 9 kinds: `read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`, `other` | Unstructured tool names | Richer Agent Activity tab -- group/filter by kind, show icons per category. **Note:** these are ACP protocol-level kind labels, NOT kiro-cli built-in tool names (see section 3.1). |
 | **Tool call locations** | `locations: [{ path, line? }]` on each tool call | Not available | Show affected file:line in activity view |
 | **Permission model** | 4 options: `allow_once`, `allow_always`, `reject_once`, `reject_always` with structured `PermissionOption` objects | 3 options: `once`, `always`, `reject` as strings | `reject_always` enables persistent rejection rules; structured options allow custom labels |
 | **Session modes** | Dynamic modes with `session/set_config_option`; categories for `mode`, `model`, `thought_level` | None | Switch between ask/architect/code modes per pipeline stage; adjust model/reasoning dynamically |
@@ -119,6 +119,17 @@ Kiro extends standard ACP with `_kiro.dev/` prefixed methods:
 Kiro uses JSON config files (not YAML/TOML), stored at:
 - Global: `~/.kiro/agents/<name>.json`
 - Workspace: `.kiro/agents/<name>.json` (takes precedence)
+
+> **Important: ACP tool kind names vs. kiro-cli built-in tool names**
+>
+> The ACP protocol defines 9 abstract tool *kind* labels (`read`, `edit`, `delete`, `move`,
+> `search`, `execute`, `think`, `fetch`, `other`) used in tool call notifications to categorize
+> what a tool does. These are NOT the names used in kiro agent JSON configs.
+>
+> The `tools` and `allowedTools` arrays in kiro config files use kiro-cli's actual **built-in
+> tool names**: `read`, `write`, `glob`, `grep`, `shell`, `code`, `thinking`. Kiro silently
+> ignores any unrecognized tool name, so using ACP kind names (e.g. `"edit"`, `"execute"`,
+> `"search"`, `"think"`) in these arrays will NOT enable the corresponding capabilities.
 
 Complete schema:
 
