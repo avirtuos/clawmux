@@ -19,6 +19,7 @@
 //! kiro's automatic context compaction from discarding mid-pipeline context.
 
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -49,6 +50,8 @@ pub struct KiroProcess {
     reader_handle: JoinHandle<()>,
     event_loop_handle: JoinHandle<()>,
     child: tokio::process::Child,
+    /// Accumulated agent text from streaming chunks; shared with the event loop.
+    accumulated_text: Arc<Mutex<String>>,
 }
 
 impl KiroProcess {
@@ -117,10 +120,14 @@ impl KiroProcess {
             "kiro-cli session created: agent={agent_name} session_id={session_id} task={task_id}"
         );
 
+        // Shared accumulated text: event loop writes chunks; send_prompt reads final value.
+        let accumulated_text: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+
         // Spawn the event loop to translate ACP notifications -> AppMessage
         let event_transport = transport.clone();
         let event_task_id = task_id.clone();
         let event_session_id = session_id.clone();
+        let event_accumulated = accumulated_text.clone();
         let event_loop_handle = tokio::spawn(run_event_loop(
             event_task_id,
             event_session_id,
@@ -128,6 +135,7 @@ impl KiroProcess {
             notification_rx,
             permission_rx,
             async_tx,
+            event_accumulated,
         ));
 
         Ok(Self {
@@ -137,6 +145,7 @@ impl KiroProcess {
             permission_tx,
             reader_handle,
             event_loop_handle,
+            accumulated_text,
             child,
         })
     }
@@ -215,6 +224,7 @@ impl KiroProcess {
         let transport = self.transport.clone();
         let task_id = self.task_id.clone();
         let session_id = self.session_id.clone();
+        let accumulated_text = self.accumulated_text.clone();
 
         tokio::spawn(async move {
             match transport
@@ -240,14 +250,16 @@ impl KiroProcess {
                             })
                             .await;
                     } else {
-                        // Signal completion. The event loop's turn_end handler only breaks the
-                        // loop; SessionCompleted is sent here to avoid a double-advance if kiro
-                        // sends both a turn_end notification and responds to the request.
+                        // Read the text accumulated by the event loop during this turn.
+                        let response_text = accumulated_text
+                            .lock()
+                            .map(|g| g.clone())
+                            .unwrap_or_default();
                         let _ = async_tx
                             .send(AppMessage::SessionCompleted {
                                 task_id,
                                 session_id,
-                                response_text: String::new(),
+                                response_text,
                             })
                             .await;
                     }
