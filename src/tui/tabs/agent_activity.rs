@@ -596,13 +596,28 @@ impl Tab2State {
         }
     }
 
-    /// Updates the cumulative token counts for a task.
+    /// Updates the token counts for a task, accumulating per-step counts and using
+    /// cumulative counts as a floor.
     ///
-    /// Replaces the stored `(input, output)` pair with the latest values reported
-    /// by the OpenCode `message.updated` SSE event.
-    pub fn update_tokens(&mut self, task_id: &TaskId, input_tokens: u64, output_tokens: u64) {
-        self.task_tokens
-            .insert(task_id.clone(), (input_tokens, output_tokens));
+    /// Per-step counts (`is_cumulative: false`) from `step-finish` events are summed
+    /// together so the display reflects total usage across all inference steps.
+    /// Cumulative counts (`is_cumulative: true`) from `message.updated` are applied
+    /// with `max`, so they only raise the totals, never lower them.
+    pub fn update_tokens(
+        &mut self,
+        task_id: &TaskId,
+        input_tokens: u64,
+        output_tokens: u64,
+        is_cumulative: bool,
+    ) {
+        let entry = self.task_tokens.entry(task_id.clone()).or_insert((0, 0));
+        if is_cumulative {
+            entry.0 = entry.0.max(input_tokens);
+            entry.1 = entry.1.max(output_tokens);
+        } else {
+            entry.0 += input_tokens;
+            entry.1 += output_tokens;
+        }
     }
 
     /// Returns the cumulative `(input_tokens, output_tokens)` for a task, if any have been reported.
@@ -2019,19 +2034,19 @@ mod tests {
             "tokens should be None before any update"
         );
 
-        state.update_tokens(&task_id, 1000, 250);
+        state.update_tokens(&task_id, 1000, 250, false);
         assert_eq!(
             state.get_tokens(&task_id),
             Some((1000, 250)),
-            "tokens should match after update"
+            "tokens should match after first per-step update"
         );
 
-        // Subsequent update replaces previous values.
-        state.update_tokens(&task_id, 2000, 500);
+        // Subsequent per-step update accumulates.
+        state.update_tokens(&task_id, 2000, 500, false);
         assert_eq!(
             state.get_tokens(&task_id),
-            Some((2000, 500)),
-            "tokens should be replaced by second update"
+            Some((3000, 750)),
+            "tokens should be accumulated by second per-step update"
         );
     }
 
@@ -2042,7 +2057,7 @@ mod tests {
         let task1 = TaskId::from_path("tasks/1.1.md");
         let task2 = TaskId::from_path("tasks/1.2.md");
 
-        state.update_tokens(&task1, 100, 50);
+        state.update_tokens(&task1, 100, 50, false);
         assert_eq!(state.get_tokens(&task1), Some((100, 50)));
         assert!(
             state.get_tokens(&task2).is_none(),
@@ -2283,6 +2298,58 @@ mod tests {
             matches!(&lines[0], ActivityLine::Text { content } if content == "No JSON here."),
             "content should be unchanged; got: {:?}",
             lines[0]
+        );
+    }
+
+    #[test]
+    fn test_update_tokens_accumulates_per_step() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.update_tokens(&id, 100, 10, false);
+        state.update_tokens(&id, 200, 20, false);
+        state.update_tokens(&id, 50, 5, false);
+        let (inp, out) = state.get_tokens(&id).unwrap();
+        assert_eq!(inp, 350, "per-step input tokens should be summed");
+        assert_eq!(out, 35, "per-step output tokens should be summed");
+    }
+
+    #[test]
+    fn test_update_tokens_cumulative_acts_as_floor() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        // Accumulate some per-step counts.
+        state.update_tokens(&id, 100, 10, false);
+        state.update_tokens(&id, 200, 20, false);
+        // Cumulative count is higher -- should win.
+        state.update_tokens(&id, 500, 100, true);
+        let (inp, out) = state.get_tokens(&id).unwrap();
+        assert_eq!(
+            inp, 500,
+            "cumulative input should replace lower accumulated value"
+        );
+        assert_eq!(
+            out, 100,
+            "cumulative output should replace lower accumulated value"
+        );
+    }
+
+    #[test]
+    fn test_update_tokens_cumulative_does_not_decrease() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        // Accumulate more than the cumulative report.
+        state.update_tokens(&id, 400, 80, false);
+        state.update_tokens(&id, 300, 60, false);
+        // Cumulative is lower -- accumulated value should be kept.
+        state.update_tokens(&id, 500, 50, true);
+        let (inp, out) = state.get_tokens(&id).unwrap();
+        assert_eq!(
+            inp, 700,
+            "accumulated input exceeds cumulative; should not decrease"
+        );
+        assert_eq!(
+            out, 140,
+            "accumulated output exceeds cumulative; should not decrease"
         );
     }
 }

@@ -1419,9 +1419,10 @@ impl App {
                 task_id,
                 input_tokens,
                 output_tokens,
+                is_cumulative,
             } => {
                 self.tab2_state
-                    .update_tokens(&task_id, input_tokens, output_tokens);
+                    .update_tokens(&task_id, input_tokens, output_tokens, is_cumulative);
                 vec![]
             }
 
