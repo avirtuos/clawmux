@@ -100,10 +100,16 @@ pub async fn run_event_loop(
                 match msg {
                     None => {
                         tracing::debug!("kiro incoming channel closed for task {task_id}");
+                        if !accumulated_text.is_empty() {
+                            let _ = async_tx.send(AppMessage::SessionCompleted {
+                                task_id: task_id.clone(),
+                                session_id: session_id.clone(),
+                                response_text: accumulated_text.clone(),
+                            }).await;
+                        }
                         break;
                     }
                     Some(IncomingMessage::Notification(notif)) => {
-                        let is_terminal = is_terminal_notification(&notif);
                         handle_notification(
                             &notif.method,
                             notif.params.as_ref(),
@@ -112,9 +118,6 @@ pub async fn run_event_loop(
                             &mut accumulated_text,
                             &async_tx,
                         ).await;
-                        if is_terminal {
-                            break;
-                        }
                     }
                     Some(IncomingMessage::Request(req)) => {
                         // Bidirectional request from agent -- only permission requests expected
@@ -180,24 +183,6 @@ pub async fn run_event_loop(
                 break;
             }
         }
-    }
-}
-
-/// Returns `true` if `notif` represents a terminal event that should stop the event loop.
-fn is_terminal_notification(notif: &super::types::RpcNotification) -> bool {
-    match notif.method.as_str() {
-        // Legacy flat method names (kept as fallback)
-        "turn_end" | "session/error" => true,
-        // ACP envelope: terminal only when the inner update is turn_end
-        "session/update" => notif
-            .params
-            .as_ref()
-            .and_then(|p| p.get("update"))
-            .and_then(|u| u.get("sessionUpdate"))
-            .and_then(|s| s.as_str())
-            .map(|s| s == "turn_end")
-            .unwrap_or(false),
-        _ => false,
     }
 }
 
@@ -283,8 +268,7 @@ pub(crate) async fn handle_notification(
                 }
                 "turn_end" => {
                     // Turn completion is signaled via the session/prompt response in
-                    // process.rs::send_prompt to avoid double-advancing the workflow.
-                    // The event loop uses is_terminal_notification to break the loop.
+                    // process.rs::send_prompt. This notification is informational only.
                     let stop_reason = update
                         .get("stopReason")
                         .and_then(|v| v.as_str())
@@ -366,8 +350,6 @@ pub(crate) async fn handle_notification(
 
         "turn_end" => {
             // Completion is handled by the session/prompt response in send_prompt.
-            // This legacy flat turn_end is only used to break the event loop
-            // (via is_terminal_notification); no SessionCompleted is sent here.
             tracing::debug!("kiro: legacy turn_end notification received");
         }
 
@@ -903,32 +885,128 @@ mod tests {
         assert!(accumulated.is_empty());
     }
 
-    #[test]
-    fn test_is_terminal_notification_session_update_turn_end() {
-        use super::super::types::RpcNotification;
-        let notif = RpcNotification {
-            jsonrpc: "2.0".to_string(),
-            method: "session/update".to_string(),
-            params: Some(serde_json::json!({
-                "sessionId": "sess-1",
-                "update": { "sessionUpdate": "turn_end" }
-            })),
-        };
-        assert!(is_terminal_notification(&notif));
+    #[tokio::test]
+    async fn test_event_loop_completion_rx_sends_session_completed() {
+        use super::super::types::IncomingMessage;
+        use crate::backend::kiro::transport::Transport;
+
+        let (async_tx, mut async_rx) = mpsc::channel(64);
+        let (incoming_tx, incoming_rx) = mpsc::channel(64);
+        let (permission_tx, permission_rx) = mpsc::channel(8);
+        let (completion_tx, completion_rx) = mpsc::channel(4);
+
+        let (transport, _reader) = Transport::new_test();
+        let tid = task_id();
+
+        // Pre-send a text chunk so accumulated_text is non-empty
+        incoming_tx
+            .send(IncomingMessage::Notification(
+                super::super::types::RpcNotification {
+                    jsonrpc: "2.0".to_string(),
+                    method: "agent_message_chunk".to_string(),
+                    params: Some(serde_json::json!({
+                        "sessionId": "s1",
+                        "delta": "hello"
+                    })),
+                },
+            ))
+            .await
+            .unwrap();
+
+        // Fire completion signal
+        completion_tx.send("end_turn".to_string()).await.unwrap();
+
+        // Drop senders so the loop can exit
+        drop(incoming_tx);
+        drop(permission_tx);
+        drop(completion_tx);
+
+        run_event_loop(
+            tid.clone(),
+            "s1".to_string(),
+            transport,
+            incoming_rx,
+            permission_rx,
+            async_tx,
+            completion_rx,
+        )
+        .await;
+
+        // Drain StreamingUpdate messages, then expect SessionCompleted
+        let mut found_completed = false;
+        while let Ok(msg) = async_rx.try_recv() {
+            if let AppMessage::SessionCompleted {
+                task_id,
+                response_text,
+                ..
+            } = msg
+            {
+                assert_eq!(task_id, tid);
+                assert_eq!(response_text, "hello");
+                found_completed = true;
+            }
+        }
+        assert!(found_completed, "expected SessionCompleted");
     }
 
-    #[test]
-    fn test_is_terminal_notification_session_update_chunk_not_terminal() {
-        use super::super::types::RpcNotification;
-        let notif = RpcNotification {
-            jsonrpc: "2.0".to_string(),
-            method: "session/update".to_string(),
-            params: Some(serde_json::json!({
-                "sessionId": "sess-1",
-                "update": { "sessionUpdate": "agent_message_chunk" }
-            })),
-        };
-        assert!(!is_terminal_notification(&notif));
+    #[tokio::test]
+    async fn test_event_loop_channel_close_fallback() {
+        use super::super::types::IncomingMessage;
+        use crate::backend::kiro::transport::Transport;
+
+        let (async_tx, mut async_rx) = mpsc::channel(64);
+        let (incoming_tx, incoming_rx) = mpsc::channel(64);
+        let (permission_tx, permission_rx) = mpsc::channel(8);
+        let (_completion_tx, completion_rx) = mpsc::channel(4);
+
+        let (transport, _reader) = Transport::new_test();
+        let tid = task_id();
+
+        // Send a chunk then close incoming channel without completion_rx signal
+        incoming_tx
+            .send(IncomingMessage::Notification(
+                super::super::types::RpcNotification {
+                    jsonrpc: "2.0".to_string(),
+                    method: "agent_message_chunk".to_string(),
+                    params: Some(serde_json::json!({
+                        "sessionId": "s2",
+                        "delta": "fallback text"
+                    })),
+                },
+            ))
+            .await
+            .unwrap();
+        drop(incoming_tx);
+        drop(permission_tx);
+
+        run_event_loop(
+            tid.clone(),
+            "s2".to_string(),
+            transport,
+            incoming_rx,
+            permission_rx,
+            async_tx,
+            completion_rx,
+        )
+        .await;
+
+        let mut found_completed = false;
+        while let Ok(msg) = async_rx.try_recv() {
+            if let AppMessage::SessionCompleted {
+                task_id,
+                response_text,
+                ..
+            } = msg
+            {
+                assert_eq!(task_id, tid);
+                assert_eq!(response_text, "fallback text");
+                found_completed = true;
+            }
+        }
+        assert!(
+            found_completed,
+            "expected fallback SessionCompleted on channel close"
+        );
     }
 
     #[tokio::test]

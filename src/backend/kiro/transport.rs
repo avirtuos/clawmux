@@ -255,6 +255,30 @@ pub(crate) async fn route_message(
 }
 
 #[cfg(test)]
+impl Transport {
+    /// Create a transport backed by a `cat` child process for use in tests.
+    ///
+    /// Returns the transport and a `JoinHandle` for the reader task.
+    /// The caller should drop both when the test is done.
+    pub fn new_test() -> (Self, JoinHandle<()>) {
+        use tokio::process::Command;
+        let mut child = Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn cat for test transport");
+        let stdin = child.stdin.take().expect("cat stdin");
+        let stdout = child.stdout.take().expect("cat stdout");
+        let (notification_tx, _notification_rx) = mpsc::channel(64);
+        // Leak the child handle; it will be cleaned up when the process exits.
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+        Transport::new(stdin, stdout, notification_tx)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::sync::oneshot;
