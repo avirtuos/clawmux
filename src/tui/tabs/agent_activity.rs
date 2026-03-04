@@ -5,7 +5,7 @@
 //! emulation with structured streaming text display.
 
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -18,6 +18,30 @@ use tui_textarea::TextArea;
 use crate::opencode::types::{DiffLineKind, DiffStatus, FileDiff, MessagePart, PermissionRequest};
 use crate::tasks::TaskId;
 use crate::tui::markdown::markdown_to_lines;
+
+/// Per-task token accounting, separating accumulated per-step totals from
+/// message-level cumulative counts.
+///
+/// `step_sum` is built by adding each `step-finish` event's counts (deduplicated
+/// by `step_id`). `cumulative_floor` is updated with `max` from `message.updated`
+/// events so it can only raise the display total, never lower it.
+/// The displayed count is `max(step_sum, cumulative_floor)` per component.
+#[derive(Debug, Default)]
+struct TokenState {
+    step_sum: (u64, u64),
+    cumulative_floor: (u64, u64),
+    seen_step_ids: HashSet<String>,
+}
+
+impl TokenState {
+    /// Returns the effective `(input, output)` token counts.
+    fn effective(&self) -> (u64, u64) {
+        (
+            self.step_sum.0.max(self.cumulative_floor.0),
+            self.step_sum.1.max(self.cumulative_floor.1),
+        )
+    }
+}
 
 /// Title text used on the rejection response textarea.
 const REJECTION_PROMPT: &str = "What should the agent do instead?";
@@ -156,10 +180,14 @@ pub struct Tab2State {
     /// Drained at the end of each session turn (`SessionCompleted`) and sent to
     /// the just-finished session so the agent processes it before the workflow advances.
     queued_steering_prompts: HashMap<TaskId, String>,
-    /// Cumulative token counts per task: `(input_tokens, output_tokens)`.
+    /// Token accounting per task.
     ///
-    /// Updated whenever a `message.updated` SSE event carries token usage data.
-    task_tokens: HashMap<TaskId, (u64, u64)>,
+    /// Holds two separate buckets: `step_sum` (accumulated from `step-finish`
+    /// events, deduplicated by step id) and `cumulative_floor` (the maximum
+    /// seen from `message.updated` events). The displayed total is the
+    /// component-wise max of the two, so neither source can inflate or deflate
+    /// the other.
+    task_tokens: HashMap<TaskId, TokenState>,
 }
 
 impl Tab2State {
@@ -596,33 +624,40 @@ impl Tab2State {
         }
     }
 
-    /// Updates the token counts for a task, accumulating per-step counts and using
-    /// cumulative counts as a floor.
+    /// Updates the token counts for a task.
     ///
-    /// Per-step counts (`is_cumulative: false`) from `step-finish` events are summed
-    /// together so the display reflects total usage across all inference steps.
-    /// Cumulative counts (`is_cumulative: true`) from `message.updated` are applied
-    /// with `max`, so they only raise the totals, never lower them.
+    /// Per-step counts (`is_cumulative: false`) from `step-finish` events are
+    /// accumulated into `step_sum`, deduplicated by `step_id` so that SSE stream
+    /// replays cannot inflate the total.  Cumulative counts (`is_cumulative: true`)
+    /// from `message.updated` are applied with `max` on `cumulative_floor`, so they
+    /// can only raise the floor, never lower it.  The value returned by `get_tokens`
+    /// is the component-wise max of the two buckets.
     pub fn update_tokens(
         &mut self,
         task_id: &TaskId,
         input_tokens: u64,
         output_tokens: u64,
         is_cumulative: bool,
+        step_id: Option<&str>,
     ) {
-        let entry = self.task_tokens.entry(task_id.clone()).or_insert((0, 0));
+        let state = self.task_tokens.entry(task_id.clone()).or_default();
         if is_cumulative {
-            entry.0 = entry.0.max(input_tokens);
-            entry.1 = entry.1.max(output_tokens);
+            state.cumulative_floor.0 = state.cumulative_floor.0.max(input_tokens);
+            state.cumulative_floor.1 = state.cumulative_floor.1.max(output_tokens);
         } else {
-            entry.0 += input_tokens;
-            entry.1 += output_tokens;
+            if let Some(id) = step_id {
+                if !state.seen_step_ids.insert(id.to_string()) {
+                    return; // duplicate step-finish; skip
+                }
+            }
+            state.step_sum.0 += input_tokens;
+            state.step_sum.1 += output_tokens;
         }
     }
 
-    /// Returns the cumulative `(input_tokens, output_tokens)` for a task, if any have been reported.
+    /// Returns the effective `(input_tokens, output_tokens)` for a task, if any have been reported.
     pub fn get_tokens(&self, task_id: &TaskId) -> Option<(u64, u64)> {
-        self.task_tokens.get(task_id).copied()
+        self.task_tokens.get(task_id).map(TokenState::effective)
     }
 
     /// Sets the steering textarea to the focused (yellow border) style.
@@ -2034,7 +2069,7 @@ mod tests {
             "tokens should be None before any update"
         );
 
-        state.update_tokens(&task_id, 1000, 250, false);
+        state.update_tokens(&task_id, 1000, 250, false, Some("step-1"));
         assert_eq!(
             state.get_tokens(&task_id),
             Some((1000, 250)),
@@ -2042,7 +2077,7 @@ mod tests {
         );
 
         // Subsequent per-step update accumulates.
-        state.update_tokens(&task_id, 2000, 500, false);
+        state.update_tokens(&task_id, 2000, 500, false, Some("step-2"));
         assert_eq!(
             state.get_tokens(&task_id),
             Some((3000, 750)),
@@ -2057,7 +2092,7 @@ mod tests {
         let task1 = TaskId::from_path("tasks/1.1.md");
         let task2 = TaskId::from_path("tasks/1.2.md");
 
-        state.update_tokens(&task1, 100, 50, false);
+        state.update_tokens(&task1, 100, 50, false, Some("step-1"));
         assert_eq!(state.get_tokens(&task1), Some((100, 50)));
         assert!(
             state.get_tokens(&task2).is_none(),
@@ -2305,9 +2340,9 @@ mod tests {
     fn test_update_tokens_accumulates_per_step() {
         let mut state = Tab2State::new();
         let id = task_id();
-        state.update_tokens(&id, 100, 10, false);
-        state.update_tokens(&id, 200, 20, false);
-        state.update_tokens(&id, 50, 5, false);
+        state.update_tokens(&id, 100, 10, false, Some("step-1"));
+        state.update_tokens(&id, 200, 20, false, Some("step-2"));
+        state.update_tokens(&id, 50, 5, false, Some("step-3"));
         let (inp, out) = state.get_tokens(&id).unwrap();
         assert_eq!(inp, 350, "per-step input tokens should be summed");
         assert_eq!(out, 35, "per-step output tokens should be summed");
@@ -2318,10 +2353,10 @@ mod tests {
         let mut state = Tab2State::new();
         let id = task_id();
         // Accumulate some per-step counts.
-        state.update_tokens(&id, 100, 10, false);
-        state.update_tokens(&id, 200, 20, false);
+        state.update_tokens(&id, 100, 10, false, Some("step-1"));
+        state.update_tokens(&id, 200, 20, false, Some("step-2"));
         // Cumulative count is higher -- should win.
-        state.update_tokens(&id, 500, 100, true);
+        state.update_tokens(&id, 500, 100, true, None);
         let (inp, out) = state.get_tokens(&id).unwrap();
         assert_eq!(
             inp, 500,
@@ -2338,10 +2373,10 @@ mod tests {
         let mut state = Tab2State::new();
         let id = task_id();
         // Accumulate more than the cumulative report.
-        state.update_tokens(&id, 400, 80, false);
-        state.update_tokens(&id, 300, 60, false);
+        state.update_tokens(&id, 400, 80, false, Some("step-1"));
+        state.update_tokens(&id, 300, 60, false, Some("step-2"));
         // Cumulative is lower -- accumulated value should be kept.
-        state.update_tokens(&id, 500, 50, true);
+        state.update_tokens(&id, 500, 50, true, None);
         let (inp, out) = state.get_tokens(&id).unwrap();
         assert_eq!(
             inp, 700,
@@ -2351,5 +2386,57 @@ mod tests {
             out, 140,
             "accumulated output exceeds cumulative; should not decrease"
         );
+    }
+
+    /// Verifies that a replayed step-finish (same step_id) is not double-counted.
+    #[test]
+    fn test_update_tokens_deduplicates_step_id() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.update_tokens(&id, 500, 50, false, Some("step-1"));
+        // Same step replayed -- should be ignored.
+        state.update_tokens(&id, 500, 50, false, Some("step-1"));
+        let (inp, out) = state.get_tokens(&id).unwrap();
+        assert_eq!(inp, 500, "replayed step should not be double-counted");
+        assert_eq!(out, 50, "replayed step should not be double-counted");
+    }
+
+    /// Verifies that step-finish with no step_id (None) is always accumulated
+    /// (no deduplication possible without an id).
+    #[test]
+    fn test_update_tokens_no_step_id_always_accumulates() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+        state.update_tokens(&id, 100, 10, false, None);
+        state.update_tokens(&id, 100, 10, false, None);
+        let (inp, out) = state.get_tokens(&id).unwrap();
+        assert_eq!(inp, 200, "events without step_id should always accumulate");
+        assert_eq!(out, 20, "events without step_id should always accumulate");
+    }
+
+    /// Simulates two complete turns: step-finish -> message.updated -> step-finish -> message.updated.
+    /// Verifies that cross-turn totals are correct and message.updated does not cause
+    /// step-finish counts from subsequent turns to be inflated.
+    #[test]
+    fn test_update_tokens_two_turn_sequence() {
+        let mut state = Tab2State::new();
+        let id = task_id();
+
+        // Turn 1: two step-finish events, then a message.updated with the cumulative total.
+        state.update_tokens(&id, 300, 30, false, Some("prt-t1-a"));
+        state.update_tokens(&id, 200, 20, false, Some("prt-t1-b"));
+        // message.updated for turn 1 reports 500/50 cumulative.
+        state.update_tokens(&id, 500, 50, true, None);
+        let (inp, out) = state.get_tokens(&id).unwrap();
+        assert_eq!(inp, 500, "turn 1: step_sum matches cumulative floor");
+        assert_eq!(out, 50, "turn 1: step_sum matches cumulative floor");
+
+        // Turn 2: another step-finish, then message.updated with new higher cumulative.
+        state.update_tokens(&id, 400, 40, false, Some("prt-t2-a"));
+        // message.updated for turn 2 reports 900/90 (500+400 / 50+40).
+        state.update_tokens(&id, 900, 90, true, None);
+        let (inp, out) = state.get_tokens(&id).unwrap();
+        assert_eq!(inp, 900, "turn 2: cumulative floor wins over step_sum");
+        assert_eq!(out, 90, "turn 2: cumulative floor wins over step_sum");
     }
 }

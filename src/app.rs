@@ -1420,9 +1420,15 @@ impl App {
                 input_tokens,
                 output_tokens,
                 is_cumulative,
+                step_id,
             } => {
-                self.tab2_state
-                    .update_tokens(&task_id, input_tokens, output_tokens, is_cumulative);
+                self.tab2_state.update_tokens(
+                    &task_id,
+                    input_tokens,
+                    output_tokens,
+                    is_cumulative,
+                    step_id.as_deref(),
+                );
                 vec![]
             }
 

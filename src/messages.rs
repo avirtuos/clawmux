@@ -184,6 +184,9 @@ pub enum AppMessage {
         output_tokens: u64,
         /// `true` for message-level cumulative counts, `false` for per-step counts.
         is_cumulative: bool,
+        /// Part id from the `step-finish` event, used to deduplicate SSE replays.
+        /// `None` for cumulative `message.updated` events.
+        step_id: Option<String>,
     },
 
     // --- Diff events ---

@@ -123,7 +123,7 @@ impl EventStreamConsumer {
                     Ok(Event::Message(msg)) => {
                         // opencode wraps all events in {"payload":{"type":"<name>","properties":{...}}}.
                         // The SSE event: field is always "message" and carries no type info.
-                        tracing::debug!(
+                        tracing::trace!(
                             "SSE raw: event='{}', data_len={}",
                             msg.event,
                             msg.data.len()
@@ -484,6 +484,7 @@ impl EventStreamConsumer {
                 input_tokens,
                 output_tokens,
                 is_cumulative,
+                step_id,
             } => {
                 let task_id = {
                     let map = self.session_map.read().await;
@@ -495,6 +496,7 @@ impl EventStreamConsumer {
                         input_tokens,
                         output_tokens,
                         is_cumulative,
+                        step_id,
                     })
                     .await?;
                 } else {
@@ -827,11 +829,13 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
                     let output = part["tokens"]["output"].as_u64();
                     if let (Some(sid), Some(inp), Some(out)) = (session_id, input, output) {
                         if inp > 0 || out > 0 {
+                            let step_id = part["id"].as_str().map(str::to_string);
                             return OpenCodeEvent::TokensUpdated {
                                 session_id: sid.to_string(),
                                 input_tokens: inp,
                                 output_tokens: out,
                                 is_cumulative: false,
+                                step_id,
                             };
                         }
                     }
@@ -917,6 +921,7 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
                         input_tokens: inp,
                         output_tokens: out,
                         is_cumulative: true,
+                        step_id: None,
                     };
                 }
             }
@@ -1736,6 +1741,7 @@ mod tests {
                     input_tokens: 1234,
                     output_tokens: 567,
                     is_cumulative: true,
+                    step_id: None,
                 } if session_id == "ses_abc"
             ),
             "expected TokensUpdated from info.tokens path, got: {event:?}"
@@ -1755,6 +1761,7 @@ mod tests {
                     input_tokens: 2000,
                     output_tokens: 800,
                     is_cumulative: true,
+                    step_id: None,
                 } if session_id == "ses_abc"
             ),
             "expected TokensUpdated from info.summary.tokens path, got: {event:?}"
@@ -2401,7 +2408,8 @@ mod tests {
                     input_tokens,
                     output_tokens,
                     is_cumulative: false,
-                } if session_id == "ses_xyz" && input_tokens == 7873 && output_tokens == 212
+                    ref step_id,
+                } if session_id == "ses_xyz" && input_tokens == 7873 && output_tokens == 212 && step_id.as_deref() == Some("prt_abc")
             ),
             "expected TokensUpdated from step-finish part, got: {event:?}"
         );
