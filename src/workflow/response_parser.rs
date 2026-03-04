@@ -93,9 +93,11 @@ fn extract_balanced_json(s: &str) -> Option<&str> {
 /// Parses a pipeline agent response from accumulated session text.
 ///
 /// The function first tries to parse `text` directly as an [`AgentResponse`].
-/// If that fails, it searches backwards through `text` for the last `{"action":`
-/// substring and attempts to extract and parse the balanced-brace JSON object
-/// starting there.
+/// If that fails, it searches backwards through `text` for the last `"action"`
+/// key, backtracks to the nearest `{` that opens the enclosing object, and
+/// attempts to extract and parse the balanced-brace JSON object starting there.
+/// This handles both compact (`{"action":"complete",...}`) and pretty-printed
+/// (`{\n  "action": "complete",\n  ...\n}`) agent output.
 ///
 /// # Errors
 ///
@@ -108,12 +110,16 @@ pub fn parse_response(text: &str) -> Result<AgentResponse> {
         return Ok(response);
     }
 
-    // Fallback: search for the last {"action": marker and extract balanced JSON.
-    if let Some(pos) = trimmed.rfind(r#"{"action":"#) {
-        let candidate = &trimmed[pos..];
-        if let Some(json_str) = extract_balanced_json(candidate) {
-            if let Ok(response) = serde_json::from_str::<AgentResponse>(json_str) {
-                return Ok(response);
+    // Fallback: find the last "action" key and backtrack to the enclosing '{'.
+    // Using rfind("\"action\"") handles both compact and pretty-printed JSON.
+    if let Some(action_pos) = trimmed.rfind("\"action\"") {
+        let prefix = &trimmed[..action_pos];
+        if let Some(brace_pos) = prefix.rfind('{') {
+            let candidate = &trimmed[brace_pos..];
+            if let Some(json_str) = extract_balanced_json(candidate) {
+                if let Ok(response) = serde_json::from_str::<AgentResponse>(json_str) {
+                    return Ok(response);
+                }
             }
         }
     }
@@ -200,6 +206,23 @@ mod tests {
         assert!(
             matches!(resp, AgentResponse::Complete { ref summary, .. } if summary == "Finished")
         );
+    }
+
+    #[test]
+    fn test_parse_pretty_printed_json() {
+        let text = "Some preamble text.\n\n{\n  \"action\": \"complete\",\n  \"summary\": \"Done\",\n  \"updates\": {\n    \"implementation_plan\": \"Step 1\"\n  }\n}";
+        let resp = parse_response(text).expect("should parse pretty-printed JSON");
+        if let AgentResponse::Complete {
+            ref summary,
+            updates: Some(ref u),
+            ..
+        } = resp
+        {
+            assert_eq!(summary, "Done");
+            assert_eq!(u.implementation_plan.as_deref(), Some("Step 1"));
+        } else {
+            panic!("expected Complete with updates, got {resp:?}");
+        }
     }
 
     #[test]
