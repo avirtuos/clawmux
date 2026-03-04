@@ -819,6 +819,27 @@ impl App {
                     }
                 }
 
+                // Guard: when no session is registered (session_id == None) and the
+                // workflow is in AwaitingApproval, drop the completion.  The engine
+                // cleared session_id after AgentCompleted but is waiting for the human
+                // to press Ctrl+N before advancing — a spurious or stale event here
+                // would otherwise spawn a second idle session for the current agent
+                // instead of the correct next one.
+                if expected_session.is_none() {
+                    let is_awaiting_approval = self
+                        .workflow_engine
+                        .state(&task_id)
+                        .map(|s| matches!(s.phase, WorkflowPhase::AwaitingApproval { .. }))
+                        .unwrap_or(false);
+                    if is_awaiting_approval {
+                        tracing::debug!(
+                            "Ignoring SessionCompleted for task {} (session_id=None, AwaitingApproval phase)",
+                            task_id
+                        );
+                        return vec![];
+                    }
+                }
+
                 self.tab2_state.clear_awaiting(&task_id);
 
                 // Drain any queued steering prompt before advancing the workflow.
@@ -964,10 +985,19 @@ impl App {
                     }
                     Err(_) => {
                         let agent = current_agent.unwrap_or(AgentKind::Intake);
+                        let preview: String = response_text
+                            .chars()
+                            .rev()
+                            .take(500)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect();
                         tracing::warn!(
-                            "Could not parse structured output for task {} (response_text len={}); waiting for human steering",
+                            "Could not parse structured output for task {} (response_text len={}); last 500 chars: {}",
                             task_id,
-                            response_text.len()
+                            response_text.len(),
+                            preview
                         );
                         self.tab2_state.push_banner(
                             &task_id,
@@ -4064,6 +4094,59 @@ mod tests {
         assert!(
             matches!(msg, AppMessage::CommitFailed { .. }),
             "NullBackend should send CommitFailed, got: {msg:?}"
+        );
+    }
+
+    /// Verifies that a `SessionCompleted` arriving while the workflow is in
+    /// `AwaitingApproval` phase (session_id == None) is silently dropped.
+    ///
+    /// Regression guard for the "double CodeQuality session" bug: after
+    /// `AgentCompleted` the engine clears `session_id` and enters `AwaitingApproval`.
+    /// A stale or spurious `SessionCompleted` arriving in that window must be dropped
+    /// to prevent a second idle session being spawned for the current agent.
+    #[test]
+    fn test_session_completed_ignored_during_awaiting_approval() {
+        let mut app = App::test_default();
+        let task_id = make_task_in_progress(&mut app);
+
+        // Drive the workflow into AwaitingApproval via AgentCompleted with gate enabled.
+        app.workflow_engine.set_approval_gate(true);
+        app.workflow_engine.process(AppMessage::AgentCompleted {
+            task_id: task_id.clone(),
+            agent: AgentKind::Intake,
+            summary: "done".to_string(),
+        });
+
+        // Confirm we are now in AwaitingApproval with session_id == None.
+        let state = app.workflow_engine.state(&task_id).unwrap();
+        assert!(
+            matches!(state.phase, WorkflowPhase::AwaitingApproval { .. }),
+            "expected AwaitingApproval, got {:?}",
+            state.phase
+        );
+        assert!(
+            state.session_id.is_none(),
+            "session_id should be None after AgentCompleted with gate"
+        );
+
+        // A spurious / stale SessionCompleted must be dropped entirely.
+        let msgs = app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "stale-sess".to_string(),
+            response_text: "some text without action key".to_string(),
+        });
+
+        assert!(
+            msgs.is_empty(),
+            "SessionCompleted during AwaitingApproval must return no messages, got: {msgs:?}"
+        );
+
+        // Phase must remain AwaitingApproval — no idle session spawned, no advance.
+        let state = app.workflow_engine.state(&task_id).unwrap();
+        assert!(
+            matches!(state.phase, WorkflowPhase::AwaitingApproval { .. }),
+            "phase must stay AwaitingApproval after dropped completion, got {:?}",
+            state.phase
         );
     }
 }

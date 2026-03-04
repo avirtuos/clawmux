@@ -93,11 +93,12 @@ fn extract_balanced_json(s: &str) -> Option<&str> {
 /// Parses a pipeline agent response from accumulated session text.
 ///
 /// The function first tries to parse `text` directly as an [`AgentResponse`].
-/// If that fails, it searches backwards through `text` for the last `"action"`
-/// key, backtracks to the nearest `{` that opens the enclosing object, and
-/// attempts to extract and parse the balanced-brace JSON object starting there.
-/// This handles both compact (`{"action":"complete",...}`) and pretty-printed
-/// (`{\n  "action": "complete",\n  ...\n}`) agent output.
+/// If that fails, it scans backwards through all occurrences of `"action"`,
+/// backtracks to the nearest enclosing `{`, and tries to extract and parse
+/// the balanced-brace JSON object starting there.  Scanning all occurrences
+/// (last to first) handles both compact JSON (`{"action":`) and pretty-printed
+/// JSON, and correctly skips false matches where `"action"` appears in
+/// ordinary prose after the real JSON object.
 ///
 /// # Errors
 ///
@@ -110,9 +111,13 @@ pub fn parse_response(text: &str) -> Result<AgentResponse> {
         return Ok(response);
     }
 
-    // Fallback: find the last "action" key and backtrack to the enclosing '{'.
-    // Using rfind("\"action\"") handles both compact and pretty-printed JSON.
-    if let Some(action_pos) = trimmed.rfind("\"action\"") {
+    // Fallback: iterate over every occurrence of "action" from last to first.
+    // For each, backtrack to the nearest '{' and attempt to extract balanced JSON.
+    // Trying all occurrences handles cases where "action" appears in prose after
+    // the real JSON object, which would cause a single rfind to land on the wrong hit.
+    let needle = "\"action\"";
+    let mut search_end = trimmed.len();
+    while let Some(action_pos) = trimmed[..search_end].rfind(needle) {
         let prefix = &trimmed[..action_pos];
         if let Some(brace_pos) = prefix.rfind('{') {
             let candidate = &trimmed[brace_pos..];
@@ -122,6 +127,7 @@ pub fn parse_response(text: &str) -> Result<AgentResponse> {
                 }
             }
         }
+        search_end = action_pos;
     }
 
     Err(ClawdMuxError::Json(
@@ -244,5 +250,18 @@ mod tests {
         let text = r#"{"action":"unknown","foo":"bar"}"#;
         let result = parse_response(text);
         assert!(result.is_err(), "unknown action should fail to parse");
+    }
+
+    /// Verifies that a false `"action"` match in prose after the real JSON is skipped.
+    ///
+    /// The parser scans occurrences of `"action"` from last to first, so even though
+    /// the last occurrence is in prose (not in a valid JSON object), it must fall back
+    /// to the earlier occurrence that is the genuine agent response.
+    #[test]
+    fn test_parse_action_in_prose_after_json() {
+        let text =
+            r#"{"action":"complete","summary":"done"} The action described above is finished."#;
+        let resp = parse_response(text).expect("should parse despite prose action");
+        assert!(matches!(resp, AgentResponse::Complete { ref summary, .. } if summary == "done"));
     }
 }
