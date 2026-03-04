@@ -37,6 +37,13 @@ pub struct EventStreamConsumer {
     session_map: SessionMap,
     /// Accumulated assistant text per session ID, drained on session completion.
     accumulated_text: HashMap<String, String>,
+    /// Longest non-empty text seen per session.
+    ///
+    /// Unlike `accumulated_text` (which reflects the latest snapshot for streaming
+    /// display and can be overwritten by empty user-message events), this preserves
+    /// the longest text seen so that the structured JSON response is available when
+    /// `SessionCompleted` fires.
+    best_response_text: HashMap<String, String>,
     /// Per-(session, message) accumulated delta text for streaming display.
     ///
     /// Each delta is appended here so the full text can be emitted on every chunk.
@@ -62,6 +69,7 @@ impl EventStreamConsumer {
             tx,
             session_map,
             accumulated_text: HashMap::new(),
+            best_response_text: HashMap::new(),
             accumulated_deltas: HashMap::new(),
             last_registered_session: None,
         }
@@ -237,7 +245,18 @@ impl EventStreamConsumer {
                         MessagePart::Text { text } => Some(text.clone()),
                         _ => None,
                     }) {
-                        self.accumulated_text.insert(session_id.clone(), text);
+                        self.accumulated_text
+                            .insert(session_id.clone(), text.clone());
+                        // Preserve the longest text seen so empty user-message events
+                        // cannot overwrite the structured JSON response.
+                        if text.len()
+                            > self
+                                .best_response_text
+                                .get(&session_id)
+                                .map_or(0, |t| t.len())
+                        {
+                            self.best_response_text.insert(session_id.clone(), text);
+                        }
                     }
                     self.send(AppMessage::StreamingUpdate {
                         task_id,
@@ -272,6 +291,15 @@ impl EventStreamConsumer {
                         };
                         self.accumulated_text
                             .insert(session_id.clone(), full_text.clone());
+                        if full_text.len()
+                            > self
+                                .best_response_text
+                                .get(&session_id)
+                                .map_or(0, |t| t.len())
+                        {
+                            self.best_response_text
+                                .insert(session_id.clone(), full_text.clone());
+                        }
                         self.send(AppMessage::StreamingUpdate {
                             task_id,
                             session_id,
@@ -358,9 +386,12 @@ impl EventStreamConsumer {
                 };
                 if let Some(task_id) = task_id {
                     let response_text = self
-                        .accumulated_text
+                        .best_response_text
                         .remove(&session_id)
+                        .or_else(|| self.accumulated_text.remove(&session_id))
                         .unwrap_or_default();
+                    // Also clean up accumulated_text (may still have a stale entry).
+                    self.accumulated_text.remove(&session_id);
                     self.accumulated_deltas
                         .retain(|(sid, _), _| *sid != session_id);
                     // Clone before move into message so we can remove from the map after send.
@@ -384,6 +415,7 @@ impl EventStreamConsumer {
                     map.get(&session_id).map(|(task_id, _)| task_id.clone())
                 };
                 // Clean up accumulated text and deltas to prevent memory leaks.
+                self.best_response_text.remove(&session_id);
                 self.accumulated_text.remove(&session_id);
                 self.accumulated_deltas
                     .retain(|(sid, _), _| *sid != session_id);
@@ -750,9 +782,11 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
                 }
             }
         }
-        // message.part.updated carries tool state (pending/running/completed) that
-        // must be surfaced. Non-tool parts (text streaming) are still ignored because
-        // they are superseded by message.part.delta (OpenCode >= 1.2).
+        // message.part.updated carries tool state (pending/running/completed) and
+        // text snapshots. Text parts carry the agent's accumulated response and must
+        // be forwarded so accumulated_text is populated for SessionCompleted.
+        // message.part.delta is the preferred streaming path but OpenCode also sends
+        // full-text snapshots via part.updated; both paths must be handled.
         "message.part.updated" => {
             if let Some(part) = props.get("part") {
                 if part.get("type").and_then(|t| t.as_str()) == Some("tool") {
@@ -804,14 +838,42 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
                         }
                     }
                 }
+                // text parts carry the agent's full response snapshot and must be
+                // accumulated for SessionCompleted. message.part.delta is the preferred
+                // streaming path, but OpenCode also delivers text via part.updated.
+                if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    let session_id = part["sessionID"]
+                        .as_str()
+                        .or_else(|| part["sessionId"].as_str());
+                    let text = part["text"].as_str();
+                    if let (Some(sid), Some(txt)) = (session_id, text) {
+                        let message_id = part["messageID"]
+                            .as_str()
+                            .or_else(|| part["messageId"].as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        return OpenCodeEvent::MessageUpdated {
+                            session_id: sid.to_string(),
+                            message_id,
+                            parts: vec![MessagePart::Text {
+                                text: txt.to_string(),
+                            }],
+                        };
+                    }
+                }
             }
             debug!("SSE event '{}': ignoring (props: {})", event_type, props);
             OpenCodeEvent::Unknown
         }
-        // message.updated: ignore the message content (superseded by message.part.delta
-        // in OpenCode >= 1.2) but extract token usage when present and non-zero.
+        // message.updated: extract text from the message body when present, then extract
+        // token usage. In some OpenCode versions (observed in production) the final
+        // assistant response text arrives exclusively via message.updated (props["parts"])
+        // rather than via message.part.updated or message.part.delta. Text extraction is
+        // prioritised: when a text part is found we return MessageUpdated immediately so
+        // accumulated_text is populated for SessionCompleted. Token extraction is the
+        // fallback when no text parts are present.
         //
-        // OpenCode sends two path layouts depending on message role:
+        // OpenCode sends two token path layouts depending on message role:
         //   - assistant: info.tokens.{input,output}
         //   - user:      info.summary.tokens.{input,output}  (fallback, not always present)
         //
@@ -821,6 +883,29 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
             let session_id = props["sessionId"]
                 .as_str()
                 .or_else(|| props["sessionID"].as_str());
+            // Check for text content in the message parts first.
+            if let Some(sid) = session_id {
+                if let Some(parts) = props["parts"].as_array() {
+                    if let Some(text) = parts.iter().find_map(|p| {
+                        if p["type"].as_str() == Some("text") {
+                            p["text"].as_str().map(|t| t.to_string())
+                        } else {
+                            None
+                        }
+                    }) {
+                        let message_id = props["messageId"]
+                            .as_str()
+                            .or_else(|| props["messageID"].as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        return OpenCodeEvent::MessageUpdated {
+                            session_id: sid.to_string(),
+                            message_id,
+                            parts: vec![MessagePart::Text { text }],
+                        };
+                    }
+                }
+            }
             let input = props["info"]["tokens"]["input"]
                 .as_u64()
                 .or_else(|| props["info"]["summary"]["tokens"]["input"].as_u64());
@@ -1362,10 +1447,14 @@ mod tests {
             "expected last accumulated text 'second'"
         );
 
-        // accumulated_text should now be empty for this session.
+        // Both maps should now be empty for this session.
         assert!(
             consumer.accumulated_text.is_empty(),
             "accumulated_text should be cleared after SessionCompleted"
+        );
+        assert!(
+            consumer.best_response_text.is_empty(),
+            "best_response_text should be cleared after SessionCompleted"
         );
     }
 
@@ -1403,6 +1492,60 @@ mod tests {
             consumer.accumulated_text.is_empty(),
             "accumulated_text should be cleared on SessionError"
         );
+        assert!(
+            consumer.best_response_text.is_empty(),
+            "best_response_text should be cleared on SessionError"
+        );
+    }
+
+    /// Verifies that an empty `MessageUpdated` (user-message event) does not overwrite a
+    /// previously captured non-empty response text in `best_response_text`.
+    #[tokio::test]
+    async fn test_empty_message_updated_does_not_wipe_response_text() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert("sess-z".to_string(), (task_id.clone(), AgentKind::Intake));
+        }
+
+        // Emit a MessageUpdated with the real JSON response.
+        consumer
+            .handle_event(OpenCodeEvent::MessageUpdated {
+                session_id: "sess-z".to_string(),
+                message_id: "msg-1".to_string(),
+                parts: make_text_parts(r#"{"action":"complete"}"#),
+            })
+            .await
+            .expect("handle_event");
+        let _ = rx.try_recv().expect("drain StreamingUpdate");
+
+        // Emit an empty MessageUpdated (simulates OpenCode user-message event).
+        consumer
+            .handle_event(OpenCodeEvent::MessageUpdated {
+                session_id: "sess-z".to_string(),
+                message_id: "msg-2".to_string(),
+                parts: make_text_parts(""),
+            })
+            .await
+            .expect("handle_event");
+        let _ = rx.try_recv().expect("drain StreamingUpdate");
+
+        // SessionCompleted should carry the original non-empty response text.
+        consumer
+            .handle_event(OpenCodeEvent::SessionCompleted {
+                session_id: "sess-z".to_string(),
+            })
+            .await
+            .expect("handle_event");
+        let msg = rx.try_recv().expect("SessionCompleted message");
+        assert!(
+            matches!(&msg, AppMessage::SessionCompleted { response_text, .. } if response_text == r#"{"action":"complete"}"#),
+            "expected original JSON response, got: {msg:?}"
+        );
+
+        assert!(consumer.accumulated_text.is_empty());
+        assert!(consumer.best_response_text.is_empty());
     }
 
     /// Verifies that parse_wire_event correctly extracts the session ID from the nested
@@ -1488,17 +1631,27 @@ mod tests {
         );
     }
 
-    /// Verifies that message.updated without token data returns Unknown.
+    /// Verifies that message.updated with text parts produces MessageUpdated.
     ///
-    /// The message content is intentionally ignored (superseded by message.part.delta
-    /// in OpenCode >= 1.2), and without a token payload there is nothing to emit.
+    /// In some OpenCode versions the final response text arrives only via
+    /// message.updated (props["parts"]); we must extract it so accumulated_text
+    /// is populated when SessionCompleted fires.
     #[test]
-    fn test_parse_wire_event_message_updated_no_tokens_ignored() {
+    fn test_parse_wire_event_message_updated_with_text_produces_message_updated() {
         let json = r#"{"payload":{"type":"message.updated","properties":{"sessionId":"ses_abc","messageId":"msg_1","parts":[{"type":"text","text":"hello"}]}}}"#;
         let event = parse_wire_event(json);
         assert!(
-            matches!(event, OpenCodeEvent::Unknown),
-            "message.updated with no token data should return Unknown, got: {event:?}"
+            matches!(
+                event,
+                OpenCodeEvent::MessageUpdated {
+                    ref session_id,
+                    ref message_id,
+                    ref parts,
+                } if session_id == "ses_abc"
+                    && message_id == "msg_1"
+                    && matches!(parts.first(), Some(MessagePart::Text { text }) if text == "hello")
+            ),
+            "message.updated with text parts should produce MessageUpdated, got: {event:?}"
         );
     }
 
@@ -1608,15 +1761,118 @@ mod tests {
         );
     }
 
-    /// Verifies that a message.part.updated with a non-tool (text) part still returns Unknown.
+    /// Verifies that a message.part.updated with a text part produces MessageUpdated
+    /// (not Unknown), so that accumulated_text is populated for SessionCompleted.
     #[test]
-    fn test_non_tool_message_part_updated_still_ignored() {
-        let json = r#"{"payload":{"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"ses_abc","text":"hello"}}}}"#;
+    fn test_message_part_updated_text_produces_message_updated() {
+        let json = r#"{"payload":{"type":"message.part.updated","properties":{"part":{"type":"text","sessionID":"ses_abc","messageID":"msg_1","text":"hello"}}}}"#;
         let event = parse_wire_event(json);
         assert!(
-            matches!(event, OpenCodeEvent::Unknown),
-            "non-tool message.part.updated should return Unknown, got: {event:?}"
+            matches!(
+                event,
+                OpenCodeEvent::MessageUpdated {
+                    ref session_id,
+                    ref message_id,
+                    ref parts,
+                } if session_id == "ses_abc"
+                    && message_id == "msg_1"
+                    && matches!(parts.first(), Some(MessagePart::Text { text }) if text == "hello")
+            ),
+            "text part.updated should produce MessageUpdated, got: {event:?}"
         );
+    }
+
+    /// Verifies that text arriving via message.part.updated is accumulated and
+    /// included in the SessionCompleted AppMessage's response_text field.
+    #[tokio::test]
+    async fn test_message_part_updated_text_accumulates_for_session_completed() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-text".to_string(),
+                (task_id.clone(), AgentKind::Implementation),
+            );
+        }
+
+        // Emit a MessageUpdated produced from a text part.updated event.
+        consumer
+            .handle_event(OpenCodeEvent::MessageUpdated {
+                session_id: "sess-text".to_string(),
+                message_id: "msg-1".to_string(),
+                parts: make_text_parts("the full response"),
+            })
+            .await
+            .expect("handle_event");
+        let _ = rx.try_recv().expect("drain StreamingUpdate");
+
+        // Now fire SessionCompleted and check response_text.
+        consumer
+            .handle_event(OpenCodeEvent::SessionCompleted {
+                session_id: "sess-text".to_string(),
+            })
+            .await
+            .expect("handle_event");
+
+        let msg = rx.try_recv().expect("SessionCompleted AppMessage");
+        match msg {
+            AppMessage::SessionCompleted {
+                response_text,
+                task_id: tid,
+                ..
+            } => {
+                assert_eq!(tid, task_id);
+                assert_eq!(
+                    response_text, "the full response",
+                    "response_text should carry text accumulated from part.updated"
+                );
+            }
+            other => panic!("expected SessionCompleted, got: {other:?}"),
+        }
+    }
+
+    /// Verifies that text arriving via message.updated (props["parts"]) is accumulated
+    /// and included in the SessionCompleted AppMessage's response_text field.
+    /// This covers the case where OpenCode delivers final text through message.updated
+    /// rather than message.part.updated or message.part.delta.
+    #[tokio::test]
+    async fn test_message_updated_text_accumulates_for_session_completed() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert("sess-mu".to_string(), (task_id.clone(), AgentKind::Design));
+        }
+
+        // Simulate a message.updated event that carries the full response text.
+        let json = r#"{"payload":{"type":"message.updated","properties":{"sessionId":"sess-mu","messageId":"msg-final","parts":[{"type":"text","text":"design output"}]}}}"#;
+        let event = parse_wire_event(json);
+        consumer.handle_event(event).await.expect("handle_event");
+        let _ = rx.try_recv().expect("drain StreamingUpdate");
+
+        consumer
+            .handle_event(OpenCodeEvent::SessionCompleted {
+                session_id: "sess-mu".to_string(),
+            })
+            .await
+            .expect("handle_event");
+
+        let msg = rx.try_recv().expect("SessionCompleted AppMessage");
+        match msg {
+            AppMessage::SessionCompleted {
+                response_text,
+                task_id: tid,
+                ..
+            } => {
+                assert_eq!(tid, task_id);
+                assert_eq!(
+                    response_text, "design output",
+                    "response_text should carry text accumulated from message.updated parts"
+                );
+            }
+            other => panic!("expected SessionCompleted, got: {other:?}"),
+        }
     }
 
     /// Verifies that known-but-ignored events (heartbeats etc.) return Unknown.
