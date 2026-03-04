@@ -1109,8 +1109,9 @@ impl App {
                     Err(_) => {
                         let agent = current_agent.unwrap_or(AgentKind::Intake);
                         tracing::warn!(
-                            "Could not parse structured output for task {}; waiting for human steering",
-                            task_id
+                            "Could not parse structured output for task {} (response_text len={}); waiting for human steering",
+                            task_id,
+                            response_text.len()
                         );
                         self.tab2_state.push_banner(
                             &task_id,
