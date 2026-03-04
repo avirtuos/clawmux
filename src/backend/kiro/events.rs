@@ -180,7 +180,11 @@ pub async fn run_event_loop(
                     session_id: session_id.clone(),
                     response_text: accumulated_text.clone(),
                 }).await;
-                break;
+                // Reset for the next turn. The event loop stays alive so that
+                // subsequent steering prompts (send_prompt calls on the same
+                // kiro-cli process) can also deliver their SessionCompleted.
+                // The loop exits naturally when incoming_rx closes (kiro-cli exits).
+                accumulated_text = String::new();
             }
         }
     }

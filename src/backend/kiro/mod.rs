@@ -115,6 +115,16 @@ impl AgentBackend for KiroBackend {
                 map.insert(session_id.clone(), (task_id.clone(), agent));
             }
 
+            // Notify the workflow engine so it can track this session_id.
+            // This is required for the SessionCompleted guard to reject stale
+            // completions from old sessions when a new session takes over.
+            let _ = async_tx
+                .send(AppMessage::SessionCreated {
+                    task_id: task_id.clone(),
+                    session_id: session_id.clone(),
+                })
+                .await;
+
             // Send the initial prompt
             if let Err(e) = process.send_prompt(&prompt, async_tx.clone()).await {
                 tracing::error!("failed to send prompt to kiro for task {task_id}: {e}");
