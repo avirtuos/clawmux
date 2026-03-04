@@ -93,9 +93,12 @@ fn extract_balanced_json(s: &str) -> Option<&str> {
 /// Parses a pipeline agent response from accumulated session text.
 ///
 /// The function first tries to parse `text` directly as an [`AgentResponse`].
-/// If that fails, it searches backwards through `text` for the last `{"action":`
-/// substring and attempts to extract and parse the balanced-brace JSON object
-/// starting there.
+/// If that fails, it scans backwards through all occurrences of `"action"`,
+/// backtracks to the nearest enclosing `{`, and tries to extract and parse
+/// the balanced-brace JSON object starting there. Scanning all occurrences
+/// (last to first) handles both compact JSON (`{"action":`) and pretty-printed
+/// JSON, and correctly skips false matches where `"action"` appears in
+/// ordinary prose after the real JSON object.
 ///
 /// # Errors
 ///
@@ -108,14 +111,23 @@ pub fn parse_response(text: &str) -> Result<AgentResponse> {
         return Ok(response);
     }
 
-    // Fallback: search for the last {"action": marker and extract balanced JSON.
-    if let Some(pos) = trimmed.rfind(r#"{"action":"#) {
-        let candidate = &trimmed[pos..];
-        if let Some(json_str) = extract_balanced_json(candidate) {
-            if let Ok(response) = serde_json::from_str::<AgentResponse>(json_str) {
-                return Ok(response);
+    // Fallback: iterate over every occurrence of "action" from last to first.
+    // For each, backtrack to the nearest '{' and attempt to extract balanced JSON.
+    // Trying all occurrences handles cases where "action" appears in prose after
+    // the real JSON object, which would cause a single rfind to land on the wrong hit.
+    let needle = "\"action\"";
+    let mut search_end = trimmed.len();
+    while let Some(action_pos) = trimmed[..search_end].rfind(needle) {
+        let prefix = &trimmed[..action_pos];
+        if let Some(brace_pos) = prefix.rfind('{') {
+            let candidate = &trimmed[brace_pos..];
+            if let Some(json_str) = extract_balanced_json(candidate) {
+                if let Ok(response) = serde_json::from_str::<AgentResponse>(json_str) {
+                    return Ok(response);
+                }
             }
         }
+        search_end = action_pos;
     }
 
     Err(ClawdMuxError::Json(
@@ -221,5 +233,22 @@ mod tests {
         let text = r#"{"action":"unknown","foo":"bar"}"#;
         let result = parse_response(text);
         assert!(result.is_err(), "unknown action should fail to parse");
+    }
+
+    #[test]
+    fn test_parse_pretty_printed_json() {
+        let text = "Some preamble text.\n\n{\n  \"action\": \"complete\",\n  \"summary\": \"Done\",\n  \"updates\": {\n    \"implementation_plan\": \"Step 1\"\n  }\n}";
+        let resp = parse_response(text).expect("should parse pretty-printed JSON");
+        if let AgentResponse::Complete {
+            ref summary,
+            updates: Some(ref u),
+            ..
+        } = resp
+        {
+            assert_eq!(summary, "Done");
+            assert_eq!(u.implementation_plan.as_deref(), Some("Step 1"));
+        } else {
+            panic!("expected Complete with updates, got {resp:?}");
+        }
     }
 }

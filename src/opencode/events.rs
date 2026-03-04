@@ -37,12 +37,14 @@ pub struct EventStreamConsumer {
     session_map: SessionMap,
     /// Accumulated assistant text per session ID, drained on session completion.
     accumulated_text: HashMap<String, String>,
-    /// Longest non-empty text seen per session.
+    /// Last text seen per session that contains the `"action"` key.
     ///
     /// Unlike `accumulated_text` (which reflects the latest snapshot for streaming
-    /// display and can be overwritten by empty user-message events), this preserves
-    /// the longest text seen so that the structured JSON response is available when
-    /// `SessionCompleted` fires.
+    /// display and can be overwritten by empty user-message events), this is only
+    /// updated when the text looks like an agent response (contains `"action"`).
+    /// This prevents large user-message context prompts -- which arrive before the
+    /// agent replies and can be far longer than the short JSON response -- from
+    /// polluting the response captured at `SessionCompleted`.
     best_response_text: HashMap<String, String>,
     /// Per-(session, message) accumulated delta text for streaming display.
     ///
@@ -247,14 +249,12 @@ impl EventStreamConsumer {
                     }) {
                         self.accumulated_text
                             .insert(session_id.clone(), text.clone());
-                        // Preserve the longest text seen so empty user-message events
-                        // cannot overwrite the structured JSON response.
-                        if text.len()
-                            > self
-                                .best_response_text
-                                .get(&session_id)
-                                .map_or(0, |t| t.len())
-                        {
+                        // Only track in best_response_text when the text looks like an
+                        // agent response. User-message context prompts can be much longer
+                        // than the agent's short JSON reply, so a length-based heuristic
+                        // would pick the wrong text. Checking for "action" ensures we
+                        // only store genuine agent responses here.
+                        if text.contains("\"action\"") {
                             self.best_response_text.insert(session_id.clone(), text);
                         }
                     }
@@ -291,12 +291,7 @@ impl EventStreamConsumer {
                         };
                         self.accumulated_text
                             .insert(session_id.clone(), full_text.clone());
-                        if full_text.len()
-                            > self
-                                .best_response_text
-                                .get(&session_id)
-                                .map_or(0, |t| t.len())
-                        {
+                        if full_text.contains("\"action\"") {
                             self.best_response_text
                                 .insert(session_id.clone(), full_text.clone());
                         }
@@ -1546,6 +1541,62 @@ mod tests {
 
         assert!(consumer.accumulated_text.is_empty());
         assert!(consumer.best_response_text.is_empty());
+    }
+
+    /// Verifies that a large user-message context prompt does not overwrite the agent's
+    /// short JSON response in `best_response_text`.
+    ///
+    /// The user-message text is longer than the agent response but does not contain
+    /// `"action"`, so it must not be preferred over the agent's JSON.
+    #[tokio::test]
+    async fn test_large_user_context_does_not_pollute_response_text() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-ctx".to_string(),
+                (task_id.clone(), AgentKind::CodeReview),
+            );
+        }
+
+        // Simulate a large user-message context arriving first (no "action").
+        let user_context = "## Task Context\n- Story: 6\n- Task: 6.2\n".repeat(200);
+        assert!(user_context.len() > 5000, "user context should be large");
+        consumer
+            .handle_event(OpenCodeEvent::MessageUpdated {
+                session_id: "sess-ctx".to_string(),
+                message_id: "msg-user".to_string(),
+                parts: make_text_parts(&user_context),
+            })
+            .await
+            .expect("handle_event");
+        let _ = rx.try_recv().expect("drain StreamingUpdate");
+
+        // Agent then responds with a short JSON (contains "action").
+        consumer
+            .handle_event(OpenCodeEvent::MessageUpdated {
+                session_id: "sess-ctx".to_string(),
+                message_id: "msg-agent".to_string(),
+                parts: make_text_parts(r#"{"action":"complete","summary":"done"}"#),
+            })
+            .await
+            .expect("handle_event");
+        let _ = rx.try_recv().expect("drain StreamingUpdate");
+
+        // SessionCompleted must carry the agent JSON, not the user context.
+        consumer
+            .handle_event(OpenCodeEvent::SessionCompleted {
+                session_id: "sess-ctx".to_string(),
+            })
+            .await
+            .expect("handle_event");
+        let msg = rx.try_recv().expect("SessionCompleted message");
+        assert!(
+            matches!(&msg, AppMessage::SessionCompleted { response_text, .. }
+                if response_text == r#"{"action":"complete","summary":"done"}"#),
+            "expected agent JSON response, got: {msg:?}"
+        );
     }
 
     /// Verifies that parse_wire_event correctly extracts the session ID from the nested
