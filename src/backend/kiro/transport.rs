@@ -99,21 +99,23 @@ impl Transport {
     }
 
     /// Send a JSON-RPC response to a bidirectional agent request.
-    pub async fn respond(&self, id: u64, result: Value) -> Result<()> {
-        let resp = RpcResponse::ok(id, result);
+    ///
+    /// `id` must match the `id` from the agent's request so it can correlate the reply.
+    pub async fn respond(&self, id: &Value, result: Value) -> Result<()> {
+        let resp = RpcResponse::ok(id.clone(), result);
         self.write_line(&serde_json::to_value(&resp)?).await
     }
 
     /// Send a JSON-RPC error response to a bidirectional agent request.
     pub async fn respond_error(
         &self,
-        id: u64,
+        id: &Value,
         code: i64,
         message: impl Into<String>,
     ) -> Result<()> {
         use super::types::RpcError;
         let resp = RpcResponse::err(
-            id,
+            id.clone(),
             RpcError {
                 code,
                 message: message.into(),
@@ -377,7 +379,40 @@ mod tests {
         assert!(matches!(msg, IncomingMessage::Request(_)));
         if let IncomingMessage::Request(req) = msg {
             assert_eq!(req.method, "session/request_permission");
-            assert_eq!(req.id, 10);
+            assert_eq!(req.id, serde_json::json!(10));
+        }
+    }
+
+    /// Regression test: kiro-cli sends UUID strings as bidirectional request IDs.
+    ///
+    /// Previously `RpcRequest.id` was `u64`, causing deserialization to fail and
+    /// permission requests to be silently dropped.
+    #[tokio::test]
+    async fn test_route_bidirectional_request_uuid_string_id() {
+        let (notification_tx, mut notification_rx) = mpsc::channel(64);
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let bidi_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "8c599dcf-5387-4823-8335-102f884f9048",
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess-1",
+                "permission": "file_write",
+                "patterns": ["docs/**"]
+            }
+        });
+
+        route_message(bidi_request, &pending, &notification_tx).await;
+
+        let msg = notification_rx.recv().await.unwrap();
+        assert!(matches!(msg, IncomingMessage::Request(_)));
+        if let IncomingMessage::Request(req) = msg {
+            assert_eq!(req.method, "session/request_permission");
+            assert_eq!(
+                req.id,
+                serde_json::json!("8c599dcf-5387-4823-8335-102f884f9048")
+            );
         }
     }
 

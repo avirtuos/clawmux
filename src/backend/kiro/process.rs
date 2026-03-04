@@ -287,7 +287,7 @@ impl KiroProcess {
     /// Resolve a pending permission request.
     ///
     /// Routes the user's decision to the event loop via the permission channel.
-    pub async fn resolve_permission(&self, rpc_id: u64, decision: &str) -> Result<()> {
+    pub async fn resolve_permission(&self, rpc_id: &str, decision: &str) -> Result<()> {
         self.permission_tx
             .send(PermissionResponse::new(rpc_id, decision))
             .await

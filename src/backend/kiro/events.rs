@@ -33,16 +33,19 @@ use super::types::{
 #[derive(Debug, Clone)]
 pub struct PermissionResponse {
     /// The JSON-RPC request id of the `session/request_permission` we are answering.
-    pub rpc_id: u64,
+    ///
+    /// Stored as a `String` to support both numeric IDs (from the spec) and the UUID
+    /// strings that kiro-cli actually uses for bidirectional request IDs.
+    pub rpc_id: String,
     /// The user's permission string: "once", "always", or "reject".
     pub decision: String,
 }
 
 impl PermissionResponse {
     /// Create a permission response from a raw decision string.
-    pub fn new(rpc_id: u64, decision: impl Into<String>) -> Self {
+    pub fn new(rpc_id: impl Into<String>, decision: impl Into<String>) -> Self {
         Self {
-            rpc_id,
+            rpc_id: rpc_id.into(),
             decision: decision.into(),
         }
     }
@@ -123,7 +126,7 @@ pub async fn run_event_loop(
                         // Bidirectional request from agent -- only permission requests expected
                         if req.method == "session/request_permission" {
                             handle_permission_request(
-                                req.id,
+                                &req.id,
                                 req.params.as_ref(),
                                 &task_id,
                                 &session_id,
@@ -136,7 +139,7 @@ pub async fn run_event_loop(
                                 "unexpected bidirectional request from kiro: {}",
                                 req.method
                             );
-                            let _ = transport.respond_error(req.id, -32601, "Method not found").await;
+                            let _ = transport.respond_error(&req.id, -32601, "Method not found").await;
                         }
                     }
                 }
@@ -385,7 +388,7 @@ pub(crate) async fn handle_notification(
 ///
 /// Forwards the permission request to the TUI, then blocks until the user resolves.
 async fn handle_permission_request(
-    rpc_id: u64,
+    rpc_id: &serde_json::Value,
     params: Option<&serde_json::Value>,
     task_id: &TaskId,
     session_id: &str,
@@ -393,6 +396,13 @@ async fn handle_permission_request(
     permission_rx: &mut mpsc::Receiver<PermissionResponse>,
     async_tx: &mpsc::Sender<AppMessage>,
 ) {
+    // Extract a string representation of the ID for comparison and display.
+    // kiro-cli uses UUID strings; the spec also allows numbers.
+    let rpc_id_str: String = match rpc_id {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+
     let Some(params) = params else {
         let _ = transport
             .respond_error(rpc_id, -32602, "Missing params")
@@ -417,7 +427,7 @@ async fn handle_permission_request(
 
     let permission_kind = map_permission_kind(&perm.permission);
     let request = PermissionRequest {
-        id: rpc_id.to_string(),
+        id: rpc_id_str.clone(),
         session_id: session_id.to_string(),
         permission: permission_kind.to_string(),
         patterns: if perm.patterns.is_empty() && !perm.description.is_empty() {
@@ -436,37 +446,34 @@ async fn handle_permission_request(
 
     // Block until the user resolves the permission.
     // Drain other permission responses until we see one for our rpc_id.
-    loop {
+    let result = loop {
         match permission_rx.recv().await {
             None => {
                 // Channel closed -- reject to unblock the agent
-                tracing::warn!("permission channel closed while waiting for rpc_id={rpc_id}");
-                let result = serde_json::to_value(PermissionResult {
+                tracing::warn!("permission channel closed while waiting for rpc_id={rpc_id_str}");
+                break serde_json::to_value(PermissionResult {
                     decision: PermissionDecision::RejectOnce,
                 })
                 .unwrap_or(serde_json::json!({"decision": "reject_once"}));
-                let _ = transport.respond(rpc_id, result).await;
-                break;
             }
-            Some(response) if response.rpc_id == rpc_id => {
+            Some(response) if response.rpc_id == rpc_id_str => {
                 let acp_decision = map_permission_decision(&response.decision);
-                let result = serde_json::to_value(PermissionResult {
+                break serde_json::to_value(PermissionResult {
                     decision: acp_decision,
                 })
                 .unwrap_or(serde_json::json!({"decision": "allow_once"}));
-                let _ = transport.respond(rpc_id, result).await;
-                break;
             }
             Some(other) => {
                 // Response for a different rpc_id (shouldn't happen in practice)
                 tracing::debug!(
                     "ignoring permission response for rpc_id={} while waiting for {}",
                     other.rpc_id,
-                    rpc_id
+                    rpc_id_str
                 );
             }
         }
-    }
+    };
+    let _ = transport.respond(rpc_id, result).await;
 }
 
 #[cfg(test)]
@@ -1015,8 +1022,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_permission_response_new() {
-        let resp = PermissionResponse::new(42, "always");
-        assert_eq!(resp.rpc_id, 42);
+        let resp = PermissionResponse::new("42", "always");
+        assert_eq!(resp.rpc_id, "42");
         assert_eq!(resp.decision, "always");
+    }
+
+    #[tokio::test]
+    async fn test_permission_response_new_uuid_string() {
+        let uuid = "8c599dcf-5387-4823-8335-102f884f9048";
+        let resp = PermissionResponse::new(uuid, "once");
+        assert_eq!(resp.rpc_id, uuid);
+        assert_eq!(resp.decision, "once");
     }
 }

@@ -290,23 +290,10 @@ impl AgentBackend for KiroBackend {
         let rpc_id_str = request.id.clone();
 
         tokio::spawn(async move {
-            // Parse the rpc_id (stored in request.id)
-            let rpc_id: u64 = match rpc_id_str.parse() {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!("resolve_permission: invalid rpc_id '{rpc_id_str}': {e}");
-                    // If we can't route the permission, send the steering prompt if any
-                    if let Some(msg) = send_prompt_msg {
-                        let _ = async_tx.send(msg).await;
-                    }
-                    return;
-                }
-            };
-
             let result = {
                 let map = processes.lock().await;
                 if let Some(process) = map.get(&session_id) {
-                    process.resolve_permission(rpc_id, &response).await
+                    process.resolve_permission(&rpc_id_str, &response).await
                 } else {
                     tracing::warn!("resolve_permission: no active kiro session for {session_id}");
                     Ok(())

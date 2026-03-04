@@ -13,10 +13,13 @@ use serde_json::Value;
 // ---------------------------------------------------------------------------
 
 /// A JSON-RPC 2.0 request (client -> agent or agent -> client for bidirectional).
+///
+/// The `id` field is `serde_json::Value` because kiro-cli uses UUID strings for
+/// bidirectional request IDs while the JSON-RPC spec allows both numbers and strings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcRequest {
     pub jsonrpc: String,
-    pub id: u64,
+    pub id: Value,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
@@ -24,10 +27,12 @@ pub struct RpcRequest {
 
 impl RpcRequest {
     /// Create a new request with the given id, method, and optional params.
+    ///
+    /// `id` is a `u64`; it is stored as a JSON number so kiro-cli can correlate responses.
     pub fn new(id: u64, method: impl Into<String>, params: Option<Value>) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
-            id,
+            id: id.into(),
             method: method.into(),
             params,
         }
@@ -55,10 +60,13 @@ impl RpcNotification {
 }
 
 /// A JSON-RPC 2.0 response to a request.
+///
+/// The `id` field mirrors `RpcRequest::id` and accepts both JSON numbers and strings
+/// so that responses to kiro-cli's UUID-string bidirectional requests are well-formed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcResponse {
     pub jsonrpc: String,
-    pub id: u64,
+    pub id: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -67,7 +75,7 @@ pub struct RpcResponse {
 
 impl RpcResponse {
     /// Create a successful response with the given result.
-    pub fn ok(id: u64, result: Value) -> Self {
+    pub fn ok(id: Value, result: Value) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             id,
@@ -77,7 +85,7 @@ impl RpcResponse {
     }
 
     /// Create an error response.
-    pub fn err(id: u64, error: RpcError) -> Self {
+    pub fn err(id: Value, error: RpcError) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             id,
@@ -382,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_rpc_response_ok() {
-        let resp = RpcResponse::ok(42, json!({"sessionId": "abc"}));
+        let resp = RpcResponse::ok(json!(42), json!({"sessionId": "abc"}));
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"id\":42"));
         assert!(json.contains("\"result\""));
@@ -392,7 +400,7 @@ mod tests {
     #[test]
     fn test_rpc_response_error() {
         let resp = RpcResponse::err(
-            1,
+            json!(1),
             RpcError {
                 code: -32600,
                 message: "Invalid Request".to_string(),
