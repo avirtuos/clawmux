@@ -26,8 +26,7 @@ use crate::tasks::models::TaskId;
 use super::transport::Transport;
 use super::types::{
     AcpPermissionKind, AgentMessageChunkParams, IncomingMessage, PermissionDecision,
-    PermissionResult, RequestPermissionParams, SessionErrorParams, StopReason, ToolCallParams,
-    ToolCallStatus, TurnEndParams,
+    PermissionResult, RequestPermissionParams, SessionErrorParams, ToolCallParams, ToolCallStatus,
 };
 
 /// A resolved permission decision from the TUI.
@@ -260,26 +259,14 @@ pub(crate) async fn handle_notification(
                     let _ = async_tx.send(msg).await;
                 }
                 "turn_end" => {
+                    // Turn completion is signaled via the session/prompt response in
+                    // process.rs::send_prompt to avoid double-advancing the workflow.
+                    // The event loop uses is_terminal_notification to break the loop.
                     let stop_reason = update
                         .get("stopReason")
                         .and_then(|v| v.as_str())
                         .unwrap_or("end_turn");
-                    if stop_reason == "error" || stop_reason == "cancelled" {
-                        let msg = AppMessage::SessionError {
-                            task_id: task_id.clone(),
-                            session_id: session_id.to_string(),
-                            error: format!("session ended with stop reason: {stop_reason}"),
-                        };
-                        let _ = async_tx.send(msg).await;
-                    } else {
-                        send_session_completed(
-                            task_id,
-                            session_id,
-                            accumulated_text.clone(),
-                            async_tx,
-                        )
-                        .await;
-                    }
+                    tracing::debug!("session/update turn_end: stop_reason={stop_reason}");
                 }
                 other => {
                     tracing::debug!("kiro session/update unhandled type: {other}");
@@ -355,34 +342,10 @@ pub(crate) async fn handle_notification(
         }
 
         "turn_end" => {
-            let Some(params) = params else {
-                send_session_completed(task_id, session_id, accumulated_text.clone(), async_tx)
-                    .await;
-                return;
-            };
-            let turn: TurnEndParams = match serde_json::from_value(params.clone()) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("failed to parse turn_end: {e}");
-                    send_session_completed(task_id, session_id, accumulated_text.clone(), async_tx)
-                        .await;
-                    return;
-                }
-            };
-            if turn.session_id != session_id {
-                return;
-            }
-            if turn.stop_reason == StopReason::Error || turn.stop_reason == StopReason::Cancelled {
-                let msg = AppMessage::SessionError {
-                    task_id: task_id.clone(),
-                    session_id: session_id.to_string(),
-                    error: format!("session ended with stop reason: {:?}", turn.stop_reason),
-                };
-                let _ = async_tx.send(msg).await;
-            } else {
-                send_session_completed(task_id, session_id, accumulated_text.clone(), async_tx)
-                    .await;
-            }
+            // Completion is handled by the session/prompt response in send_prompt.
+            // This legacy flat turn_end is only used to break the event loop
+            // (via is_terminal_notification); no SessionCompleted is sent here.
+            tracing::debug!("kiro: legacy turn_end notification received");
         }
 
         "session/error" => {
@@ -687,7 +650,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_notification_turn_end_sends_completed() {
+    async fn test_handle_notification_turn_end_sends_nothing() {
+        // turn_end no longer sends SessionCompleted -- completion is sent by the
+        // session/prompt response handler in send_prompt to avoid double-advance.
         let (tx, mut rx) = mpsc::channel(64);
         let mut accumulated = "full response text".to_string();
 
@@ -704,63 +669,7 @@ mod tests {
         )
         .await;
 
-        let msg = rx.recv().await.unwrap();
-        if let AppMessage::SessionCompleted {
-            response_text,
-            session_id,
-            task_id,
-        } = msg
-        {
-            assert_eq!(response_text, "full response text");
-            assert_eq!(session_id, "sess-1");
-            assert_eq!(task_id, TaskId::from_path("tasks/1.1.md"));
-        } else {
-            panic!("expected SessionCompleted, got: {:?}", msg);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_handle_notification_turn_end_error_sends_session_error() {
-        let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = String::new();
-
-        handle_notification(
-            "turn_end",
-            Some(&serde_json::json!({
-                "sessionId": "sess-1",
-                "stopReason": "error"
-            })),
-            &task_id(),
-            "sess-1",
-            &mut accumulated,
-            &tx,
-        )
-        .await;
-
-        let msg = rx.recv().await.unwrap();
-        assert!(matches!(msg, AppMessage::SessionError { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_handle_notification_turn_end_cancelled_sends_session_error() {
-        let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = String::new();
-
-        handle_notification(
-            "turn_end",
-            Some(&serde_json::json!({
-                "sessionId": "sess-1",
-                "stopReason": "cancelled"
-            })),
-            &task_id(),
-            "sess-1",
-            &mut accumulated,
-            &tx,
-        )
-        .await;
-
-        let msg = rx.recv().await.unwrap();
-        assert!(matches!(msg, AppMessage::SessionError { .. }));
+        assert!(rx.try_recv().is_err(), "turn_end should send no AppMessage");
     }
 
     #[tokio::test]
@@ -849,7 +758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_turn_end_no_params_sends_completed() {
+    async fn test_turn_end_no_params_sends_nothing() {
         let (tx, mut rx) = mpsc::channel(64);
         let mut accumulated = "some text".to_string();
 
@@ -863,29 +772,7 @@ mod tests {
         )
         .await;
 
-        let msg = rx.recv().await.unwrap();
-        assert!(matches!(msg, AppMessage::SessionCompleted { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_turn_end_wrong_session_ignored() {
-        let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = "text".to_string();
-
-        handle_notification(
-            "turn_end",
-            Some(&serde_json::json!({
-                "sessionId": "other-sess",
-                "stopReason": "end_turn"
-            })),
-            &task_id(),
-            "sess-1",
-            &mut accumulated,
-            &tx,
-        )
-        .await;
-
-        assert!(rx.try_recv().is_err());
+        assert!(rx.try_recv().is_err(), "turn_end should send no AppMessage");
     }
 
     #[tokio::test]
@@ -956,7 +843,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_session_update_turn_end_sends_completed() {
+    async fn test_session_update_turn_end_sends_nothing() {
+        // turn_end via session/update also sends no AppMessage; completion comes from send_prompt.
         let (tx, mut rx) = mpsc::channel(64);
         let mut accumulated = "full response".to_string();
 
@@ -976,12 +864,10 @@ mod tests {
         )
         .await;
 
-        let msg = rx.recv().await.unwrap();
-        if let AppMessage::SessionCompleted { response_text, .. } = msg {
-            assert_eq!(response_text, "full response");
-        } else {
-            panic!("expected SessionCompleted, got {:?}", msg);
-        }
+        assert!(
+            rx.try_recv().is_err(),
+            "session/update turn_end should send no AppMessage"
+        );
     }
 
     #[tokio::test]

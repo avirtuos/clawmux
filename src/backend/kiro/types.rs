@@ -300,29 +300,6 @@ pub struct ToolCallParams {
     pub output: Option<String>,
 }
 
-/// Stop reason for a completed turn.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum StopReason {
-    EndTurn,
-    MaxTokens,
-    StopSequence,
-    ToolUse,
-    Cancelled,
-    Error,
-}
-
-/// Params for the `turn_end` notification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnEndParams {
-    #[serde(rename = "sessionId")]
-    pub session_id: String,
-    #[serde(rename = "stopReason")]
-    pub stop_reason: StopReason,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Value>,
-}
-
 /// Params for the `session/error` notification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionErrorParams {
@@ -453,14 +430,6 @@ mod tests {
         assert_eq!(s, ToolCallStatus::InProgress);
         let s: ToolCallStatus = serde_json::from_str("\"completed\"").unwrap();
         assert_eq!(s, ToolCallStatus::Completed);
-    }
-
-    #[test]
-    fn test_stop_reason_deserialization() {
-        let s: StopReason = serde_json::from_str("\"end_turn\"").unwrap();
-        assert_eq!(s, StopReason::EndTurn);
-        let s: StopReason = serde_json::from_str("\"cancelled\"").unwrap();
-        assert_eq!(s, StopReason::Cancelled);
     }
 
     #[test]
