@@ -226,20 +226,31 @@ impl KiroProcess {
                         .get("stopReason")
                         .and_then(|v| v.as_str())
                         .unwrap_or("end_turn");
-                    tracing::debug!(
+                    tracing::info!(
                         "session/prompt response: task={task_id} stop_reason={stop_reason}"
                     );
-                    if stop_reason == "error" {
+                    if stop_reason == "error" || stop_reason == "cancelled" {
                         let _ = async_tx
                             .send(AppMessage::SessionError {
                                 task_id,
                                 session_id,
-                                error: "session/prompt returned error stop reason".to_string(),
+                                error: format!(
+                                    "session/prompt returned stop reason: {stop_reason}"
+                                ),
+                            })
+                            .await;
+                    } else {
+                        // Signal completion. The event loop's turn_end handler only breaks the
+                        // loop; SessionCompleted is sent here to avoid a double-advance if kiro
+                        // sends both a turn_end notification and responds to the request.
+                        let _ = async_tx
+                            .send(AppMessage::SessionCompleted {
+                                task_id,
+                                session_id,
+                                response_text: String::new(),
                             })
                             .await;
                     }
-                    // Normal completion is signaled via session/update { turn_end } in the
-                    // event loop; we don't send SessionCompleted here to avoid duplicates.
                 }
                 Err(e) => {
                     tracing::error!("session/prompt failed for task={task_id}: {e}");
