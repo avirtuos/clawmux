@@ -761,6 +761,17 @@ impl App {
                 self.tab2_state
                     .push_banner(&task_id, format!("[Commit] Committing: {}", first_line));
 
+                // Set the task status to Completed and persist it to disk BEFORE staging.
+                // This ensures the committed file already has the final status so that
+                // CommitCompleted's set_status call is a no-op, avoiding a spurious
+                // post-commit modification that would show up as an unstaged change.
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    task.set_status(TaskStatus::Completed, AgentKind::Human);
+                }
+                if let Err(e) = self.task_store.persist(&task_id) {
+                    tracing::warn!("Failed to persist task before commit staging: {}", e);
+                }
+
                 // Include the task's own markdown file so status/work-log changes are committed.
                 if let Some(task) = self.task_store.get(&task_id) {
                     let task_path = task.file_path.to_string_lossy().to_string();
