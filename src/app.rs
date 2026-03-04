@@ -587,25 +587,40 @@ impl App {
                 } else {
                     None
                 };
-                // If this question came from the backend, send the reply back.
-                if let Some(req_id) = opencode_request_id {
+                // Branch on whether this is a backend-native question (has a request ID)
+                // or a parsed question extracted from agent output.
+                let mut msgs = if let Some(req_id) = opencode_request_id {
+                    // Backend-native: the original session is still active; send the
+                    // reply and resume the workflow without creating a new session.
                     self.backend.reply_question(
                         task_id.clone(),
                         req_id,
                         answer.clone(),
                         self.async_tx.clone(),
                     );
-                }
+                    self.workflow_engine.resume_from_answer(&task_id);
+                    // Restart the idle timer so the resumed session gets a fresh window.
+                    let agent_name = self
+                        .workflow_engine
+                        .state(&task_id)
+                        .map(|s| s.current_agent.display_name().to_string())
+                        .unwrap_or_default();
+                    self.tab2_state.set_awaiting_response(&task_id, agent_name);
+                    vec![]
+                } else {
+                    // Parsed question: the session already completed, so the engine
+                    // must create a new session to continue the workflow.
+                    self.workflow_engine.process(AppMessage::HumanAnswered {
+                        task_id: task_id.clone(),
+                        question_index,
+                        answer,
+                    })
+                };
                 // Rebuild answer textareas so the answered question's textarea is removed.
                 if let Some(task) = self.task_store.get(&task_id) {
                     let task = task.clone();
                     self.questions_state.sync_answer_inputs(&task);
                 }
-                let mut msgs = self.workflow_engine.process(AppMessage::HumanAnswered {
-                    task_id: task_id.clone(),
-                    question_index,
-                    answer,
-                });
                 let next_agent = self
                     .workflow_engine
                     .state(&task_id)
@@ -3993,17 +4008,28 @@ mod tests {
         );
     }
 
-    /// Verifies that `HumanApprovedCommit` does not panic when the task store contains the
-    /// task and the task file path is appended to `file_paths` before the spawn.
-    ///
-    /// The file_paths mutation happens in the synchronous portion of the handler before any
-    /// async work; with no OpenCode client the handler returns CommitFailed, confirming the
-    /// synchronous path (including the task-file append) completed without error.
-    #[test]
-    fn test_human_approved_commit_includes_task_file() {
+    /// Verifies that `HumanApprovedCommit` appends the task markdown file to `file_paths`
+    /// before delegating to the backend. The NullBackend sends CommitFailed asynchronously,
+    /// confirming the synchronous path (including the task-file append) completed without error.
+    #[tokio::test]
+    async fn test_human_approved_commit_includes_task_file() {
         use crate::tasks::models::{Task, TaskStatus};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
 
-        let mut app = App::test_default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let session_map = Arc::new(RwLock::new(HashMap::new()));
+        let mut app = App::new(
+            crate::tasks::TaskStore::new(),
+            Box::new(crate::backend::NullBackend),
+            session_map,
+            tx,
+            false,
+            HashMap::new(),
+            None,
+        );
+
         let task_id = TaskId::from_path("tasks/3.1.md");
         let task = Task {
             id: task_id.clone(),
@@ -4023,20 +4049,21 @@ mod tests {
         };
         app.task_store.insert(task);
 
-        // The handler returns CommitFailed when no OpenCode client is configured, but the
-        // task-file mutation happens in the synchronous part before that check.
-        let msgs = app.handle_message(AppMessage::HumanApprovedCommit {
+        // Only code files; task file deliberately omitted from the caller's list.
+        app.handle_message(AppMessage::HumanApprovedCommit {
             task_id: task_id.clone(),
             commit_message: "Complete task 3.1".to_string(),
-            // Only code files; task file deliberately omitted from the caller's list.
             file_paths: vec!["src/lib.rs".to_string()],
         });
 
-        // With no opencode client the handler returns CommitFailed -- expected.
+        // NullBackend sends CommitFailed asynchronously via async_tx.
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("timed out waiting for CommitFailed")
+            .expect("channel closed");
         assert!(
-            msgs.iter()
-                .any(|m| matches!(m, AppMessage::CommitFailed { .. })),
-            "should get CommitFailed when opencode client is unavailable"
+            matches!(msg, AppMessage::CommitFailed { .. }),
+            "NullBackend should send CommitFailed, got: {msg:?}"
         );
     }
 }
