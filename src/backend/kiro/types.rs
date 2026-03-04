@@ -224,13 +224,36 @@ pub struct SessionNewResult {
     pub session_id: String,
 }
 
+/// A single content part in a prompt array (text type).
+///
+/// Kiro-cli expects `session/prompt` params to include `prompt` as a sequence
+/// of content parts (e.g. `[{"type":"text","text":"..."}]`), not a plain string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentPart {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub text: String,
+}
+
+impl ContentPart {
+    /// Create a text content part.
+    pub fn text(s: impl Into<String>) -> Self {
+        Self {
+            kind: "text".to_string(),
+            text: s.into(),
+        }
+    }
+}
+
 /// Params for the `session/prompt` request.
+///
+/// Kiro-cli uses the field name `prompt` (not `content` as in the ACP spec),
+/// and expects it to be an array of content parts, not a plain string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionPromptParams {
     #[serde(rename = "sessionId")]
     pub session_id: String,
-    /// Plain-text prompt string (kiro-cli uses `prompt`, not `content`).
-    pub prompt: String,
+    pub prompt: Vec<ContentPart>,
 }
 
 /// Params for the `session/cancel` notification.
@@ -495,5 +518,28 @@ mod tests {
         let result: InitializeResult = serde_json::from_str(json).unwrap();
         assert_eq!(result.protocol_version, "1");
         assert_eq!(result.agent_info.version, "1");
+    }
+
+    #[test]
+    fn test_content_part_text_serialization() {
+        let part = ContentPart::text("hello world");
+        assert_eq!(part.kind, "text");
+        assert_eq!(part.text, "hello world");
+        let json = serde_json::to_string(&part).unwrap();
+        assert!(json.contains("\"type\":\"text\""));
+        assert!(json.contains("\"text\":\"hello world\""));
+    }
+
+    #[test]
+    fn test_session_prompt_params_prompt_is_array() {
+        // kiro-cli expects prompt as an array of content parts, not a plain string.
+        let params = SessionPromptParams {
+            session_id: "sess-1".to_string(),
+            prompt: vec![ContentPart::text("do something")],
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains("\"prompt\":["));
+        assert!(json.contains("\"type\":\"text\""));
+        assert!(json.contains("\"text\":\"do something\""));
     }
 }

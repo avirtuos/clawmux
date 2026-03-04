@@ -31,8 +31,8 @@ use crate::tasks::models::TaskId;
 use super::events::{run_event_loop, PermissionResponse};
 use super::transport::Transport;
 use super::types::{
-    ClientCapabilities, ClientInfo, InitializeParams, InitializeResult, SessionNewParams,
-    SessionNewResult, SessionPromptParams,
+    ClientCapabilities, ClientInfo, ContentPart, InitializeParams, InitializeResult,
+    SessionNewParams, SessionNewResult, SessionPromptParams,
 };
 
 /// Protocol version string sent during ACP initialization.
@@ -209,7 +209,7 @@ impl KiroProcess {
     ) -> Result<()> {
         let params = SessionPromptParams {
             session_id: self.session_id.clone(),
-            prompt: prompt.to_string(),
+            prompt: vec![ContentPart::text(prompt)],
         };
         let params_value = serde_json::to_value(&params)?;
         let transport = self.transport.clone();
