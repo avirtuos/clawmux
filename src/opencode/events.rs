@@ -483,6 +483,7 @@ impl EventStreamConsumer {
                 session_id,
                 input_tokens,
                 output_tokens,
+                is_cumulative,
             } => {
                 let task_id = {
                     let map = self.session_map.read().await;
@@ -493,6 +494,7 @@ impl EventStreamConsumer {
                         task_id,
                         input_tokens,
                         output_tokens,
+                        is_cumulative,
                     })
                     .await?;
                 } else {
@@ -829,6 +831,7 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
                                 session_id: sid.to_string(),
                                 input_tokens: inp,
                                 output_tokens: out,
+                                is_cumulative: false,
                             };
                         }
                     }
@@ -913,6 +916,7 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
                         session_id: sid.to_string(),
                         input_tokens: inp,
                         output_tokens: out,
+                        is_cumulative: true,
                     };
                 }
             }
@@ -1731,6 +1735,7 @@ mod tests {
                     ref session_id,
                     input_tokens: 1234,
                     output_tokens: 567,
+                    is_cumulative: true,
                 } if session_id == "ses_abc"
             ),
             "expected TokensUpdated from info.tokens path, got: {event:?}"
@@ -1749,6 +1754,7 @@ mod tests {
                     ref session_id,
                     input_tokens: 2000,
                     output_tokens: 800,
+                    is_cumulative: true,
                 } if session_id == "ses_abc"
             ),
             "expected TokensUpdated from info.summary.tokens path, got: {event:?}"
@@ -2394,6 +2400,7 @@ mod tests {
                     ref session_id,
                     input_tokens,
                     output_tokens,
+                    is_cumulative: false,
                 } if session_id == "ses_xyz" && input_tokens == 7873 && output_tokens == 212
             ),
             "expected TokensUpdated from step-finish part, got: {event:?}"

@@ -305,6 +305,8 @@ pub enum OpenCodeEvent {
         session_id: String,
         input_tokens: u64,
         output_tokens: u64,
+        /// `true` for message-level cumulative counts (`message.updated`), `false` for per-step counts (`step-finish`).
+        is_cumulative: bool,
     },
     /// An unrecognized event type; ignored gracefully for forward compatibility.
     #[serde(other)]
