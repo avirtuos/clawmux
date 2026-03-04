@@ -17,6 +17,8 @@
 //! TUI via `async_tx`, then waits on a [`PermissionResponse`] channel.  Once the
 //! user decides, the response is sent back via [`Transport::respond`].
 
+use std::sync::{Arc, Mutex};
+
 use tokio::sync::mpsc;
 
 use crate::messages::AppMessage;
@@ -90,26 +92,14 @@ pub async fn run_event_loop(
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
     mut permission_rx: mpsc::Receiver<PermissionResponse>,
     async_tx: mpsc::Sender<AppMessage>,
+    accumulated_text: Arc<Mutex<String>>,
 ) {
-    let mut accumulated_text = String::new();
-
     loop {
         tokio::select! {
             msg = incoming_rx.recv() => {
                 match msg {
                     None => {
                         tracing::debug!("kiro incoming channel closed for task {task_id}");
-                        // If the process exited before sending turn_end, send completion
-                        // with whatever text we have accumulated so the workflow isn't stuck.
-                        if !accumulated_text.is_empty() {
-                            send_session_completed(
-                                &task_id,
-                                &session_id,
-                                accumulated_text.clone(),
-                                &async_tx,
-                            )
-                            .await;
-                        }
                         break;
                     }
                     Some(IncomingMessage::Notification(notif)) => {
@@ -119,7 +109,7 @@ pub async fn run_event_loop(
                             notif.params.as_ref(),
                             &task_id,
                             &session_id,
-                            &mut accumulated_text,
+                            &accumulated_text,
                             &async_tx,
                         ).await;
                         if is_terminal {
@@ -184,7 +174,7 @@ pub(crate) async fn handle_notification(
     params: Option<&serde_json::Value>,
     task_id: &TaskId,
     session_id: &str,
-    accumulated_text: &mut String,
+    accumulated_text: &Arc<Mutex<String>>,
     async_tx: &mpsc::Sender<AppMessage>,
 ) {
     match method {
@@ -219,14 +209,17 @@ pub(crate) async fn handle_notification(
                         .and_then(|t| t.as_str())
                         .unwrap_or("");
                     if !text.is_empty() {
-                        accumulated_text.push_str(text);
+                        let snapshot = {
+                            let mut guard =
+                                accumulated_text.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.push_str(text);
+                            guard.clone()
+                        };
                         let msg = AppMessage::StreamingUpdate {
                             task_id: task_id.clone(),
                             session_id: session_id.to_string(),
                             message_id: session_id.to_string(),
-                            parts: vec![MessagePart::Text {
-                                text: accumulated_text.clone(),
-                            }],
+                            parts: vec![MessagePart::Text { text: snapshot }],
                         };
                         let _ = async_tx.send(msg).await;
                     }
@@ -286,14 +279,16 @@ pub(crate) async fn handle_notification(
             if chunk.session_id != session_id {
                 return;
             }
-            accumulated_text.push_str(&chunk.delta);
+            let snapshot = {
+                let mut guard = accumulated_text.lock().unwrap_or_else(|e| e.into_inner());
+                guard.push_str(&chunk.delta);
+                guard.clone()
+            };
             let msg = AppMessage::StreamingUpdate {
                 task_id: task_id.clone(),
                 session_id: session_id.to_string(),
                 message_id: session_id.to_string(),
-                parts: vec![MessagePart::Text {
-                    text: accumulated_text.clone(),
-                }],
+                parts: vec![MessagePart::Text { text: snapshot }],
             };
             let _ = async_tx.send(msg).await;
         }
@@ -460,21 +455,6 @@ async fn handle_permission_request(
     }
 }
 
-/// Send a [`AppMessage::SessionCompleted`] with the accumulated response text.
-async fn send_session_completed(
-    task_id: &TaskId,
-    session_id: &str,
-    response_text: String,
-    async_tx: &mpsc::Sender<AppMessage>,
-) {
-    let msg = AppMessage::SessionCompleted {
-        task_id: task_id.clone(),
-        session_id: session_id.to_string(),
-        response_text,
-    };
-    let _ = async_tx.send(msg).await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,10 +465,25 @@ mod tests {
         TaskId::from_path("tasks/1.1.md")
     }
 
+    /// Create an empty shared accumulated-text buffer for tests.
+    fn make_text() -> Arc<Mutex<String>> {
+        Arc::new(Mutex::new(String::new()))
+    }
+
+    /// Create a shared accumulated-text buffer pre-filled with `s`.
+    fn make_text_with(s: &str) -> Arc<Mutex<String>> {
+        Arc::new(Mutex::new(s.to_string()))
+    }
+
+    /// Read the current value of a shared accumulated-text buffer.
+    fn read_text(t: &Arc<Mutex<String>>) -> String {
+        t.lock().unwrap().clone()
+    }
+
     #[tokio::test]
     async fn test_handle_notification_text_chunk_accumulates() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = String::new();
+        let accumulated = make_text();
 
         handle_notification(
             "agent_message_chunk",
@@ -498,7 +493,7 @@ mod tests {
             })),
             &task_id(),
             "sess-1",
-            &mut accumulated,
+            &accumulated,
             &tx,
         )
         .await;
@@ -511,12 +506,12 @@ mod tests {
             })),
             &task_id(),
             "sess-1",
-            &mut accumulated,
+            &accumulated,
             &tx,
         )
         .await;
 
-        assert_eq!(accumulated, "Hello world");
+        assert_eq!(read_text(&accumulated), "Hello world");
 
         let msg1 = rx.recv().await.unwrap();
         if let AppMessage::StreamingUpdate { parts, .. } = msg1 {
@@ -544,7 +539,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_notification_text_chunk_wrong_session_ignored() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = String::new();
+        let accumulated = make_text();
 
         handle_notification(
             "agent_message_chunk",
@@ -554,19 +549,19 @@ mod tests {
             })),
             &task_id(),
             "sess-1",
-            &mut accumulated,
+            &accumulated,
             &tx,
         )
         .await;
 
         assert!(rx.try_recv().is_err());
-        assert!(accumulated.is_empty());
+        assert!(read_text(&accumulated).is_empty());
     }
 
     #[tokio::test]
     async fn test_handle_notification_tool_call_in_progress() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = String::new();
+        let accumulated = make_text();
 
         handle_notification(
             "tool_call",
@@ -578,7 +573,7 @@ mod tests {
             })),
             &task_id(),
             "sess-1",
-            &mut accumulated,
+            &accumulated,
             &tx,
         )
         .await;
@@ -595,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_notification_tool_call_completed() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = String::new();
+        let accumulated = make_text();
 
         handle_notification(
             "tool_call_update",
@@ -607,7 +602,7 @@ mod tests {
             })),
             &task_id(),
             "sess-1",
-            &mut accumulated,
+            &accumulated,
             &tx,
         )
         .await;
@@ -623,7 +618,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_notification_tool_call_with_path_detail() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = String::new();
+        let accumulated = make_text();
 
         handle_notification(
             "tool_call",
@@ -636,7 +631,7 @@ mod tests {
             })),
             &task_id(),
             "sess-1",
-            &mut accumulated,
+            &accumulated,
             &tx,
         )
         .await;
@@ -654,7 +649,7 @@ mod tests {
         // turn_end no longer sends SessionCompleted -- completion is sent by the
         // session/prompt response handler in send_prompt to avoid double-advance.
         let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = "full response text".to_string();
+        let accumulated = make_text_with("full response text");
 
         handle_notification(
             "turn_end",
@@ -664,7 +659,7 @@ mod tests {
             })),
             &task_id(),
             "sess-1",
-            &mut accumulated,
+            &accumulated,
             &tx,
         )
         .await;
@@ -675,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_notification_session_error() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = String::new();
+        let accumulated = make_text();
 
         handle_notification(
             "session/error",
@@ -685,7 +680,7 @@ mod tests {
             })),
             &task_id(),
             "sess-1",
-            &mut accumulated,
+            &accumulated,
             &tx,
         )
         .await;
@@ -701,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_notification_session_error_wrong_session_ignored() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = String::new();
+        let accumulated = make_text();
 
         handle_notification(
             "session/error",
@@ -711,7 +706,7 @@ mod tests {
             })),
             &task_id(),
             "sess-1",
-            &mut accumulated,
+            &accumulated,
             &tx,
         )
         .await;
@@ -722,14 +717,14 @@ mod tests {
     #[tokio::test]
     async fn test_handle_notification_unknown_method_ignored() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = String::new();
+        let accumulated = make_text();
 
         handle_notification(
             "some_unknown_notification",
             None,
             &task_id(),
             "sess-1",
-            &mut accumulated,
+            &accumulated,
             &tx,
         )
         .await;
@@ -760,17 +755,9 @@ mod tests {
     #[tokio::test]
     async fn test_turn_end_no_params_sends_nothing() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = "some text".to_string();
+        let accumulated = make_text_with("some text");
 
-        handle_notification(
-            "turn_end",
-            None,
-            &task_id(),
-            "sess-1",
-            &mut accumulated,
-            &tx,
-        )
-        .await;
+        handle_notification("turn_end", None, &task_id(), "sess-1", &accumulated, &tx).await;
 
         assert!(rx.try_recv().is_err(), "turn_end should send no AppMessage");
     }
@@ -778,7 +765,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_update_agent_message_chunk() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = String::new();
+        let accumulated = make_text();
 
         handle_notification(
             "session/update",
@@ -791,12 +778,12 @@ mod tests {
             })),
             &task_id(),
             "sess-1",
-            &mut accumulated,
+            &accumulated,
             &tx,
         )
         .await;
 
-        assert_eq!(accumulated, "Hello world");
+        assert_eq!(read_text(&accumulated), "Hello world");
         let msg = rx.recv().await.unwrap();
         if let AppMessage::StreamingUpdate { parts, .. } = msg {
             if let MessagePart::Text { text } = &parts[0] {
@@ -812,7 +799,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_update_tool_call() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = String::new();
+        let accumulated = make_text();
 
         handle_notification(
             "session/update",
@@ -828,7 +815,7 @@ mod tests {
             })),
             &task_id(),
             "sess-1",
-            &mut accumulated,
+            &accumulated,
             &tx,
         )
         .await;
@@ -846,7 +833,7 @@ mod tests {
     async fn test_session_update_turn_end_sends_nothing() {
         // turn_end via session/update also sends no AppMessage; completion comes from send_prompt.
         let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = "full response".to_string();
+        let accumulated = make_text_with("full response");
 
         handle_notification(
             "session/update",
@@ -859,7 +846,7 @@ mod tests {
             })),
             &task_id(),
             "sess-1",
-            &mut accumulated,
+            &accumulated,
             &tx,
         )
         .await;
@@ -873,7 +860,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_update_wrong_session_ignored() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut accumulated = String::new();
+        let accumulated = make_text();
 
         handle_notification(
             "session/update",
@@ -886,13 +873,13 @@ mod tests {
             })),
             &task_id(),
             "sess-1",
-            &mut accumulated,
+            &accumulated,
             &tx,
         )
         .await;
 
         assert!(rx.try_recv().is_err());
-        assert!(accumulated.is_empty());
+        assert!(read_text(&accumulated).is_empty());
     }
 
     #[test]
