@@ -19,7 +19,6 @@
 //! kiro's automatic context compaction from discarding mid-pipeline context.
 
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
 
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -47,11 +46,14 @@ pub struct KiroProcess {
     task_id: TaskId,
     session_id: String,
     permission_tx: mpsc::Sender<PermissionResponse>,
+    /// Sends the turn's stop_reason to the event loop when session/prompt responds.
+    ///
+    /// The event loop drains all pending notifications before sending SessionCompleted,
+    /// avoiding a race between the response arriving and streaming chunks being processed.
+    completion_tx: mpsc::Sender<String>,
     reader_handle: JoinHandle<()>,
     event_loop_handle: JoinHandle<()>,
     child: tokio::process::Child,
-    /// Accumulated agent text from streaming chunks; shared with the event loop.
-    accumulated_text: Arc<Mutex<String>>,
 }
 
 impl KiroProcess {
@@ -110,6 +112,8 @@ impl KiroProcess {
         // Notification channel: reader task -> event loop
         let (notification_tx, notification_rx) = mpsc::channel::<super::types::IncomingMessage>(64);
         let (permission_tx, permission_rx) = mpsc::channel::<PermissionResponse>(8);
+        // Completion signal: send_prompt -> event loop (stop_reason string).
+        let (completion_tx, completion_rx) = mpsc::channel::<String>(1);
 
         let (transport, reader_handle) = Transport::new(stdin, stdout, notification_tx);
 
@@ -120,14 +124,10 @@ impl KiroProcess {
             "kiro-cli session created: agent={agent_name} session_id={session_id} task={task_id}"
         );
 
-        // Shared accumulated text: event loop writes chunks; send_prompt reads final value.
-        let accumulated_text: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-
         // Spawn the event loop to translate ACP notifications -> AppMessage
         let event_transport = transport.clone();
         let event_task_id = task_id.clone();
         let event_session_id = session_id.clone();
-        let event_accumulated = accumulated_text.clone();
         let event_loop_handle = tokio::spawn(run_event_loop(
             event_task_id,
             event_session_id,
@@ -135,7 +135,7 @@ impl KiroProcess {
             notification_rx,
             permission_rx,
             async_tx,
-            event_accumulated,
+            completion_rx,
         ));
 
         Ok(Self {
@@ -143,9 +143,9 @@ impl KiroProcess {
             task_id,
             session_id,
             permission_tx,
+            completion_tx,
             reader_handle,
             event_loop_handle,
-            accumulated_text,
             child,
         })
     }
@@ -206,11 +206,12 @@ impl KiroProcess {
 
     /// Send a text prompt to the active session.
     ///
-    /// `session/prompt` is a JSON-RPC **request** (not a notification): kiro
-    /// responds when the turn completes with `{ stopReason: "end_turn" | ... }`.
-    /// A background task awaits that response and forwards any error to `async_tx`.
-    /// Streaming updates arrive separately via `session/update` notifications handled
-    /// by the event loop.
+    /// `session/prompt` is a JSON-RPC **request**: kiro responds when the turn
+    /// completes with `{ stopReason: "end_turn" | ... }`. On success the stop_reason
+    /// is forwarded to the event loop via `completion_tx`. The event loop drains any
+    /// remaining buffered notifications first, then sends [`AppMessage::SessionCompleted`]
+    /// with the fully accumulated text — avoiding a race between the response arriving
+    /// and streaming chunks still queued in the notification channel.
     pub async fn send_prompt(
         &self,
         prompt: &str,
@@ -224,7 +225,7 @@ impl KiroProcess {
         let transport = self.transport.clone();
         let task_id = self.task_id.clone();
         let session_id = self.session_id.clone();
-        let accumulated_text = self.accumulated_text.clone();
+        let completion_tx = self.completion_tx.clone();
 
         tokio::spawn(async move {
             match transport
@@ -235,7 +236,8 @@ impl KiroProcess {
                     let stop_reason = result
                         .get("stopReason")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("end_turn");
+                        .unwrap_or("end_turn")
+                        .to_string();
                     tracing::info!(
                         "session/prompt response: task={task_id} stop_reason={stop_reason}"
                     );
@@ -250,18 +252,9 @@ impl KiroProcess {
                             })
                             .await;
                     } else {
-                        // Read the text accumulated by the event loop during this turn.
-                        let response_text = accumulated_text
-                            .lock()
-                            .map(|g| g.clone())
-                            .unwrap_or_default();
-                        let _ = async_tx
-                            .send(AppMessage::SessionCompleted {
-                                task_id,
-                                session_id,
-                                response_text,
-                            })
-                            .await;
+                        // Signal the event loop to complete the session. The event loop
+                        // will drain remaining notifications before reading accumulated text.
+                        let _ = completion_tx.send(stop_reason).await;
                     }
                 }
                 Err(e) => {
