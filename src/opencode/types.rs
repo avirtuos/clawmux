@@ -307,6 +307,9 @@ pub enum OpenCodeEvent {
         output_tokens: u64,
         /// `true` for message-level cumulative counts (`message.updated`), `false` for per-step counts (`step-finish`).
         is_cumulative: bool,
+        /// Part id from the `step-finish` event, used to deduplicate SSE replays.
+        /// `None` for cumulative `message.updated` events.
+        step_id: Option<String>,
     },
     /// An unrecognized event type; ignored gracefully for forward compatibility.
     #[serde(other)]
