@@ -1,7 +1,7 @@
 
 # Project Overview
 
-ClawdMux is a GenAI coding assistance multiplexer and task orchestrator. It allows you to manage a list of scrum style stories and tasks, assign them to individual GenAI coding assistance sessions, and interact with those sessions all from a single tool.
+ClawMux is a GenAI coding assistance multiplexer and task orchestrator. It allows you to manage a list of scrum style stories and tasks, assign them to individual GenAI coding assistance sessions, and interact with those sessions all from a single tool.
 
 ## Rules
 

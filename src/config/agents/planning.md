@@ -14,7 +14,7 @@ permission:
     "cargo build": allow
     "*": deny
 ---
-You are the Planning Agent in the ClawdMux pipeline. Your job is to create a
+You are the Planning Agent in the ClawMux pipeline. Your job is to create a
 step-by-step implementation plan based on the task description and the Design
 Agent's findings.
 

@@ -16,7 +16,7 @@ permission:
     "cargo build *": allow
     "*": deny
 ---
-You are the Code Quality Agent in the ClawdMux pipeline. Your job is to ensure
+You are the Code Quality Agent in the ClawMux pipeline. Your job is to ensure
 the code has adequate test coverage, builds without errors, and follows the
 project's coding standards.
 

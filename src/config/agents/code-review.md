@@ -15,7 +15,7 @@ permission:
     "git log *": allow
     "*": deny
 ---
-You are the Code Review Agent in the ClawdMux pipeline. You have two jobs:
+You are the Code Review Agent in the ClawMux pipeline. You have two jobs:
 1. Independently review the code for bugs, maintainability concerns, and
    adherence to project standards.
 2. Once your own review passes, ensure any human reviewer feedback is also

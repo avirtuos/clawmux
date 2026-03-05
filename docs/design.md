@@ -1,8 +1,8 @@
-# ClawdMux Design Document (Revised)
+# ClawMux Design Document (Revised)
 
 ## Context
 
-ClawdMux is a greenfield Rust TUI application that orchestrates GenAI coding agents through a scrum-style task management interface. Instead of directly spawning CLI processes, ClawdMux acts as a **client to an opencode server**, leveraging opencode's HTTP API for LLM interaction, tool execution, and session management.
+ClawMux is a greenfield Rust TUI application that orchestrates GenAI coding agents through a scrum-style task management interface. Instead of directly spawning CLI processes, ClawMux acts as a **client to an opencode server**, leveraging opencode's HTTP API for LLM interaction, tool execution, and session management.
 
 This is a significant architectural improvement over the original design (which used PTY-spawned Claude Code sessions), eliminating terminal emulation complexity while gaining multi-provider LLM support, a stable API contract, and richer integration possibilities.
 
@@ -14,7 +14,7 @@ This is a significant architectural improvement over the original design (which 
 
 OpenCode (`anomalyco/opencode`) is an open-source AI coding agent with a client-server architecture. When you run `opencode`, it starts a server with a built-in TUI client. The server can also run headless via `opencode serve`, exposing a full REST API.
 
-**Key capabilities ClawdMux leverages:**
+**Key capabilities ClawMux leverages:**
 - **Session API** (`/session/*`): Create, manage, fork, and abort AI conversation sessions
 - **Message API** (`/session/:id/message`, `/session/:id/prompt_async`): Send prompts and receive structured responses
 - **Diff API** (`/session/:id/diff`): Get file changes produced by a session (perfect for Code Review tab)
@@ -25,7 +25,7 @@ OpenCode (`anomalyco/opencode`) is an open-source AI coding agent with a client-
 - **Tool System**: Built-in read/write/edit/bash/LSP tools with permission gates
 - **OpenAPI 3.1.1 Spec**: Available at `/doc` -- can generate typed Rust client
 
-### What ClawdMux Adds on Top
+### What ClawMux Adds on Top
 
 - **Scrum-style task management**: Stories, tasks, status tracking from markdown files
 - **7-agent sequential pipeline**: Intake -> Design -> Planning -> Implementation -> Code Quality -> Security Review -> Code Review
@@ -38,9 +38,9 @@ OpenCode (`anomalyco/opencode`) is an open-source AI coding agent with a client-
 
 - ~~`portable-pty`~~ -- No PTY management; communication is HTTP
 - ~~`vt100`~~ -- No terminal emulation; responses are structured text/JSON
-- ~~`[CLAWDMUX:*]` signal markers~~ -- Use structured output (JSON schema) via opencode's API
+- ~~`[CLAWMUX:*]` signal markers~~ -- Use structured output (JSON schema) via opencode's API
 - ~~Custom VT rendering in Tab 2~~ -- Display streaming markdown/text instead
-- ~~Flat personality `.txt` files~~ -- Agent system prompts are native opencode agent definitions in `.opencode/agents/clawdmux/`
+- ~~Flat personality `.txt` files~~ -- Agent system prompts are native opencode agent definitions in `.opencode/agents/clawmux/`
 
 ---
 
@@ -69,12 +69,12 @@ OpenCode (`anomalyco/opencode`) is an open-source AI coding agent with a client-
           +------- async mpsc channels -------+
 ```
 
-ClawdMux is a single Rust binary with internal async subsystems communicating via `mpsc` channels. The **AgentBackend trait** decouples the application from any specific AI coding assistant, enabling pluggable backends. Two backends are implemented:
+ClawMux is a single Rust binary with internal async subsystems communicating via `mpsc` channels. The **AgentBackend trait** decouples the application from any specific AI coding assistant, enabling pluggable backends. Two backends are implemented:
 
 - **OpenCodeBackend** (default): communicates with an opencode server over HTTP REST + Server-Sent Events (SSE).
 - **KiroBackend**: communicates with kiro-cli via the Agent Client Protocol (ACP) -- JSON-RPC 2.0 over stdin/stdout, one process per agent stage.
 
-Backend selection is configured in `.clawdmux/config.toml`:
+Backend selection is configured in `.clawmux/config.toml`:
 ```toml
 backend = "opencode"  # or "kiro"
 
@@ -84,12 +84,12 @@ backend = "opencode"  # or "kiro"
 
 ### KiroBackend: Agent Client Protocol (ACP)
 
-When `backend = "kiro"` is configured, ClawdMux communicates with kiro-cli via ACP
+When `backend = "kiro"` is configured, ClawMux communicates with kiro-cli via ACP
 (JSON-RPC 2.0 over newline-delimited stdin/stdout). One fresh kiro-cli process is
 spawned per agent stage to avoid context compaction across pipeline stages.
 
 **Process lifecycle per agent stage:**
-1. Spawn `kiro --acp --agent clawdmux-<stage>` with piped stdin/stdout
+1. Spawn `kiro --acp --agent clawmux-<stage>` with piped stdin/stdout
 2. Send `initialize` request; receive capabilities; send `initialized` notification
 3. Send `session/new`; receive `sessionId`
 4. Send `session/prompt` notification with task prompt
@@ -103,8 +103,8 @@ spawned per agent stage to avoid context compaction across pipeline stages.
 - `session/error` -> `AppMessage::SessionError`
 - `session/request_permission` (bidirectional) -> `AppMessage::PermissionAsked`
 
-**Kiro agent configs** are scaffolded into `.kiro/agents/clawdmux-*.json` during
-`clawdmux init`. Tool permissions are scoped per agent role:
+**Kiro agent configs** are scaffolded into `.kiro/agents/clawmux-*.json` during
+`clawmux init`. Tool permissions are scoped per agent role:
 - Read-only (Intake, Design, SecurityReview): `["read", "search", "think"]`
 - Read + execute (Planning, CodeQuality, CodeReview): `["read", "execute", "search", "think"]`
 - Full access (Implementation): `["read", "edit", "delete", "execute", "search", "think"]`
@@ -115,16 +115,16 @@ spawned per agent stage to avoid context compaction across pipeline stages.
 
 ### OpenCode Server Lifecycle
 
-ClawdMux manages the opencode server as a child process:
+ClawMux manages the opencode server as a child process:
 
 1. On startup, check if an opencode server is already running (health check at configured port)
-2. If not running, spawn `opencode serve --port <port> --hostname 127.0.0.1` as a background child process with **LLM provider credentials injected as environment variables** (e.g., `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) read from ClawdMux's global config
+2. If not running, spawn `opencode serve --port <port> --hostname 127.0.0.1` as a background child process with **LLM provider credentials injected as environment variables** (e.g., `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) read from ClawMux's global config
 3. Wait for health check to pass (`GET /global/health`)
 4. On shutdown, send SIGTERM to the child process (if we spawned it)
 
 Configuration allows connecting to an existing server instead:
 ```toml
-# .clawdmux/config.toml (project-level)
+# .clawmux/config.toml (project-level)
 [opencode]
 # auto = spawn if needed (default), external = expect running server
 mode = "auto"
@@ -133,9 +133,9 @@ port = 4096
 password = ""  # optional, for OPENCODE_SERVER_PASSWORD
 ```
 
-### Project Initialization (`clawdmux init`)
+### Project Initialization (`clawmux init`)
 
-`clawdmux init` is a one-time setup command run per project. It is interactive (terminal prompts, not TUI) and must be run before `clawdmux` (the TUI) is usable.
+`clawmux init` is a one-time setup command run per project. It is interactive (terminal prompts, not TUI) and must be run before `clawmux` (the TUI) is usable.
 
 **Step 1 -- Dependency check: opencode binary**
 
@@ -144,7 +144,7 @@ Checking for opencode... not found.
 opencode is required. Install it now? [Y/n]
 ```
 
-If yes, ClawdMux runs the official install script non-interactively:
+If yes, ClawMux runs the official install script non-interactively:
 ```bash
 curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path
 # Installs to ~/.opencode/bin/opencode
@@ -153,7 +153,7 @@ After installation, verifies the binary works and prints the installed version.
 
 **Step 2 -- Provider credentials (global, written once per machine)**
 
-Reads `~/.config/clawdmux/config.toml`. If no provider is configured:
+Reads `~/.config/clawmux/config.toml`. If no provider is configured:
 
 ```
 No LLM provider configured. Let's set one up.
@@ -161,12 +161,12 @@ Provider: [1] Anthropic  [2] OpenAI  [3] Google  [4] OpenRouter
 > 1
 API key: ****
 Default model [claude-sonnet-4-5]:
-Credentials saved to ~/.config/clawdmux/config.toml
+Credentials saved to ~/.config/clawmux/config.toml
 ```
 
 Global config structure:
 ```toml
-# ~/.config/clawdmux/config.toml
+# ~/.config/clawmux/config.toml
 [provider]
 default = "anthropic"
 
@@ -184,7 +184,7 @@ default_model = "claude-sonnet-4-5"
 # default_model = "openrouter/openrouter/auto"
 ```
 
-Credentials are stored only in ClawdMux's own config file -- they are never written to opencode's config. ClawdMux passes them to opencode via environment variables at process spawn time.
+Credentials are stored only in ClawMux's own config file -- they are never written to opencode's config. ClawMux passes them to opencode via environment variables at process spawn time.
 
 **Step 3 -- Project scaffold**
 
@@ -192,39 +192,39 @@ Creates the project-local files if they don't exist:
 
 ```
 Scaffolding project...
-  created .clawdmux/config.toml
-  created .opencode/agents/clawdmux/intake.md
-  created .opencode/agents/clawdmux/design.md
-  created .opencode/agents/clawdmux/planning.md
-  created .opencode/agents/clawdmux/implementation.md
-  created .opencode/agents/clawdmux/code-quality.md
-  created .opencode/agents/clawdmux/security-review.md
-  created .opencode/agents/clawdmux/code-review.md
+  created .clawmux/config.toml
+  created .opencode/agents/clawmux/intake.md
+  created .opencode/agents/clawmux/design.md
+  created .opencode/agents/clawmux/planning.md
+  created .opencode/agents/clawmux/implementation.md
+  created .opencode/agents/clawmux/code-quality.md
+  created .opencode/agents/clawmux/security-review.md
+  created .opencode/agents/clawmux/code-review.md
   created tasks/tasks.md
   created tasks/1.1.md
   created tasks/1.2.md
   created tasks/2.1.md
 ```
 
-The agent definition files contain sensible defaults. Users may edit them to customize agent behaviour. Running `clawdmux init --reset-agents` regenerates them from built-in defaults.
+The agent definition files contain sensible defaults. Users may edit them to customize agent behaviour. Running `clawmux init --reset-agents` regenerates them from built-in defaults.
 
-Implementation note: `run_init` delegates to an internal `run_init_with_paths(global_config_path, project_root, args)` that accepts an explicit global config path. This mirrors the `AppConfig::load_from` pattern and allows tests to supply a `TempDir`-based path without touching `~/.config/clawdmux/config.toml`. The opencode binary check lives only in the public `run_init` entry point and is intentionally excluded from `run_init_with_paths`.
+Implementation note: `run_init` delegates to an internal `run_init_with_paths(global_config_path, project_root, args)` that accepts an explicit global config path. This mirrors the `AppConfig::load_from` pattern and allows tests to supply a `TempDir`-based path without touching `~/.config/clawmux/config.toml`. The opencode binary check lives only in the public `run_init` entry point and is intentionally excluded from `run_init_with_paths`.
 
 **Step 4 -- Summary**
 
 ```
-clawdmux is ready. Run `clawdmux` to open the TUI.
+clawmux is ready. Run `clawmux` to open the TUI.
 ```
 
 ### Model Selection Hierarchy
 
-ClawdMux controls model selection at three layers (highest priority first):
+ClawMux controls model selection at three layers (highest priority first):
 
 | Priority | Mechanism | How to Set |
 |----------|-----------|------------|
-| 1 | **Per-prompt explicit model** | `model: { providerID, modelID }` passed in the `POST /session/:id/prompt_async` request body — ClawdMux always sets this from agent frontmatter or the global default |
-| 2 | **Per-agent default** | `model:` field in `.opencode/agents/clawdmux/<agent>.md` frontmatter |
-| 3 | **Global ClawdMux default** | `[provider.<name>].default_model` in `~/.config/clawdmux/config.toml`; used as the fallback in agent definition files via a `{global_default}` placeholder resolved at agent file generation time |
+| 1 | **Per-prompt explicit model** | `model: { providerID, modelID }` passed in the `POST /session/:id/prompt_async` request body — ClawMux always sets this from agent frontmatter or the global default |
+| 2 | **Per-agent default** | `model:` field in `.opencode/agents/clawmux/<agent>.md` frontmatter |
+| 3 | **Global ClawMux default** | `[provider.<name>].default_model` in `~/.config/clawmux/config.toml`; used as the fallback in agent definition files via a `{global_default}` placeholder resolved at agent file generation time |
 
 #### Per-Turn Model Selection (implementation)
 
@@ -239,17 +239,17 @@ Commit and fix sessions (which have no dedicated agent) use `default_model` dire
 This means:
 - Agents use their own model by default (e.g., Implementation uses a capable model, Intake uses a lighter/faster one)
 - The explicit per-turn model in the request body takes the highest OpenCode resolution priority, overriding agent frontmatter and session history
-- The global default seeds all agent files at `clawdmux init` time but each can be hand-edited independently
+- The global default seeds all agent files at `clawmux init` time but each can be hand-edited independently
 
 ### Crate & Module Structure
 
 ```
-clawdmux/
+clawmux/
   Cargo.toml
   src/
     main.rs                    # Entry point, bootstrap, event loop
     app.rs                     # Top-level App state, message dispatcher
-    error.rs                   # Centralized ClawdMuxError enum
+    error.rs                   # Centralized ClawMuxError enum
 
     messages.rs                # AppMessage enum -- the contract between subsystems
 
@@ -286,8 +286,8 @@ clawdmux/
 
     config/
       mod.rs                   # AppConfig, config loading (global + project), opencode agent definition management
-      init.rs                  # `clawdmux init` command: dependency checks, provider setup, project scaffold
-      providers.rs             # ProviderConfig: reads ~/.config/clawdmux/config.toml, resolves env vars to inject into opencode process
+      init.rs                  # `clawmux init` command: dependency checks, provider setup, project scaffold
+      providers.rs             # ProviderConfig: reads ~/.config/clawmux/config.toml, resolves env vars to inject into opencode process
 ```
 
 ### Key Data Structures
@@ -494,7 +494,7 @@ Pipeline: Intake -> Design -> Planning -> Implementation -> CodeQuality -> Secur
 **Flow (API-based):**
 1. Human selects a task and hits "Start" -> `StartTask` message
 2. Workflow engine assigns task to `Intake` agent, emits `CreateSession`
-3. OpenCode client creates a session via `POST /session`, then sends composed user message via `POST /session/:id/message` with `agent: "clawdmux/intake"` (or the appropriate stage agent)
+3. OpenCode client creates a session via `POST /session`, then sends composed user message via `POST /session/:id/message` with `agent: "clawmux/intake"` (or the appropriate stage agent)
 4. SSE events stream back: tool activity, message parts, completion -> mapped to `StreamingUpdate`, `ToolActivity` messages
 5. Agent response is parsed for structured output (JSON schema) indicating completion, questions, or kickback
 6. On completion -> `AgentCompleted` -> workflow advances to next agent (new session or forked session)
@@ -510,7 +510,7 @@ Pipeline: Intake -> Design -> Planning -> Implementation -> CodeQuality -> Secur
 
 ### Human Approval Gate
 
-Between each agent handoff, ClawdMux can pause and require explicit human approval before starting the next agent. This allows the user to inspect intermediate results at each pipeline stage without having to race against automatic progression.
+Between each agent handoff, ClawMux can pause and require explicit human approval before starting the next agent. This allows the user to inspect intermediate results at each pipeline stage without having to race against automatic progression.
 
 **Behavior:**
 - When an agent completes (via `AgentCompleted`, `AgentKickedBack`, or `SessionCompleted` fallback), the workflow engine transitions to `WorkflowPhase::AwaitingApproval { next_agent, context }` instead of immediately emitting `CreateSession`.
@@ -520,7 +520,7 @@ Between each agent handoff, ClawdMux can pause and require explicit human approv
 - When the human presses `n` on Tab 5, a `HumanApprovedTransition` message is dispatched. The workflow engine transitions to `Running` and emits `CreateSession` for the pending agent.
 
 **Configuration:**
-The gate is **on by default**. Disable it by adding the following to `.clawdmux/config.toml`:
+The gate is **on by default**. Disable it by adding the following to `.clawmux/config.toml`:
 
 ```toml
 [workflow]
@@ -552,7 +552,7 @@ When a task is interrupted — by a session error or an app crash/restart — it
 
 ### Session Completion Detection
 
-OpenCode signals session completion via SSE. ClawdMux uses two complementary mechanisms:
+OpenCode signals session completion via SSE. ClawMux uses two complementary mechanisms:
 
 **Primary: `session.status` SSE event (OpenCode >= 1.2.11)**
 When `props["status"]["type"] == "idle"`, `parse_wire_event` returns `OpenCodeEvent::SessionCompleted`. This is instant — the session completes as soon as the SSE event is received.
@@ -637,9 +637,9 @@ impl EventStreamConsumer {
 
 ### Custom OpenCode Agent Definitions
 
-Each of ClawdMux's 7 pipeline stages is a custom opencode agent defined as a markdown file in `.opencode/agents/clawdmux/`. ClawdMux writes these files at startup if they do not already exist (or if the user runs `clawdmux agent reset`), giving users a sensible default that they can edit by hand.
+Each of ClawMux's 7 pipeline stages is a custom opencode agent defined as a markdown file in `.opencode/agents/clawmux/`. ClawMux writes these files at startup if they do not already exist (or if the user runs `clawmux agent reset`), giving users a sensible default that they can edit by hand.
 
-**Example: `.opencode/agents/clawdmux/implementation.md`**
+**Example: `.opencode/agents/clawmux/implementation.md`**
 
 ```markdown
 ---
@@ -659,7 +659,7 @@ permission:
     "git status": allow
     "*": ask
 ---
-You are the Implementation agent in the ClawdMux pipeline. Your job is to
+You are the Implementation agent in the ClawMux pipeline. Your job is to
 implement the code changes described in the task's implementation plan.
 
 Follow the plan precisely. Prefer editing existing files over creating new ones.
@@ -684,7 +684,7 @@ If you have a blocking question for the human, respond with:
 | SecurityReview | yes | no | no | no | Read-only audit |
 | CodeReview | yes | no | no | limited | May run `git diff` |
 
-The `config/mod.rs` module owns the agent definition lifecycle: generating defaults, detecting if files exist, and exposing the opencode agent name (e.g., `"clawdmux/implementation"`) for each `AgentKind`.
+The `config/mod.rs` module owns the agent definition lifecycle: generating defaults, detecting if files exist, and exposing the opencode agent name (e.g., `"clawmux/implementation"`) for each `AgentKind`.
 
 ### Agent User Message Composition
 
@@ -695,7 +695,7 @@ The system prompt is embedded in the opencode agent definition file. `prompt_com
 
 /// Composes the user message sent to opencode for a given agent + task.
 /// The system prompt (personality, structured output instructions) lives in
-/// the opencode agent definition at .opencode/agents/clawdmux/<agent>.md.
+/// the opencode agent definition at .opencode/agents/clawmux/<agent>.md.
 pub fn compose_user_message(
     agent: &AgentKind,
     task: &Task,
@@ -745,7 +745,7 @@ This is far more reliable than parsing terminal output for text markers. opencod
 
 ```
 +-----------------------------------------------------------------------+
-| ClawdMux v0.1.0                                   [Task: 1.1 Foo]    |
+| ClawMux v0.1.0                                   [Task: 1.1 Foo]    |
 +-------------------+---------------------------------------------------+
 |                   | [Details] [Agent Activity] [Team Status] [Review]  |
 | Stories & Tasks   +---------------------------------------------------+
@@ -812,8 +812,8 @@ File discovery at startup: scan `./tasks/` then `./docs/tasks/` for `*.md` files
 | **opencode server lifecycle** -- process crashes, port conflicts, startup timing | Medium | Health check polling with exponential backoff on startup. Automatic restart with configurable retry limit. Clear error messages in TUI if server unreachable. On mid-workflow session errors, the user is presented with a choice: retry, mark as errored, or skip. |
 | **Task file format edge cases** -- multi-line fields, special characters | Medium | Comprehensive parser test suite with edge cases. Lenient parsing with sensible defaults. |
 | **SSE connection reliability** -- dropped connections, reconnection | Low | `reqwest-eventsource` handles reconnection. Add heartbeat monitoring. Graceful degradation: poll API if SSE fails. |
-| **opencode dependency** -- external binary must be installed | Low | `clawdmux init` auto-installs via official curl script with user consent. `clawdmux doctor` verifies prerequisites at any time. |
-| **Provider credential exposure** -- API keys stored in config file | Low | Keys live in `~/.config/clawdmux/config.toml` (user-owned, 0600). Never written to project files or opencode config. Passed to opencode process via env vars, not command-line args. |
+| **opencode dependency** -- external binary must be installed | Low | `clawmux init` auto-installs via official curl script with user consent. `clawmux doctor` verifies prerequisites at any time. |
+| **Provider credential exposure** -- API keys stored in config file | Low | Keys live in `~/.config/clawmux/config.toml` (user-owned, 0600). Never written to project files or opencode config. Passed to opencode process via env vars, not command-line args. |
 
 ---
 
@@ -827,20 +827,20 @@ File discovery at startup: scan `./tasks/` then `./docs/tasks/` for `*.md` files
    - OpenCode client: mock HTTP server tests for session lifecycle, prompt sending, diff retrieval
 3. **Integration test**: Mock opencode server that returns structured JSON responses, verify full pipeline from `StartTask` through `Completed`
 4. **Manual TUI test**: Run `cargo run` in a project with sample task files and a running opencode server, verify all 4 tabs render
-5. **Server lifecycle test**: Verify ClawdMux spawns opencode server on startup, connects, and cleans up on shutdown
+5. **Server lifecycle test**: Verify ClawMux spawns opencode server on startup, connects, and cleans up on shutdown
 
 ---
 
 ## MVP Phasing
 
 - **Phase 1**: TUI shell with task loading, left pane navigation, Tab 1 (task details)
-- **Phase 2**: `clawdmux init`, opencode server lifecycle, Tab 2 (agent activity stream)
+- **Phase 2**: `clawmux init`, opencode server lifecycle, Tab 2 (agent activity stream)
 - **Phase 3**: Agent workflow engine with structured output parsing, Tab 3 (team status)
 - **Phase 4**: Tab 4 (code review) with diffs from opencode API
 
 ### Implementation Status
 
-- Task 4.1 (TUI Bootstrap & Event Loop): COMPLETED. `cargo run` opens a full-screen ratatui terminal with a placeholder layout (header, left/right panes, footer). Pressing `q` or `Ctrl-C` exits cleanly and restores the terminal. Logging redirected to `clawdmux.log` to avoid corrupting the TUI display. `App` struct, `tui::draw()`, `tui::handle_input()`, and `tui::layout::render_layout()` are all implemented with unit tests.
+- Task 4.1 (TUI Bootstrap & Event Loop): COMPLETED. `cargo run` opens a full-screen ratatui terminal with a placeholder layout (header, left/right panes, footer). Pressing `q` or `Ctrl-C` exits cleanly and restores the terminal. Logging redirected to `clawmux.log` to avoid corrupting the TUI display. `App` struct, `tui::draw()`, `tui::handle_input()`, and `tui::layout::render_layout()` are all implemented with unit tests.
 - Task 4.2 (Task List Widget): COMPLETED. Left pane now renders a real collapsible story/task tree via `tui::task_list`. `TaskListState` tracks expansion, selection index, and the flattened item list. Arrow keys (`Up`/`Down`/`j`/`k`) navigate the list; `Enter`/`Space` toggles story expansion or selects a task; `Tab` cycles the active right-pane tab. Status icons use distinct ratatui colors (`[ ]` Open, `[*]` InProgress, `[x]` Completed, `[!]` Abandoned, `[?]` PendingReview). `handle_input` now takes `&mut App` to mutate navigation state directly. `App` gains `task_list_state: TaskListState`, initialized via `refresh()` in `App::new()`. 103 tests passing.
 - Task 6.1 (Workflow State Machine): COMPLETED. `WorkflowEngine` pure state machine implemented in `src/workflow/transitions.rs`. `WorkflowPhase` (`Idle`, `Running`, `AwaitingAnswer`, `PendingReview`, `Completed`, `Errored`) and `WorkflowState` drive per-task lifecycle. `process(AppMessage) -> Vec<AppMessage>` handles all workflow transitions: `StartTask`, `SessionCreated`, `SessionCompleted`, `AgentCompleted`, `AgentKickedBack` (with kickback validation), `AgentAskedQuestion`, `HumanAnswered`, `HumanApprovedReview`, `HumanRequestedRevisions`, `SessionError`. Placeholder prompt helper marked `//TODO: Wire compose_user_message`. TOCTOU race in `EventStreamConsumer::handle_event()` fixed with 3-attempt/50ms retry on `SessionCreated`. 12 unit tests added (185 total). Re-exported via `workflow::{WorkflowEngine, WorkflowPhase, WorkflowState}`.
 - Task 6.2 (Prompt Composer): COMPLETED. `compose_user_message(agent, task, kickback_reason) -> String` implemented in `src/workflow/prompt_composer.rs`. Builds per-agent user messages with sections gated by pipeline index: Task Context and Description (all agents); Prior Q&A (Design+, index >= 1); Design, Implementation Plan, Work Log last 10 entries (Planning+, index >= 2); Kickback Context (when reason provided); Your Role (all agents). Private section builders each return `Option<String>` and are omitted when content is empty. Work log truncation shows a `(showing last 10 of N entries)` note when truncated. 6 unit tests added (195 total).

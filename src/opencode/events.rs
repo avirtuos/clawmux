@@ -14,7 +14,7 @@ use reqwest_eventsource::{Event, EventSource};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::error::{ClawdMuxError, Result};
+use crate::error::{ClawMuxError, Result};
 use crate::messages::AppMessage;
 use crate::opencode::types::{MessagePart, OpenCodeEvent, PermissionRequest};
 use crate::tasks::models::TaskId;
@@ -23,7 +23,7 @@ use crate::workflow::agents::AgentKind;
 /// Maps session IDs to their associated task and agent.
 ///
 /// Shared between the `EventStreamConsumer` and the workflow engine to correlate
-/// opencode session events with ClawdMux tasks.
+/// opencode session events with ClawMux tasks.
 pub type SessionMap = Arc<RwLock<HashMap<String, (TaskId, AgentKind)>>>;
 
 /// Consumes SSE events from the opencode server and routes them as `AppMessage` values.
@@ -517,12 +517,12 @@ impl EventStreamConsumer {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Sse`] if the receiver has been dropped.
+    /// Returns [`ClawMuxError::Sse`] if the receiver has been dropped.
     async fn send(&self, msg: AppMessage) -> Result<()> {
         self.tx
             .send(msg)
             .await
-            .map_err(|e| ClawdMuxError::Sse(e.to_string()))
+            .map_err(|e| ClawMuxError::Sse(e.to_string()))
     }
 }
 

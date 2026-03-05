@@ -1,7 +1,7 @@
 //! App configuration loading and opencode agent definition management.
 //!
-//! Loads the global config (`~/.config/clawdmux/config.toml`) and the
-//! project-level config (`.clawdmux/config.toml`), and exposes the merged
+//! Loads the global config (`~/.config/clawmux/config.toml`) and the
+//! project-level config (`.clawmux/config.toml`), and exposes the merged
 //! [`AppConfig`] used throughout the application.
 
 pub mod init;
@@ -13,22 +13,22 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ClawdMuxError, Result};
+use crate::error::{ClawMuxError, Result};
 
-/// Whether clawdmux manages the opencode server process itself or connects to
+/// Whether clawmux manages the opencode server process itself or connects to
 /// an already-running external instance.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ServerMode {
-    /// ClawdMux launches and manages the opencode server automatically.
+    /// ClawMux launches and manages the opencode server automatically.
     #[default]
     Auto,
-    /// ClawdMux connects to an externally managed opencode server.
+    /// ClawMux connects to an externally managed opencode server.
     External,
 }
 
-/// Which agent backend ClawdMux uses for session operations.
+/// Which agent backend ClawMux uses for session operations.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendKind {
@@ -46,11 +46,11 @@ pub enum BackendKind {
 pub struct KiroConfig {
     /// Optional path to the kiro binary.
     ///
-    /// When `None`, ClawdMux searches `PATH` for `kiro`.
+    /// When `None`, ClawMux searches `PATH` for `kiro`.
     pub binary: Option<String>,
 }
 
-/// Project-level opencode connection settings from `.clawdmux/config.toml`.
+/// Project-level opencode connection settings from `.clawmux/config.toml`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -76,7 +76,7 @@ impl Default for OpenCodeConfig {
     }
 }
 
-/// Workflow behavior settings from `.clawdmux/config.toml`.
+/// Workflow behavior settings from `.clawmux/config.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WorkflowConfig {
@@ -132,15 +132,15 @@ impl AppConfig {
     /// Resolve the effective opencode server password.
     ///
     /// Precedence (highest to lowest):
-    /// 1. `global.opencode_password` — set in `~/.config/clawdmux/config.toml`
-    /// 2. `opencode.password` — set in `.clawdmux/config.toml`
-    /// 3. Hardcoded default: `"clawdmux-default-pw"`
+    /// 1. `global.opencode_password` — set in `~/.config/clawmux/config.toml`
+    /// 2. `opencode.password` — set in `.clawmux/config.toml`
+    /// 3. Hardcoded default: `"clawmux-default-pw"`
     pub fn effective_opencode_password(&self) -> String {
         self.global
             .opencode_password
             .clone()
             .or_else(|| self.opencode.password.clone())
-            .unwrap_or_else(|| "clawdmux-default-pw".to_string())
+            .unwrap_or_else(|| "clawmux-default-pw".to_string())
     }
 
     /// Returns `true` if a password was explicitly configured by the user.
@@ -154,33 +154,33 @@ impl AppConfig {
 
     /// Load the merged application config.
     ///
-    /// Reads the global config from `~/.config/clawdmux/config.toml` and the
-    /// project config from `{project_root}/.clawdmux/config.toml`. Missing
+    /// Reads the global config from `~/.config/clawmux/config.toml` and the
+    /// project config from `{project_root}/.clawmux/config.toml`. Missing
     /// config files are treated as an empty config (defaults are used). Other
     /// IO errors or TOML parse errors are propagated.
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Internal`] if the platform config directory
-    /// cannot be resolved. Returns [`ClawdMuxError::Io`] for unexpected IO
-    /// failures and [`ClawdMuxError::Config`] for malformed TOML.
+    /// Returns [`ClawMuxError::Internal`] if the platform config directory
+    /// cannot be resolved. Returns [`ClawMuxError::Io`] for unexpected IO
+    /// failures and [`ClawMuxError::Config`] for malformed TOML.
     pub fn load(project_root: &Path) -> Result<Self> {
         let global_config_dir = dirs::config_dir().ok_or_else(|| {
-            ClawdMuxError::Internal("could not determine platform config directory".to_string())
+            ClawMuxError::Internal("could not determine platform config directory".to_string())
         })?;
-        let global_path = global_config_dir.join("clawdmux").join("config.toml");
+        let global_path = global_config_dir.join("clawmux").join("config.toml");
         Self::load_from(&global_path, project_root)
     }
 
     /// Internal loader that accepts an explicit global config path.
     ///
     /// Separated from [`Self::load`] so tests can supply a temporary directory
-    /// path without touching the real `~/.config/clawdmux/config.toml`.
+    /// path without touching the real `~/.config/clawmux/config.toml`.
     fn load_from(global_config_path: &Path, project_root: &Path) -> Result<Self> {
         // --- Global config ---
         let global = match GlobalConfig::load(global_config_path) {
             Ok(cfg) => cfg,
-            Err(ClawdMuxError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(ClawMuxError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::info!(
                     path = %global_config_path.display(),
                     "global config not found, using defaults"
@@ -191,7 +191,7 @@ impl AppConfig {
         };
 
         // --- Project config ---
-        let project_config_path = project_root.join(".clawdmux").join("config.toml");
+        let project_config_path = project_root.join(".clawmux").join("config.toml");
 
         let (backend, opencode, kiro, workflow) =
             match std::fs::read_to_string(&project_config_path) {
@@ -211,7 +211,7 @@ impl AppConfig {
                         WorkflowConfig::default(),
                     )
                 }
-                Err(e) => return Err(ClawdMuxError::Io(e)),
+                Err(e) => return Err(ClawMuxError::Io(e)),
             };
 
         Ok(AppConfig {
@@ -294,9 +294,9 @@ password = "s3cr3t"
     fn test_app_config_load_with_project_config() {
         let global_dir = TempDir::new().unwrap();
         let project_dir = TempDir::new().unwrap();
-        let clawdmux_dir = project_dir.path().join(".clawdmux");
-        std::fs::create_dir_all(&clawdmux_dir).unwrap();
-        let config_path = clawdmux_dir.join("config.toml");
+        let clawmux_dir = project_dir.path().join(".clawmux");
+        std::fs::create_dir_all(&clawmux_dir).unwrap();
+        let config_path = clawmux_dir.join("config.toml");
         std::fs::write(
             &config_path,
             r#"
@@ -321,11 +321,11 @@ password = "mypassword"
     fn test_server_mode_invalid() {
         let toml = r#"mode = "bogus""#;
         let result: std::result::Result<OpenCodeConfig, _> = toml::from_str(toml);
-        // toml::from_str returns a toml::de::Error; map through ClawdMuxError::Config
+        // toml::from_str returns a toml::de::Error; map through ClawMuxError::Config
         // by mimicking what AppConfig::load_from does with the project config.
-        let err = result.map_err(ClawdMuxError::from);
+        let err = result.map_err(ClawMuxError::from);
         assert!(
-            matches!(err, Err(ClawdMuxError::Config(_))),
+            matches!(err, Err(ClawMuxError::Config(_))),
             "expected Config error for unknown server mode, got: {:?}",
             err
         );
@@ -366,7 +366,7 @@ password = "mypassword"
     #[test]
     fn test_effective_password_hardcoded_default() {
         let config = make_app_config(None, None);
-        assert_eq!(config.effective_opencode_password(), "clawdmux-default-pw");
+        assert_eq!(config.effective_opencode_password(), "clawmux-default-pw");
     }
 
     #[test]
@@ -461,10 +461,10 @@ password = "mypassword"
     fn test_app_config_kiro_backend_from_project_config() {
         let global_dir = TempDir::new().unwrap();
         let project_dir = TempDir::new().unwrap();
-        let clawdmux_dir = project_dir.path().join(".clawdmux");
-        std::fs::create_dir_all(&clawdmux_dir).unwrap();
+        let clawmux_dir = project_dir.path().join(".clawmux");
+        std::fs::create_dir_all(&clawmux_dir).unwrap();
         std::fs::write(
-            clawdmux_dir.join("config.toml"),
+            clawmux_dir.join("config.toml"),
             r#"backend = "kiro"
 
 [kiro]

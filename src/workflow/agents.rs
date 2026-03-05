@@ -1,6 +1,6 @@
 //! AgentKind enum and pipeline ordering.
 //!
-//! Defines the 7 agents in the ClawdMux pipeline and provides methods for
+//! Defines the 7 agents in the ClawMux pipeline and provides methods for
 //! pipeline navigation (`next`, `prev`), ordering (`pipeline_index`),
 //! kickback validation (`valid_kickback_targets`), and name conversion
 //! (`Display`, `FromStr`, `opencode_agent_name`).
@@ -8,7 +8,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::error::ClawdMuxError;
+use crate::error::ClawMuxError;
 
 /// The 7 pipeline agents plus a special `Human` marker used in task assignment.
 ///
@@ -48,30 +48,30 @@ impl AgentKind {
     /// Equivalent to `self.to_string()` but returns a `&str` without allocation.
     pub fn opencode_agent_name(&self) -> &str {
         match self {
-            AgentKind::Intake => "clawdmux/intake",
-            AgentKind::Design => "clawdmux/design",
-            AgentKind::Planning => "clawdmux/planning",
-            AgentKind::Implementation => "clawdmux/implementation",
-            AgentKind::CodeQuality => "clawdmux/code-quality",
-            AgentKind::SecurityReview => "clawdmux/security-review",
-            AgentKind::CodeReview => "clawdmux/code-review",
+            AgentKind::Intake => "clawmux/intake",
+            AgentKind::Design => "clawmux/design",
+            AgentKind::Planning => "clawmux/planning",
+            AgentKind::Implementation => "clawmux/implementation",
+            AgentKind::CodeQuality => "clawmux/code-quality",
+            AgentKind::SecurityReview => "clawmux/security-review",
+            AgentKind::CodeReview => "clawmux/code-review",
             AgentKind::Human => "human",
         }
     }
 
     /// Returns the kiro-cli agent name string for this variant.
     ///
-    /// Kiro agents are named `"clawdmux-<stage>"` and correspond to JSON config
-    /// files in `.kiro/agents/` scaffolded by `clawdmux init`.
+    /// Kiro agents are named `"clawmux-<stage>"` and correspond to JSON config
+    /// files in `.kiro/agents/` scaffolded by `clawmux init`.
     pub fn kiro_agent_name(&self) -> &str {
         match self {
-            AgentKind::Intake => "clawdmux-intake",
-            AgentKind::Design => "clawdmux-design",
-            AgentKind::Planning => "clawdmux-planning",
-            AgentKind::Implementation => "clawdmux-implementation",
-            AgentKind::CodeQuality => "clawdmux-code-quality",
-            AgentKind::SecurityReview => "clawdmux-security-review",
-            AgentKind::CodeReview => "clawdmux-code-review",
+            AgentKind::Intake => "clawmux-intake",
+            AgentKind::Design => "clawmux-design",
+            AgentKind::Planning => "clawmux-planning",
+            AgentKind::Implementation => "clawmux-implementation",
+            AgentKind::CodeQuality => "clawmux-code-quality",
+            AgentKind::SecurityReview => "clawmux-security-review",
+            AgentKind::CodeReview => "clawmux-code-review",
             AgentKind::Human => "human",
         }
     }
@@ -198,7 +198,7 @@ impl AgentKind {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Parse`] if the string does not match any known display name.
+    /// Returns [`ClawMuxError::Parse`] if the string does not match any known display name.
     pub fn from_display_name(s: &str) -> crate::error::Result<AgentKind> {
         // Strip trailing " agent" suffix before matching (case-insensitive).
         let lower = s.trim().to_lowercase();
@@ -215,7 +215,7 @@ impl AgentKind {
             "security review" => Ok(AgentKind::SecurityReview),
             "code review" => Ok(AgentKind::CodeReview),
             "human" => Ok(AgentKind::Human),
-            other => Err(ClawdMuxError::Parse {
+            other => Err(ClawMuxError::Parse {
                 file: "<agent kind>".to_string(),
                 message: format!("unknown agent display name: '{other}'"),
             }),
@@ -230,26 +230,26 @@ impl fmt::Display for AgentKind {
 }
 
 impl FromStr for AgentKind {
-    type Err = ClawdMuxError;
+    type Err = ClawMuxError;
 
     /// Parses an opencode agent name string into an `AgentKind`.
     ///
-    /// Parsing is case-insensitive. The expected format is `"clawdmux/<stage>"`.
+    /// Parsing is case-insensitive. The expected format is `"clawmux/<stage>"`.
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Parse`] if the string does not match any known agent name.
+    /// Returns [`ClawMuxError::Parse`] if the string does not match any known agent name.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "clawdmux/intake" => Ok(AgentKind::Intake),
-            "clawdmux/design" => Ok(AgentKind::Design),
-            "clawdmux/planning" => Ok(AgentKind::Planning),
-            "clawdmux/implementation" => Ok(AgentKind::Implementation),
-            "clawdmux/code-quality" => Ok(AgentKind::CodeQuality),
-            "clawdmux/security-review" => Ok(AgentKind::SecurityReview),
-            "clawdmux/code-review" => Ok(AgentKind::CodeReview),
+            "clawmux/intake" => Ok(AgentKind::Intake),
+            "clawmux/design" => Ok(AgentKind::Design),
+            "clawmux/planning" => Ok(AgentKind::Planning),
+            "clawmux/implementation" => Ok(AgentKind::Implementation),
+            "clawmux/code-quality" => Ok(AgentKind::CodeQuality),
+            "clawmux/security-review" => Ok(AgentKind::SecurityReview),
+            "clawmux/code-review" => Ok(AgentKind::CodeReview),
             "human" => Ok(AgentKind::Human),
-            other => Err(ClawdMuxError::Parse {
+            other => Err(ClawMuxError::Parse {
                 file: "<agent kind>".to_string(),
                 message: format!("unknown agent name: '{other}'"),
             }),
@@ -339,35 +339,35 @@ mod tests {
 
     #[test]
     fn test_display() {
-        assert_eq!(AgentKind::Intake.to_string(), "clawdmux/intake");
-        assert_eq!(AgentKind::Design.to_string(), "clawdmux/design");
-        assert_eq!(AgentKind::Planning.to_string(), "clawdmux/planning");
+        assert_eq!(AgentKind::Intake.to_string(), "clawmux/intake");
+        assert_eq!(AgentKind::Design.to_string(), "clawmux/design");
+        assert_eq!(AgentKind::Planning.to_string(), "clawmux/planning");
         assert_eq!(
             AgentKind::Implementation.to_string(),
-            "clawdmux/implementation"
+            "clawmux/implementation"
         );
-        assert_eq!(AgentKind::CodeQuality.to_string(), "clawdmux/code-quality");
+        assert_eq!(AgentKind::CodeQuality.to_string(), "clawmux/code-quality");
         assert_eq!(
             AgentKind::SecurityReview.to_string(),
-            "clawdmux/security-review"
+            "clawmux/security-review"
         );
-        assert_eq!(AgentKind::CodeReview.to_string(), "clawdmux/code-review");
+        assert_eq!(AgentKind::CodeReview.to_string(), "clawmux/code-review");
     }
 
     #[test]
     fn test_from_str() {
         assert_eq!(
-            "clawdmux/code-quality".parse::<AgentKind>().unwrap(),
+            "clawmux/code-quality".parse::<AgentKind>().unwrap(),
             AgentKind::CodeQuality
         );
         // Case-insensitive
         assert_eq!(
-            "CLAWDMUX/CODE-QUALITY".parse::<AgentKind>().unwrap(),
+            "CLAWMUX/CODE-QUALITY".parse::<AgentKind>().unwrap(),
             AgentKind::CodeQuality
         );
         // Unknown name returns error
-        let err = "clawdmux/unknown".parse::<AgentKind>().unwrap_err();
-        assert!(matches!(err, ClawdMuxError::Parse { file, .. } if file == "<agent kind>"));
+        let err = "clawmux/unknown".parse::<AgentKind>().unwrap_err();
+        assert!(matches!(err, ClawMuxError::Parse { file, .. } if file == "<agent kind>"));
     }
 
     #[test]
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn test_from_display_name_invalid() {
         let err = AgentKind::from_display_name("Unknown Agent").unwrap_err();
-        assert!(matches!(err, ClawdMuxError::Parse { .. }));
+        assert!(matches!(err, ClawMuxError::Parse { .. }));
     }
 
     #[test]
@@ -455,24 +455,24 @@ mod tests {
 
     #[test]
     fn test_kiro_agent_name() {
-        assert_eq!(AgentKind::Intake.kiro_agent_name(), "clawdmux-intake");
-        assert_eq!(AgentKind::Design.kiro_agent_name(), "clawdmux-design");
-        assert_eq!(AgentKind::Planning.kiro_agent_name(), "clawdmux-planning");
+        assert_eq!(AgentKind::Intake.kiro_agent_name(), "clawmux-intake");
+        assert_eq!(AgentKind::Design.kiro_agent_name(), "clawmux-design");
+        assert_eq!(AgentKind::Planning.kiro_agent_name(), "clawmux-planning");
         assert_eq!(
             AgentKind::Implementation.kiro_agent_name(),
-            "clawdmux-implementation"
+            "clawmux-implementation"
         );
         assert_eq!(
             AgentKind::CodeQuality.kiro_agent_name(),
-            "clawdmux-code-quality"
+            "clawmux-code-quality"
         );
         assert_eq!(
             AgentKind::SecurityReview.kiro_agent_name(),
-            "clawdmux-security-review"
+            "clawmux-security-review"
         );
         assert_eq!(
             AgentKind::CodeReview.kiro_agent_name(),
-            "clawdmux-code-review"
+            "clawmux-code-review"
         );
         assert_eq!(AgentKind::Human.kiro_agent_name(), "human");
     }

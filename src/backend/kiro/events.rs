@@ -51,7 +51,7 @@ impl PermissionResponse {
     }
 }
 
-/// Map a ClawdMux permission decision string to an ACP [`PermissionDecision`].
+/// Map a ClawMux permission decision string to an ACP [`PermissionDecision`].
 fn map_permission_decision(decision: &str) -> PermissionDecision {
     match decision {
         "always" => PermissionDecision::AllowAlways,
@@ -60,7 +60,7 @@ fn map_permission_decision(decision: &str) -> PermissionDecision {
     }
 }
 
-/// Map ACP [`AcpPermissionKind`] to a ClawdMux permission type string for the TUI.
+/// Map ACP [`AcpPermissionKind`] to a ClawMux permission type string for the TUI.
 fn map_permission_kind(kind: &AcpPermissionKind) -> &'static str {
     match kind {
         AcpPermissionKind::FileRead => "bash",

@@ -417,7 +417,7 @@ mod tests {
         let params = InitializeParams {
             protocol_version: "1.0".to_string(),
             client_info: ClientInfo {
-                name: "clawdmux".to_string(),
+                name: "clawmux".to_string(),
                 version: "0.1.0".to_string(),
             },
             capabilities: ClientCapabilities {
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn test_initialize_result_string_version() {
         let json =
-            r#"{"protocolVersion":"1.0","agentInfo":{"name":"clawdmux-intake","version":"0.1.0"}}"#;
+            r#"{"protocolVersion":"1.0","agentInfo":{"name":"clawmux-intake","version":"0.1.0"}}"#;
         let result: InitializeResult = serde_json::from_str(json).unwrap();
         assert_eq!(result.protocol_version, "1.0");
         assert_eq!(result.agent_info.version, "0.1.0");
@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn test_initialize_result_integer_version() {
         // kiro-cli may return version fields as bare integers rather than strings.
-        let json = r#"{"protocolVersion":1,"agentInfo":{"name":"clawdmux-intake","version":1}}"#;
+        let json = r#"{"protocolVersion":1,"agentInfo":{"name":"clawmux-intake","version":1}}"#;
         let result: InitializeResult = serde_json::from_str(json).unwrap();
         assert_eq!(result.protocol_version, "1");
         assert_eq!(result.agent_info.version, "1");

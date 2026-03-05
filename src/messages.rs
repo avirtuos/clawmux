@@ -1,4 +1,4 @@
-//! AppMessage enum -- the contract between ClawdMux subsystems.
+//! AppMessage enum -- the contract between ClawMux subsystems.
 //!
 //! All inter-subsystem communication flows through this enum via async mpsc channels.
 //! Variants cover terminal events, workflow commands, opencode session events,
@@ -10,7 +10,7 @@ use crate::opencode::types::{FileDiff, MessagePart, PermissionRequest};
 use crate::tasks::models::TaskId;
 use crate::workflow::agents::AgentKind;
 
-/// All messages flowing between ClawdMux subsystems.
+/// All messages flowing between ClawMux subsystems.
 ///
 /// Every inter-subsystem interaction -- terminal input, workflow state changes,
 /// opencode session lifecycle, diffs, task file updates, and shutdown -- is

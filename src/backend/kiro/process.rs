@@ -24,7 +24,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::error::{ClawdMuxError, Result};
+use crate::error::{ClawMuxError, Result};
 use crate::messages::AppMessage;
 use crate::tasks::models::TaskId;
 
@@ -61,7 +61,7 @@ impl KiroProcess {
     ///
     /// # Arguments
     /// * `binary` – path or name of the kiro-cli binary (looked up in PATH if not absolute).
-    /// * `agent_name` – kiro agent name, e.g. `"clawdmux-intake"`.
+    /// * `agent_name` – kiro agent name, e.g. `"clawmux-intake"`.
     /// * `cwd` – absolute path to the project working directory, sent in `initialize`.
     /// * `task_id` – task this process belongs to.
     /// * `async_tx` – channel for forwarding [`AppMessage`] variants to the application.
@@ -82,18 +82,16 @@ impl KiroProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| {
-                ClawdMuxError::Kiro(format!("failed to spawn kiro-cli ({binary}): {e}"))
-            })?;
+            .map_err(|e| ClawMuxError::Kiro(format!("failed to spawn kiro-cli ({binary}): {e}")))?;
 
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| ClawdMuxError::Kiro("kiro-cli stdin not available".to_string()))?;
+            .ok_or_else(|| ClawMuxError::Kiro("kiro-cli stdin not available".to_string()))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| ClawdMuxError::Kiro("kiro-cli stdout not available".to_string()))?;
+            .ok_or_else(|| ClawMuxError::Kiro("kiro-cli stdout not available".to_string()))?;
 
         // Drain stderr to avoid blocking and surface kiro-cli errors in the log.
         if let Some(stderr) = child.stderr.take() {
@@ -158,7 +156,7 @@ impl KiroProcess {
         let params = InitializeParams {
             protocol_version: ACP_PROTOCOL_VERSION.to_string(),
             client_info: ClientInfo {
-                name: "clawdmux".to_string(),
+                name: "clawmux".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
             capabilities: ClientCapabilities {
@@ -171,7 +169,7 @@ impl KiroProcess {
             .await?;
 
         let init_result: InitializeResult = serde_json::from_value(result).map_err(|e| {
-            ClawdMuxError::Kiro(format!(
+            ClawMuxError::Kiro(format!(
                 "invalid initialize response from {agent_name}: {e}"
             ))
         })?;
@@ -196,7 +194,7 @@ impl KiroProcess {
             .await?;
 
         let session: SessionNewResult = serde_json::from_value(session_result).map_err(|e| {
-            ClawdMuxError::Kiro(format!(
+            ClawMuxError::Kiro(format!(
                 "invalid session/new response from {agent_name}: {e}"
             ))
         })?;
@@ -292,9 +290,7 @@ impl KiroProcess {
             .send(PermissionResponse::new(rpc_id, decision))
             .await
             .map_err(|_| {
-                ClawdMuxError::Kiro(
-                    "permission channel closed (process already exited)".to_string(),
-                )
+                ClawMuxError::Kiro("permission channel closed (process already exited)".to_string())
             })
     }
 

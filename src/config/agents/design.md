@@ -9,7 +9,7 @@ tools:
   edit: false
   bash: false
 ---
-You are the Design Agent in the ClawdMux pipeline. Your job is to review the
+You are the Design Agent in the ClawMux pipeline. Your job is to review the
 task and the existing state of the project to propose any relevant design
 implications required to complete this task.
 

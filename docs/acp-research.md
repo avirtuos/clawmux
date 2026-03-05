@@ -1,13 +1,13 @@
-# ACP Research: Agent Client Protocol vs OpenCode for ClawdMux
+# ACP Research: Agent Client Protocol vs OpenCode for ClawMux
 
 **Date:** 2026-03-02
-**Related Issue:** [#36 - Add kiro-cli as an alternative agent backend via ACP](https://github.com/avirtuos/clawdmux/issues/36)
+**Related Issue:** [#36 - Add kiro-cli as an alternative agent backend via ACP](https://github.com/avirtuos/clawmux/issues/36)
 
 ## Executive Summary
 
-The Agent Client Protocol (ACP) is a standardized JSON-RPC 2.0 protocol for editor-to-agent communication, jointly governed by Zed Industries and JetBrains, with 40+ client implementations and 50+ compatible agents. It represents a fundamentally different architectural model from OpenCode's HTTP REST + SSE approach, and in many areas provides richer capabilities. This document presents a unified analysis of ACP from three angles -- core protocol specification, advanced/future features, and kiro-cli's concrete implementation -- and distills them into a single perspective on how ClawdMux should approach ACP as a backend.
+The Agent Client Protocol (ACP) is a standardized JSON-RPC 2.0 protocol for editor-to-agent communication, jointly governed by Zed Industries and JetBrains, with 40+ client implementations and 50+ compatible agents. It represents a fundamentally different architectural model from OpenCode's HTTP REST + SSE approach, and in many areas provides richer capabilities. This document presents a unified analysis of ACP from three angles -- core protocol specification, advanced/future features, and kiro-cli's concrete implementation -- and distills them into a single perspective on how ClawMux should approach ACP as a backend.
 
-**Key conclusion:** ACP is not just an alternative transport for what we already do with OpenCode. It introduces capabilities that would meaningfully improve ClawdMux's orchestration model -- structured plans, inline diffs, richer permissions, dynamic configuration, and a proxy/conductor architecture that maps naturally to our pipeline. However, ACP also has gaps (no turn limits, no token tracking yet, no global event multiplexing) that require orchestrator-level solutions.
+**Key conclusion:** ACP is not just an alternative transport for what we already do with OpenCode. It introduces capabilities that would meaningfully improve ClawMux's orchestration model -- structured plans, inline diffs, richer permissions, dynamic configuration, and a proxy/conductor architecture that maps naturally to our pipeline. However, ACP also has gaps (no turn limits, no token tracking yet, no global event multiplexing) that require orchestrator-level solutions.
 
 ---
 
@@ -25,7 +25,7 @@ The Agent Client Protocol (ACP) is a standardized JSON-RPC 2.0 protocol for edit
 | Streaming | SSE (Server-Sent Events) | JSON-RPC notifications over stdio |
 | Diff retrieval | Dedicated `GET /session/:id/diff` endpoint | **Inline** in tool call content as `{ type: "diff" }` blocks |
 
-The most significant architectural difference is **bidirectionality**. In ACP, the agent can call methods on the client -- requesting file reads, file writes, terminal creation, and permission approval. This means ClawdMux would act as both a JSON-RPC **client** (sending prompts, creating sessions) and a JSON-RPC **server** (handling agent requests for FS, terminal, and permissions). This is a richer model than OpenCode where ClawdMux is purely a consumer.
+The most significant architectural difference is **bidirectionality**. In ACP, the agent can call methods on the client -- requesting file reads, file writes, terminal creation, and permission approval. This means ClawMux would act as both a JSON-RPC **client** (sending prompts, creating sessions) and a JSON-RPC **server** (handling agent requests for FS, terminal, and permissions). This is a richer model than OpenCode where ClawMux is purely a consumer.
 
 ### 1.2 Session Lifecycle
 
@@ -40,7 +40,7 @@ ACP defines a formal 6-phase lifecycle:
 6. CONFIG CHANGE  -- session/set_config_option (at any time after phase 3)
 ```
 
-OpenCode has no formal initialization handshake -- ClawdMux just starts calling REST endpoints. ACP's capability negotiation at startup means we can detect at runtime which features a specific agent supports, rather than hardcoding assumptions.
+OpenCode has no formal initialization handshake -- ClawMux just starts calling REST endpoints. ACP's capability negotiation at startup means we can detect at runtime which features a specific agent supports, rather than hardcoding assumptions.
 
 ### 1.3 Capability Negotiation
 
@@ -55,7 +55,7 @@ During `initialize`, both sides advertise what they support:
 - `promptCapabilities.image` / `.audio` / `.embeddedContext` -- content types accepted
 - `mcpCapabilities.http` / `.sse` -- MCP server transport support
 
-OpenCode has no equivalent. ClawdMux currently assumes all OpenCode features are available.
+OpenCode has no equivalent. ClawMux currently assumes all OpenCode features are available.
 
 ---
 
@@ -63,7 +63,7 @@ OpenCode has no equivalent. ClawdMux currently assumes all OpenCode features are
 
 ### 2.1 Where ACP Exceeds OpenCode
 
-| Feature | ACP | OpenCode | Impact on ClawdMux |
+| Feature | ACP | OpenCode | Impact on ClawMux |
 |---------|-----|----------|-------------------|
 | **Structured plans** | `plan` updates with priority (high/medium/low) and status (pending/in_progress/completed) per entry | None | Native plan visualization in the Plan tab; agents report structured progress |
 | **Inline diffs** | `{ type: "diff", path, oldText?, newText }` in tool call content | Requires polling `GET /session/:id/diff` | Real-time diff display without polling; diffs arrive with the tool call that produced them |
@@ -72,18 +72,18 @@ OpenCode has no equivalent. ClawdMux currently assumes all OpenCode features are
 | **Permission model** | 4 options: `allow_once`, `allow_always`, `reject_once`, `reject_always` with structured `PermissionOption` objects | 3 options: `once`, `always`, `reject` as strings | `reject_always` enables persistent rejection rules; structured options allow custom labels |
 | **Session modes** | Dynamic modes with `session/set_config_option`; categories for `mode`, `model`, `thought_level` | None | Switch between ask/architect/code modes per pipeline stage; adjust model/reasoning dynamically |
 | **Slash commands** | Agent advertises available commands via `available_commands_update` | None | Expose agent-specific commands in the TUI |
-| **MCP server passthrough** | Client passes MCP server configs at session creation | Not available | Agents can use project-specific MCP tools defined in ClawdMux config |
-| **FS/terminal delegation** | Agent requests client to perform FS/terminal ops | Agent does everything directly | ClawdMux controls what agents can read/write/execute -- centralized security boundary |
+| **MCP server passthrough** | Client passes MCP server configs at session creation | Not available | Agents can use project-specific MCP tools defined in ClawMux config |
+| **FS/terminal delegation** | Agent requests client to perform FS/terminal ops | Agent does everything directly | ClawMux controls what agents can read/write/execute -- centralized security boundary |
 | **Rich content types** | Text, images, audio, embedded resources, resource links with annotations | Text only (message parts) | Multimodal content in agent activity; resource links for file references |
 | **Session load/replay** | `session/load` replays conversation history via notifications | No equivalent | Resume interrupted pipeline stages with full context |
-| **Formal extensibility** | `_meta` fields everywhere; `_`-prefixed custom methods; vendor capabilities | None | Define `_clawdmux/` extensions for task context injection, pipeline coordination |
-| **W3C trace context** | Built-in `traceparent`/`tracestate`/`baggage` in `_meta` | None | Distributed tracing across ClawdMux and agents |
+| **Formal extensibility** | `_meta` fields everywhere; `_`-prefixed custom methods; vendor capabilities | None | Define `_clawmux/` extensions for task context injection, pipeline coordination |
+| **W3C trace context** | Built-in `traceparent`/`tracestate`/`baggage` in `_meta` | None | Distributed tracing across ClawMux and agents |
 
 ### 2.2 Where OpenCode Exceeds ACP (and Mitigation Strategies)
 
-| OpenCode Feature | ACP Status | Mitigation for ClawdMux |
+| OpenCode Feature | ACP Status | Mitigation for ClawMux |
 |-----------------|------------|------------------------|
-| **Global event stream** | No equivalent -- ACP is per-process | ClawdMux fans-in from multiple agent process stdout streams into the single `AppMessage` channel (already the plan) |
+| **Global event stream** | No equivalent -- ACP is per-process | ClawMux fans-in from multiple agent process stdout streams into the single `AppMessage` channel (already the plan) |
 | **Session status polling** (`idle`/`busy`/`retry`) | No equivalent | Track status locally: `Running` when prompt sent, `Completed` on turn end, `Errored` on process failure |
 | **Token usage reporting** | RFD proposed: `usage_update` with input/output/thought/cached tokens + cost tracking | Implement local token counting if available via `_meta`; zero-fill otherwise. Monitor the RFD -- this will likely be standardized |
 | **Session forking** | RFD proposed: `session/fork` | Not critical for current pipeline model (sequential agents). Monitor RFD for future parallel agent support |
@@ -102,7 +102,7 @@ Kiro extends standard ACP with `_kiro.dev/` prefixed methods:
 | Extension | Purpose | Relevance |
 |-----------|---------|-----------|
 | `_kiro.dev/commands/execute` | Execute slash commands | Could invoke `/agent swap` for mode switching |
-| `_kiro.dev/commands/options` | Autocomplete suggestions | Low -- ClawdMux manages the pipeline |
+| `_kiro.dev/commands/options` | Autocomplete suggestions | Low -- ClawMux manages the pipeline |
 | `_kiro.dev/commands/available` | Available command list | Low |
 | `_kiro.dev/mcp/oauth_request` | OAuth flows for MCP servers | Useful if agents need authenticated API access |
 | `_kiro.dev/mcp/server_initialized` | MCP tool availability notification | Useful for verifying agent tool setup |
@@ -135,7 +135,7 @@ Complete schema:
 
 ```json
 {
-  "name": "clawdmux-intake",
+  "name": "clawmux-intake",
   "description": "Reviews task file and clarifies requirements",
   "prompt": "You are the Intake Agent...",
   "model": "claude-sonnet-4-6",
@@ -162,7 +162,7 @@ Complete schema:
     }
   },
   "hooks": {
-    "stop": [{ "command": "notify-clawdmux pipeline-advance" }],
+    "stop": [{ "command": "notify-clawmux pipeline-advance" }],
     "preToolUse": [{ "command": "check-allowed", "matcher": "bash" }]
   },
   "env": { "MY_VAR": "value" },
@@ -208,7 +208,7 @@ Five lifecycle hooks that fire during agent execution:
 | `stop` | Agent turn completes | 0 = success |
 
 Hooks receive JSON context via stdin and can output transformation instructions. This is powerful for orchestration:
-- `stop` hook could notify ClawdMux to advance the pipeline
+- `stop` hook could notify ClawMux to advance the pipeline
 - `preToolUse` hook could enforce additional security constraints
 - `agentSpawn` hook could inject task context
 
@@ -217,7 +217,7 @@ Hooks receive JSON context via stdin and can output transformation instructions.
 | Aspect | OpenCode | Kiro |
 |--------|----------|------|
 | Format | Markdown + YAML frontmatter | JSON |
-| Location | `.opencode/agents/clawdmux/*.md` | `.kiro/agents/*.json` |
+| Location | `.opencode/agents/clawmux/*.md` | `.kiro/agents/*.json` |
 | System prompt | Markdown body | `prompt` field (inline or `file://` URI) |
 | Model | `model` in frontmatter | `model` field |
 | Turn limits | `steps` field | **Not available** |
@@ -244,8 +244,8 @@ Proxies/conductors can:
 - Coordinate tools across agents
 - Manage multi-agent workflows
 
-**ClawdMux is naturally an ACP Conductor.** Rather than just wrapping agents, it could implement the conductor protocol, gaining:
-- Standard proxy chain composition (e.g., ClawdMux -> security-proxy -> agent)
+**ClawMux is naturally an ACP Conductor.** Rather than just wrapping agents, it could implement the conductor protocol, gaining:
+- Standard proxy chain composition (e.g., ClawMux -> security-proxy -> agent)
 - Context injection via the standardized mechanism
 - Tool coordination across pipeline stages
 - Compatibility with any ACP-compliant agent (not just kiro)
@@ -268,7 +268,7 @@ MCP servers communicating through ACP channels:
 - Client-injected tools without separate MCP processes
 - Transparent bridging for agents that don't natively support it
 
-This would let ClawdMux provide custom tools to agents (e.g., a `clawdmux-context` MCP tool that serves task/story information) without running separate processes.
+This would let ClawMux provide custom tools to agents (e.g., a `clawmux-context` MCP tool that serves task/story information) without running separate processes.
 
 ### 4.4 Usage Tracking (Proposed RFD)
 
@@ -310,7 +310,7 @@ The ACP Rust SDK (`agent-client-protocol` crate, being rewritten as `sacp` v1.0)
 - **Proxy/conductor support** built-in
 - Published as `sacp` crates
 
-This means ClawdMux could potentially use the official Rust SDK rather than building JSON-RPC transport from scratch. The SDK handles framing, capability negotiation, and message routing.
+This means ClawMux could potentially use the official Rust SDK rather than building JSON-RPC transport from scratch. The SDK handles framing, capability negotiation, and message routing.
 
 ---
 
@@ -318,7 +318,7 @@ This means ClawdMux could potentially use the official Rust SDK rather than buil
 
 ### 6.1 No Turn/Step Limits
 
-Neither ACP nor kiro-cli provide a way to limit how many turns an agent takes. OpenCode has `steps: 20` in agent definitions. ClawdMux must implement this at the orchestrator level by counting turn completions and sending `session/cancel` when the limit is reached.
+Neither ACP nor kiro-cli provide a way to limit how many turns an agent takes. OpenCode has `steps: 20` in agent definitions. ClawMux must implement this at the orchestrator level by counting turn completions and sending `session/cancel` when the limit is reached.
 
 ### 6.2 No Token Usage (Yet)
 
@@ -326,15 +326,15 @@ The `usage_update` RFD is proposed but not yet standardized. Until then, token t
 
 ### 6.3 Kiro Authentication
 
-Kiro requires interactive login before first use -- there is no API key authentication. Auth tokens persist in `~/.kiro/`. This means the first run of ClawdMux with kiro backend may require manual kiro login.
+Kiro requires interactive login before first use -- there is no API key authentication. Auth tokens persist in `~/.kiro/`. This means the first run of ClawMux with kiro backend may require manual kiro login.
 
 ### 6.4 Auto-Compaction
 
-Kiro automatically compacts conversation context when it grows large. This can lose context mid-pipeline. ClawdMux should monitor `_kiro.dev/compaction/status` and consider creating fresh sessions for later pipeline stages rather than reusing a single session with accumulated context.
+Kiro automatically compacts conversation context when it grows large. This can lose context mid-pipeline. ClawMux should monitor `_kiro.dev/compaction/status` and consider creating fresh sessions for later pipeline stages rather than reusing a single session with accumulated context.
 
 ### 6.5 MCP Tool Naming
 
-Kiro formats MCP tool names as `@server-name___tool-name` (with triple underscore). This affects how ClawdMux displays tool activity in the TUI.
+Kiro formats MCP tool names as `@server-name___tool-name` (with triple underscore). This affects how ClawMux displays tool activity in the TUI.
 
 ---
 
@@ -353,11 +353,11 @@ The original issue (#36) framed kiro-cli/ACP as "an alternative to opencode." Af
 | Orchestrator role | Passive consumer | **Active participant** (FS/terminal/permission provider) | ACP |
 | Turn limits | Built-in `steps` | Must implement externally | OpenCode |
 | Token tracking | Built-in | RFD (coming) | OpenCode (for now) |
-| Maturity | Proven in ClawdMux | New integration | OpenCode |
+| Maturity | Proven in ClawMux | New integration | OpenCode |
 
 ### 7.2 Recommended Architecture: ACP Conductor
 
-Rather than treating ACP as a simple backend swap, ClawdMux should adopt the **ACP Conductor** pattern:
+Rather than treating ACP as a simple backend swap, ClawMux should adopt the **ACP Conductor** pattern:
 
 ```
 TUI (ratatui) -> App (message dispatch) -> BackendDispatcher
@@ -376,7 +376,7 @@ The `AcpConductor` would:
 2. Handle bidirectional JSON-RPC (send prompts, respond to permission/FS/terminal requests)
 3. Translate ACP notifications to `AppMessage` variants
 4. Implement turn counting (replacing OpenCode's `steps`)
-5. Provide FS/terminal services to agents (with ClawdMux-controlled security boundaries)
+5. Provide FS/terminal services to agents (with ClawMux-controlled security boundaries)
 6. Inject task/story context via prompt enrichment or resource attachments
 
 ### 7.3 Process Model Recommendation
@@ -405,11 +405,11 @@ Tradeoff: adds a dependency and couples to the SDK's design patterns. But it sig
 
 ## 8. Feature Opportunities Unique to ACP
 
-Beyond matching OpenCode's capabilities, ACP enables features ClawdMux cannot achieve today:
+Beyond matching OpenCode's capabilities, ACP enables features ClawMux cannot achieve today:
 
 ### 8.1 Centralized Security Boundary (FS/Terminal Delegation)
 
-With ACP's delegation model, the *agent* asks *ClawdMux* to read files and run commands. This means ClawdMux can:
+With ACP's delegation model, the *agent* asks *ClawMux* to read files and run commands. This means ClawMux can:
 - Enforce path restrictions centrally (not per-agent config)
 - Log every file read/write and command execution
 - Show real-time FS/terminal activity in the TUI
@@ -417,25 +417,25 @@ With ACP's delegation model, the *agent* asks *ClawdMux* to read files and run c
 
 ### 8.2 Structured Plan Visualization
 
-ACP agents report structured plans with `priority` and `status` per entry. ClawdMux could render these in the Plan tab as a live task tracker showing which sub-steps the agent is working on, completed, or hasn't started.
+ACP agents report structured plans with `priority` and `status` per entry. ClawMux could render these in the Plan tab as a live task tracker showing which sub-steps the agent is working on, completed, or hasn't started.
 
 ### 8.3 Inline Diff Display
 
-Instead of polling a diff endpoint after session completion, ACP delivers diffs inline with tool calls as `{ type: "diff", path, oldText, newText }`. ClawdMux could show diffs in real-time as they are produced, not just at the end.
+Instead of polling a diff endpoint after session completion, ACP delivers diffs inline with tool calls as `{ type: "diff", path, oldText, newText }`. ClawMux could show diffs in real-time as they are produced, not just at the end.
 
 ### 8.4 Dynamic Model/Reasoning Configuration
 
-Via `session/set_config_option`, ClawdMux could adjust model and reasoning level per pipeline stage:
+Via `session/set_config_option`, ClawMux could adjust model and reasoning level per pipeline stage:
 - Intake/Design: use a cheaper/faster model (e.g., Haiku)
 - Implementation: use the most capable model (e.g., Opus)
 - Code review: increase reasoning/thought level
 
-### 8.5 Custom ClawdMux Extensions
+### 8.5 Custom ClawMux Extensions
 
 Using ACP's `_meta` and `_`-prefixed method extensibility:
-- `_clawdmux/task_context` -- inject story/task details into agent sessions
-- `_clawdmux/pipeline_status` -- notify agents of their position in the pipeline
-- `_clawdmux/artifact_share` -- pass artifacts between pipeline stages
+- `_clawmux/task_context` -- inject story/task details into agent sessions
+- `_clawmux/pipeline_status` -- notify agents of their position in the pipeline
+- `_clawmux/artifact_share` -- pass artifacts between pipeline stages
 
 ---
 

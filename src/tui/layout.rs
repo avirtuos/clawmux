@@ -1,12 +1,12 @@
 //! Main layout: left pane (25%), right pane (75%), and footer.
 //!
-//! Splits the terminal area into the primary ClawdMux layout regions using
+//! Splits the terminal area into the primary ClawMux layout regions using
 //! ratatui `Layout` constraints. The left pane holds the task list; the right
 //! pane holds the 4-tab widget.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-/// Computed layout regions for the ClawdMux TUI.
+/// Computed layout regions for the ClawMux TUI.
 pub struct AppLayout {
     /// Left pane occupying 25% of the main area width (task list).
     pub left_pane: Rect,
@@ -16,7 +16,7 @@ pub struct AppLayout {
     pub footer: Rect,
 }
 
-/// Splits the given terminal area into the 3-region ClawdMux layout.
+/// Splits the given terminal area into the 3-region ClawMux layout.
 ///
 /// - Main area: split 25% left / 75% right
 /// - Footer: 2 rows at the bottom

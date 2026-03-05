@@ -1,6 +1,6 @@
-# ClawdMux
+# ClawMux
 
-ClawdMux is a GenAI coding assistance multiplexer and task orchestrator. It manages scrum-style stories and tasks, assigns them to a sequential pipeline of AI agents powered by [opencode](https://opencode.ai), and provides a unified TUI for interacting with those agents.
+ClawMux is a GenAI coding assistance multiplexer and task orchestrator. It manages scrum-style stories and tasks, assigns them to a sequential pipeline of AI agents powered by [opencode](https://opencode.ai), and provides a unified TUI for interacting with those agents.
 
 ## Features
 
@@ -16,7 +16,7 @@ ClawdMux is a GenAI coding assistance multiplexer and task orchestrator. It mana
 
 ### What works today
 
-- `clawdmux init` -- full interactive wizard: checks for the `opencode` binary, configures LLM provider credentials, scaffolds the project directory, and generates agent definition files
+- `clawmux init` -- full interactive wizard: checks for the `opencode` binary, configures LLM provider credentials, scaffolds the project directory, and generates agent definition files
 - TUI -- terminal UI renders with left-pane task list navigation and Tab 1 (task details view)
 - Task markdown parsing and writing -- round-trip fidelity for all task file sections
 - OpenCode HTTP client -- session creation, SSE event streaming, server lifecycle management (auto-start/reuse)
@@ -47,28 +47,28 @@ cargo install --path .
 Run the interactive setup command once per project:
 
 ```bash
-clawdmux init
+clawmux init
 ```
 
 This will:
 1. Check for and optionally install the `opencode` binary
-2. Configure your LLM provider credentials (stored in `~/.config/clawdmux/config.toml`)
-3. Scaffold the project directory structure (`.clawdmux/`, `.opencode/agents/`, `tasks/`)
+2. Configure your LLM provider credentials (stored in `~/.config/clawmux/config.toml`)
+3. Scaffold the project directory structure (`.clawmux/`, `.opencode/agents/`, `tasks/`)
 4. Generate default agent definition files
 
 To regenerate agent definitions from built-in defaults:
 
 ```bash
-clawdmux init --reset-agents
+clawmux init --reset-agents
 ```
 
 ### Running
 
 ```bash
-clawdmux
+clawmux
 ```
 
-The TUI requires an interactive terminal. Log output is written to `clawdmux.log` in the working directory to avoid corrupting the terminal display.
+The TUI requires an interactive terminal. Log output is written to `clawmux.log` in the working directory to avoid corrupting the terminal display.
 
 ## Task File Format
 
@@ -108,7 +108,7 @@ A1: Rust
 
 ## Architecture
 
-ClawdMux acts as a client to an `opencode serve` HTTP server. See `docs/design.md` for the full architecture documentation.
+ClawMux acts as a client to an `opencode serve` HTTP server. See `docs/design.md` for the full architecture documentation.
 
 ## Module Structure
 
@@ -120,7 +120,7 @@ src/
 │   ├── mod.rs
 │   ├── init.rs
 │   └── providers.rs
-├── error.rs             -- Unified ClawdMuxError type
+├── error.rs             -- Unified ClawMuxError type
 ├── messages.rs          -- Internal message bus types (AppMessage enum)
 ├── opencode/            -- HTTP client for the opencode server
 │   ├── mod.rs
@@ -151,7 +151,7 @@ src/
 
 ## TODO
 
-- **Improve password support for opencode local auth**: Write a project-specific opencode config that enables auth when clawdmux spawns the server, so credentials can be verified end-to-end rather than relying on the user to configure opencode separately.
+- **Improve password support for opencode local auth**: Write a project-specific opencode config that enables auth when clawmux spawns the server, so credentials can be verified end-to-end rather than relying on the user to configure opencode separately.
 
 ## Development
 

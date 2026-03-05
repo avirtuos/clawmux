@@ -1,4 +1,4 @@
-//! LLM provider configuration loaded from `~/.config/clawdmux/config.toml`.
+//! LLM provider configuration loaded from `~/.config/clawmux/config.toml`.
 //!
 //! Provides API keys and model defaults for the active LLM provider, which are
 //! injected into the opencode server process as environment variables.
@@ -9,7 +9,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ClawdMuxError, Result};
+use crate::error::{ClawMuxError, Result};
 use crate::opencode::types::ModelId;
 
 /// Configuration for a single LLM provider (API key and default model).
@@ -53,7 +53,7 @@ pub struct ProviderSection {
     pub openrouter: Option<ProviderConfig>,
 }
 
-/// Global ClawdMux configuration stored in `~/.config/clawdmux/config.toml`.
+/// Global ClawMux configuration stored in `~/.config/clawmux/config.toml`.
 ///
 /// Contains LLM provider credentials used to configure opencode server processes.
 #[allow(dead_code)]
@@ -75,8 +75,8 @@ pub struct GlobalConfig {
 impl GlobalConfig {
     /// Load a [`GlobalConfig`] from a TOML file at `path`.
     ///
-    /// Returns `Err(ClawdMuxError::Io)` if the file cannot be read (including
-    /// `NotFound`) and `Err(ClawdMuxError::Config)` if the TOML is malformed.
+    /// Returns `Err(ClawMuxError::Io)` if the file cannot be read (including
+    /// `NotFound`) and `Err(ClawMuxError::Config)` if the TOML is malformed.
     pub fn load(path: &Path) -> Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         let config: GlobalConfig = toml::from_str(&contents)?;
@@ -86,13 +86,13 @@ impl GlobalConfig {
     /// Serialize this config to TOML and write it to `path`.
     ///
     /// Creates any missing parent directories. Maps TOML serialization errors
-    /// to [`ClawdMuxError::Encode`].
+    /// to [`ClawMuxError::Encode`].
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let contents =
-            toml::to_string_pretty(self).map_err(|e| ClawdMuxError::Encode(e.to_string()))?;
+            toml::to_string_pretty(self).map_err(|e| ClawMuxError::Encode(e.to_string()))?;
         std::fs::write(path, contents)?;
         Ok(())
     }
@@ -195,7 +195,7 @@ default_model = "claude-opus-4-6"
         let path = dir.path().join("does_not_exist.toml");
 
         let result = GlobalConfig::load(&path);
-        assert!(matches!(result, Err(ClawdMuxError::Io(_))));
+        assert!(matches!(result, Err(ClawMuxError::Io(_))));
     }
 
     #[test]
@@ -231,7 +231,7 @@ default_model = "claude-opus-4-6"
         std::fs::write(&path, "not valid toml ][[[").unwrap();
 
         let result = GlobalConfig::load(&path);
-        assert!(matches!(result, Err(ClawdMuxError::Config(_))));
+        assert!(matches!(result, Err(ClawMuxError::Config(_))));
     }
 
     #[test]

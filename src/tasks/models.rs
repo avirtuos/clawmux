@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use crate::error::ClawdMuxError;
+use crate::error::ClawMuxError;
 use crate::workflow::agents::AgentKind;
 
 /// Unique identifier for a task, derived from its file path.
@@ -84,7 +84,7 @@ impl fmt::Display for TaskStatus {
 }
 
 impl FromStr for TaskStatus {
-    type Err = ClawdMuxError;
+    type Err = ClawMuxError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // Strip underscores for lenient parsing (e.g. "IN_PROGRESS" == "INPROGRESS").
@@ -95,7 +95,7 @@ impl FromStr for TaskStatus {
             "PENDINGREVIEW" => Ok(TaskStatus::PendingReview),
             "COMPLETED" => Ok(TaskStatus::Completed),
             "ABANDONED" => Ok(TaskStatus::Abandoned),
-            other => Err(ClawdMuxError::Parse {
+            other => Err(ClawMuxError::Parse {
                 file: "<task status>".to_string(),
                 message: format!("unknown task status: '{other}'"),
             }),
@@ -398,7 +398,7 @@ mod tests {
         );
 
         let err = "BOGUS".parse::<TaskStatus>().unwrap_err();
-        assert!(matches!(&err, ClawdMuxError::Parse { file, .. } if file == "<task status>"));
+        assert!(matches!(&err, ClawMuxError::Parse { file, .. } if file == "<task status>"));
     }
 
     #[test]
