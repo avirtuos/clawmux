@@ -417,7 +417,7 @@ fn render_quit_confirm_dialog(frame: &mut Frame, area: Rect) {
 ///
 /// Shows the list of changed files (capped at 10 visible rows) and an editable
 /// textarea pre-filled with the proposed commit message.
-/// `[Alt+Enter]` confirms; `[Enter]` inserts a newline; `[Esc]` cancels.
+/// `[Alt/Option+Enter]` confirms; `[Enter]` inserts a newline; `[Esc]` cancels.
 fn render_commit_dialog(frame: &mut Frame, area: Rect, dialog: &CommitDialogState) {
     let dialog_width = 70u16;
     // Layout: 2 borders + file list (capped at 10) + 1 spacer + 6 editor rows + 1 hint = varies.
@@ -475,7 +475,7 @@ fn render_commit_dialog(frame: &mut Frame, area: Rect, dialog: &CommitDialogStat
 
     // Render hint line.
     frame.render_widget(
-        Paragraph::new(Line::from("[Alt+Enter] commit | [Esc] cancel")),
+        Paragraph::new(Line::from("[Alt/Option+Enter] commit | [Esc] cancel")),
         hint_area,
     );
 }
@@ -893,9 +893,13 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
         // request arriving while the commit dialog is open is handled correctly.
         if app.commit_dialog.is_some() {
             match key.code {
-                // Alt+Enter confirms (mirrors steering textarea convention).
+                // Alt+Enter (Option+Enter on macOS) confirms (mirrors steering textarea convention).
                 // Bare Enter falls through to the textarea to insert a newline.
-                KeyCode::Enter if key.modifiers == KeyModifiers::ALT => {
+                KeyCode::Enter
+                    if key.modifiers.intersects(
+                        KeyModifiers::ALT | KeyModifiers::SUPER | KeyModifiers::META,
+                    ) =>
+                {
                     // Check for empty message without consuming the dialog.
                     let message = app
                         .commit_dialog
@@ -3731,6 +3735,24 @@ mod tests {
         assert!(
             app.commit_dialog.is_some(),
             "dialog should remain open when message is empty"
+        );
+    }
+
+    /// Verifies that `[Super+Enter]` (Option+Enter on some macOS terminals) also confirms.
+    #[test]
+    fn test_commit_dialog_super_enter_emits_approved_commit() {
+        let mut app = App::test_default();
+        let task_id = crate::tasks::TaskId::from_path("tasks/1.1.md");
+        app.open_commit_dialog(&task_id);
+        app.commit_dialog
+            .as_mut()
+            .unwrap()
+            .editor
+            .insert_str("feat: option key commit");
+        let result = handle_input(key_event(KeyCode::Enter, KeyModifiers::SUPER), &mut app);
+        assert!(
+            matches!(result, Some(AppMessage::HumanApprovedCommit { .. })),
+            "Super+Enter should emit HumanApprovedCommit, got: {result:?}"
         );
     }
 
