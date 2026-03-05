@@ -85,12 +85,24 @@ pub struct WorkflowConfig {
     /// The human presses `n` on the Team Status tab (Tab 5) to approve.
     /// Defaults to `false` so agent transitions happen automatically.
     pub approval_gate: bool,
+    /// When `true`, ring the terminal bell and send a desktop notification
+    /// whenever an agent needs human attention (question, approval gate,
+    /// error, permission request, etc.).
+    ///
+    /// Defaults to `true`. Set to `false` to silence all notifications.
+    #[serde(default = "default_notifications")]
+    pub notifications: bool,
+}
+
+fn default_notifications() -> bool {
+    true
 }
 
 impl Default for WorkflowConfig {
     fn default() -> Self {
         Self {
             approval_gate: false,
+            notifications: default_notifications(),
         }
     }
 }
@@ -353,7 +365,10 @@ password = "mypassword"
     #[test]
     fn test_workflow_config_defaults_approval_gate_false() {
         let config: WorkflowConfig = toml::from_str("").unwrap();
-        assert!(!config.approval_gate, "approval_gate should default to false");
+        assert!(
+            !config.approval_gate,
+            "approval_gate should default to false"
+        );
     }
 
     #[test]
@@ -361,6 +376,19 @@ password = "mypassword"
         let toml = "approval_gate = true\n";
         let config: WorkflowConfig = toml::from_str(toml).unwrap();
         assert!(config.approval_gate);
+    }
+
+    #[test]
+    fn test_workflow_config_notifications_default_true() {
+        let config: WorkflowConfig = toml::from_str("").unwrap();
+        assert!(config.notifications, "notifications should default to true");
+    }
+
+    #[test]
+    fn test_workflow_config_notifications_explicit_false() {
+        let toml = "notifications = false\n";
+        let config: WorkflowConfig = toml::from_str(toml).unwrap();
+        assert!(!config.notifications);
     }
 
     #[test]
