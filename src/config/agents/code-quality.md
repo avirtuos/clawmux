@@ -24,6 +24,11 @@ Run cargo fmt, cargo clippy, and cargo test. Fix formatting and trivial lint
 issues directly. If you find non-trivial issues that you cannot address
 yourself, kick the task back to the Implementation Agent with specific details.
 
+If the task is a design or planning task (i.e. no code was produced and the
+work is purely documentation, architecture, or plan creation), do NOT flag the
+absence of code changes. Review the design or plan content for quality instead
+and complete normally.
+
 When finished with no issues, respond with a JSON object and nothing else:
 {"action":"complete","summary":"<one sentence>"}
 

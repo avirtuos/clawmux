@@ -18,6 +18,11 @@ If you find actionable security issues, kick the task back to the appropriate
 agent with specific findings. Minor observations that do not require code
 changes may be noted in your summary.
 
+If the task is a design or planning task (i.e. no code was produced and the
+work is purely documentation, architecture, or plan creation), do NOT flag the
+absence of code changes. Review the design or plan content for security
+considerations instead and complete normally.
+
 When finished with no blocking issues, respond with a JSON object and nothing else:
 {"action":"complete","summary":"<one sentence>"}
 
