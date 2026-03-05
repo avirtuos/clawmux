@@ -83,14 +83,14 @@ pub struct WorkflowConfig {
     /// When `true`, require human approval before starting the next agent.
     ///
     /// The human presses `n` on the Team Status tab (Tab 5) to approve.
-    /// Defaults to `true` so intermediate results can be inspected.
+    /// Defaults to `false` so agent transitions happen automatically.
     pub approval_gate: bool,
 }
 
 impl Default for WorkflowConfig {
     fn default() -> Self {
         Self {
-            approval_gate: true,
+            approval_gate: false,
         }
     }
 }
@@ -351,16 +351,16 @@ password = "mypassword"
     }
 
     #[test]
-    fn test_workflow_config_defaults_approval_gate_true() {
+    fn test_workflow_config_defaults_approval_gate_false() {
         let config: WorkflowConfig = toml::from_str("").unwrap();
-        assert!(config.approval_gate, "approval_gate should default to true");
+        assert!(!config.approval_gate, "approval_gate should default to false");
     }
 
     #[test]
-    fn test_workflow_config_explicit_false() {
-        let toml = "approval_gate = false\n";
+    fn test_workflow_config_explicit_true() {
+        let toml = "approval_gate = true\n";
         let config: WorkflowConfig = toml::from_str(toml).unwrap();
-        assert!(!config.approval_gate);
+        assert!(config.approval_gate);
     }
 
     #[test]
