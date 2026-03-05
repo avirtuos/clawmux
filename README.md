@@ -1,5 +1,9 @@
 # ClawMux
 
+<p align="center">
+  <img src="docs/images/clawmux.png" alt="ClawMux logo" width="307" />
+</p>
+
 ClawMux is a GenAI coding assistance multiplexer and task orchestrator. It manages scrum-style stories and tasks, assigns them to a sequential pipeline of AI agents powered by [opencode](https://opencode.ai), and provides a unified TUI for interacting with those agents.
 
 ## Features
