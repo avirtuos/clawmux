@@ -4,7 +4,7 @@
 //! verbatim to ensure round-trip fidelity for agent-added or user-added content.
 //! Task 2.2 implements the full serializer.
 
-use crate::error::ClawdMuxError;
+use crate::error::ClawMuxError;
 use crate::tasks::models::Task;
 
 /// Serializes a [`Task`] to a markdown string in the canonical task file format.
@@ -23,12 +23,12 @@ use crate::tasks::models::Task;
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::ClawdMuxError::Encode`] if serialization fails (currently
+/// Returns [`crate::error::ClawMuxError::Encode`] if serialization fails (currently
 /// infallible, but returns `Result` for API consistency with the rest of the codebase).
 #[allow(dead_code)]
 pub fn write_task(task: &Task) -> crate::error::Result<String> {
     if task.parse_error.is_some() {
-        return Err(ClawdMuxError::Internal(format!(
+        return Err(ClawMuxError::Internal(format!(
             "write_task: refusing to overwrite malformed task '{}' with stub defaults",
             task.id
         )));

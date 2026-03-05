@@ -42,7 +42,7 @@ impl ModelId {
     /// # Examples
     ///
     /// ```
-    /// # use clawdmux::opencode::types::ModelId;
+    /// # use clawmux::opencode::types::ModelId;
     /// let m = ModelId::parse("openrouter/anthropic/claude-sonnet-4.6").unwrap();
     /// assert_eq!(m.provider_id, "openrouter");
     /// assert_eq!(m.model_id, "anthropic/claude-sonnet-4.6");

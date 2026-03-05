@@ -8,7 +8,7 @@ pub mod server;
 pub mod session;
 pub mod types;
 
-use crate::error::{ClawdMuxError, Result};
+use crate::error::{ClawMuxError, Result};
 use crate::opencode::types::HealthResponse;
 use reqwest::Method;
 
@@ -56,14 +56,14 @@ impl OpenCodeClient {
         }
     }
 
-    /// Checks whether a response has a 2xx status, returning an [`ClawdMuxError::Api`] otherwise.
+    /// Checks whether a response has a 2xx status, returning an [`ClawMuxError::Api`] otherwise.
     ///
     /// Consumes the response to read its body on failure, and passes it through on success.
     async fn check_response(&self, resp: reqwest::Response) -> Result<reqwest::Response> {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(ClawdMuxError::Api { status, body });
+            return Err(ClawMuxError::Api { status, body });
         }
         Ok(resp)
     }
@@ -77,7 +77,7 @@ impl OpenCodeClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Http`] on transport failure or [`ClawdMuxError::Api`]
+    /// Returns [`ClawMuxError::Http`] on transport failure or [`ClawMuxError::Api`]
     /// on a non-2xx response.
     pub async fn health(&self) -> Result<bool> {
         let resp = self.request(Method::GET, "/global/health").send().await?;

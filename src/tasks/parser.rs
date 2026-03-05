@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 
-use crate::error::ClawdMuxError;
+use crate::error::ClawMuxError;
 use crate::tasks::models::{ParseErrorInfo, Question, Task, TaskId, TaskStatus, WorkLogEntry};
 use crate::workflow::agents::AgentKind;
 
@@ -22,7 +22,7 @@ use crate::workflow::agents::AgentKind;
 ///
 /// # Errors
 ///
-/// Returns [`ClawdMuxError::Parse`] if required metadata fields are missing or
+/// Returns [`ClawMuxError::Parse`] if required metadata fields are missing or
 /// any field value cannot be parsed.
 #[allow(dead_code)]
 pub fn parse_task(content: &str, file_path: PathBuf) -> crate::error::Result<Task> {
@@ -58,7 +58,7 @@ pub fn parse_task(content: &str, file_path: PathBuf) -> crate::error::Result<Tas
                         Some(
                             value
                                 .parse::<TaskStatus>()
-                                .map_err(|_| ClawdMuxError::Parse {
+                                .map_err(|_| ClawMuxError::Parse {
                                     file: file_name.clone(),
                                     message: format!("invalid Status value: '{value}'"),
                                 })?,
@@ -67,7 +67,7 @@ pub fn parse_task(content: &str, file_path: PathBuf) -> crate::error::Result<Tas
                 "assigned to" => {
                     let inner = strip_brackets(value).unwrap_or(value);
                     assigned_to = Some(AgentKind::from_display_name(inner).map_err(|_| {
-                        ClawdMuxError::Parse {
+                        ClawMuxError::Parse {
                             file: file_name.clone(),
                             message: format!("invalid Assigned To value: '{inner}'"),
                         }
@@ -78,15 +78,15 @@ pub fn parse_task(content: &str, file_path: PathBuf) -> crate::error::Result<Tas
         }
     }
 
-    let story_name = story_name.ok_or_else(|| ClawdMuxError::Parse {
+    let story_name = story_name.ok_or_else(|| ClawMuxError::Parse {
         file: file_name.clone(),
         message: "missing required 'Story:' field".to_string(),
     })?;
-    let name = task_name.ok_or_else(|| ClawdMuxError::Parse {
+    let name = task_name.ok_or_else(|| ClawMuxError::Parse {
         file: file_name.clone(),
         message: "missing required 'Task:' field".to_string(),
     })?;
-    let status = status.ok_or_else(|| ClawdMuxError::Parse {
+    let status = status.ok_or_else(|| ClawMuxError::Parse {
         file: file_name.clone(),
         message: "missing required 'Status:' field".to_string(),
     })?;
@@ -301,18 +301,18 @@ fn parse_questions(body: &str, file: &str) -> crate::error::Result<Vec<Question>
             let agent = if let Some(bracket_start) = line.find('[') {
                 if let Some(bracket_end) = line.find(']') {
                     let inner = &line[bracket_start + 1..bracket_end];
-                    AgentKind::from_display_name(inner).map_err(|_| ClawdMuxError::Parse {
+                    AgentKind::from_display_name(inner).map_err(|_| ClawMuxError::Parse {
                         file: file.to_string(),
                         message: format!("invalid agent in question: '{inner}'"),
                     })?
                 } else {
-                    return Err(ClawdMuxError::Parse {
+                    return Err(ClawMuxError::Parse {
                         file: file.to_string(),
                         message: format!("malformed question line (no closing ']'): '{line}'"),
                     });
                 }
             } else {
-                return Err(ClawdMuxError::Parse {
+                return Err(ClawMuxError::Parse {
                     file: file.to_string(),
                     message: format!("malformed question line (no '[' bracket): '{line}'"),
                 });
@@ -709,21 +709,21 @@ Q1 [Intake Agent]: An unanswered question?
     fn test_parse_invalid_status() {
         let content = "Story: S\nTask: T\nStatus: BOGUS\n\n## Description\n\nx\n";
         let err = parse_task(content, path("t")).unwrap_err();
-        assert!(matches!(err, ClawdMuxError::Parse { .. }));
+        assert!(matches!(err, ClawMuxError::Parse { .. }));
     }
 
     #[test]
     fn test_parse_missing_story_field() {
         let content = "Task: T\nStatus: OPEN\n\n## Description\n\nx\n";
         let err = parse_task(content, path("t")).unwrap_err();
-        assert!(matches!(&err, ClawdMuxError::Parse { message, .. } if message.contains("Story")));
+        assert!(matches!(&err, ClawMuxError::Parse { message, .. } if message.contains("Story")));
     }
 
     #[test]
     fn test_parse_missing_task_field() {
         let content = "Story: S\nStatus: OPEN\n\n## Description\n\nx\n";
         let err = parse_task(content, path("t")).unwrap_err();
-        assert!(matches!(&err, ClawdMuxError::Parse { message, .. } if message.contains("Task")));
+        assert!(matches!(&err, ClawMuxError::Parse { message, .. } if message.contains("Task")));
     }
 
     #[test]

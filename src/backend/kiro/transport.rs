@@ -24,7 +24,7 @@ use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
-use crate::error::{ClawdMuxError, Result};
+use crate::error::{ClawMuxError, Result};
 
 use super::types::{IncomingMessage, RpcNotification, RpcRequest, RpcResponse};
 
@@ -73,7 +73,7 @@ impl Transport {
 
     /// Send a JSON-RPC request and await the correlated response.
     ///
-    /// Returns `Ok(Value)` on success, `Err(ClawdMuxError::Kiro(...))` if the
+    /// Returns `Ok(Value)` on success, `Err(ClawMuxError::Kiro(...))` if the
     /// remote returns an error object or if the channel closes unexpectedly.
     pub async fn request(&self, method: impl Into<String>, params: Option<Value>) -> Result<Value> {
         let id = self.next_id();
@@ -88,7 +88,7 @@ impl Transport {
         self.write_line(&serde_json::to_value(&req)?).await?;
 
         rx.await.map_err(|_| {
-            ClawdMuxError::Kiro("transport channel closed before response arrived".to_string())
+            ClawMuxError::Kiro("transport channel closed before response arrived".to_string())
         })?
     }
 
@@ -133,7 +133,7 @@ impl Transport {
         writer
             .write_all(line.as_bytes())
             .await
-            .map_err(ClawdMuxError::Io)
+            .map_err(ClawMuxError::Io)
     }
 }
 
@@ -179,7 +179,7 @@ pub(crate) async fn reader_task(
     // Drain pending waiters with an error so callers don't hang forever.
     let mut map = pending.lock().await;
     for (id, tx) in map.drain() {
-        let _ = tx.send(Err(ClawdMuxError::Kiro(format!(
+        let _ = tx.send(Err(ClawMuxError::Kiro(format!(
             "process exited before responding to request {id}"
         ))));
     }
@@ -219,7 +219,7 @@ pub(crate) async fn route_message(
                     .unwrap_or("unknown error")
                     .to_string();
                 let code = value["error"]["code"].as_i64().unwrap_or(-1);
-                Err(ClawdMuxError::Kiro(format!("RPC error {code}: {msg}")))
+                Err(ClawMuxError::Kiro(format!("RPC error {code}: {msg}")))
             } else {
                 Ok(value.get("result").cloned().unwrap_or(Value::Null))
             };
@@ -330,7 +330,7 @@ mod tests {
         let result = rx.await.unwrap();
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, ClawdMuxError::Kiro(_)));
+        assert!(matches!(err, ClawMuxError::Kiro(_)));
         assert!(err.to_string().contains("Invalid Request"));
         assert!(err.to_string().contains("-32600"));
     }
@@ -460,7 +460,7 @@ mod tests {
         // Drain manually (simulating what reader_task does on EOF)
         let mut map = pending.lock().await;
         for (id, tx) in map.drain() {
-            let _ = tx.send(Err(ClawdMuxError::Kiro(format!(
+            let _ = tx.send(Err(ClawMuxError::Kiro(format!(
                 "process exited before responding to request {id}"
             ))));
         }
@@ -468,8 +468,8 @@ mod tests {
 
         let err1 = rx1.await.unwrap().unwrap_err();
         let err2 = rx2.await.unwrap().unwrap_err();
-        assert!(matches!(err1, ClawdMuxError::Kiro(_)));
-        assert!(matches!(err2, ClawdMuxError::Kiro(_)));
+        assert!(matches!(err1, ClawMuxError::Kiro(_)));
+        assert!(matches!(err2, ClawMuxError::Kiro(_)));
         assert!(err1.to_string().contains("process exited"));
         assert!(err2.to_string().contains("process exited"));
     }

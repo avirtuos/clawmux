@@ -7,7 +7,7 @@
 
 use serde::Deserialize;
 
-use crate::error::{ClawdMuxError, Result};
+use crate::error::{ClawMuxError, Result};
 
 /// Optional document updates that an agent may include with a `complete` response.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -20,7 +20,7 @@ pub struct AgentUpdates {
 
 /// A structured response produced by a pipeline agent at the end of its session.
 ///
-/// Agents must serialize one of these variants as JSON so that ClawdMux can
+/// Agents must serialize one of these variants as JSON so that ClawMux can
 /// route the task to the next pipeline step, ask the human a question, or
 /// send the task back to an earlier agent.
 #[allow(dead_code)]
@@ -102,7 +102,7 @@ fn extract_balanced_json(s: &str) -> Option<&str> {
 ///
 /// # Errors
 ///
-/// Returns [`ClawdMuxError::Json`] if no valid [`AgentResponse`] JSON can be found.
+/// Returns [`ClawMuxError::Json`] if no valid [`AgentResponse`] JSON can be found.
 pub fn parse_response(text: &str) -> Result<AgentResponse> {
     let trimmed = text.trim();
 
@@ -130,7 +130,7 @@ pub fn parse_response(text: &str) -> Result<AgentResponse> {
         search_end = action_pos;
     }
 
-    Err(ClawdMuxError::Json(
+    Err(ClawMuxError::Json(
         serde_json::from_str::<AgentResponse>("{}").unwrap_err(),
     ))
 }

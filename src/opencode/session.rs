@@ -6,7 +6,7 @@
 
 use reqwest::Method;
 
-use crate::error::{ClawdMuxError, Result};
+use crate::error::{ClawMuxError, Result};
 use crate::opencode::types::{
     ContentPart, CreateSessionResponse, FileDiff, MessageEntry, ModelId, OpenCodeSession,
     SendMessageRequest, SessionStatusResponse,
@@ -23,7 +23,7 @@ impl OpenCodeClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Http`] on transport failure or [`ClawdMuxError::Api`]
+    /// Returns [`ClawMuxError::Http`] on transport failure or [`ClawMuxError::Api`]
     /// on a non-2xx response.
     pub async fn create_session(&self) -> Result<OpenCodeSession> {
         let resp = self
@@ -40,7 +40,7 @@ impl OpenCodeClient {
                 e,
                 body
             );
-            ClawdMuxError::Json(e)
+            ClawMuxError::Json(e)
         })?;
         Ok(created.0)
     }
@@ -62,7 +62,7 @@ impl OpenCodeClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Http`] on transport failure or [`ClawdMuxError::Api`]
+    /// Returns [`ClawMuxError::Http`] on transport failure or [`ClawMuxError::Api`]
     /// on a non-2xx response.
     pub async fn send_prompt_async(
         &self,
@@ -96,7 +96,7 @@ impl OpenCodeClient {
             resp_body
         );
         if !status.is_success() {
-            return Err(ClawdMuxError::Api {
+            return Err(ClawMuxError::Api {
                 status: status.as_u16(),
                 body: resp_body,
             });
@@ -114,7 +114,7 @@ impl OpenCodeClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Http`] on transport failure or [`ClawdMuxError::Api`]
+    /// Returns [`ClawMuxError::Http`] on transport failure or [`ClawMuxError::Api`]
     /// on a non-2xx response.
     pub async fn abort_session(&self, session_id: &str) -> Result<()> {
         let path = format!("/session/{session_id}");
@@ -133,7 +133,7 @@ impl OpenCodeClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Http`] on transport failure or [`ClawdMuxError::Api`]
+    /// Returns [`ClawMuxError::Http`] on transport failure or [`ClawMuxError::Api`]
     /// on a non-2xx response.
     pub async fn fork_session(&self, session_id: &str) -> Result<OpenCodeSession> {
         let path = format!("/session/{session_id}/fork");
@@ -147,7 +147,7 @@ impl OpenCodeClient {
                 e,
                 body
             );
-            ClawdMuxError::Json(e)
+            ClawMuxError::Json(e)
         })?;
         Ok(created.0)
     }
@@ -162,7 +162,7 @@ impl OpenCodeClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Http`] on transport failure or [`ClawdMuxError::Api`]
+    /// Returns [`ClawMuxError::Http`] on transport failure or [`ClawMuxError::Api`]
     /// on a non-2xx response.
     pub async fn get_session_diffs(&self, session_id: &str) -> Result<Vec<FileDiff>> {
         let path = format!("/session/{session_id}/diff");
@@ -178,7 +178,7 @@ impl OpenCodeClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Http`] on transport failure or [`ClawdMuxError::Api`]
+    /// Returns [`ClawMuxError::Http`] on transport failure or [`ClawMuxError::Api`]
     /// on a non-2xx response.
     pub async fn get_session_statuses(&self) -> Result<SessionStatusResponse> {
         let resp = self.request(Method::GET, "/session/status").send().await?;
@@ -200,7 +200,7 @@ impl OpenCodeClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Http`] on transport failure or [`ClawdMuxError::Api`]
+    /// Returns [`ClawMuxError::Http`] on transport failure or [`ClawMuxError::Api`]
     /// on a non-2xx response.
     pub async fn resolve_permission(
         &self,
@@ -226,7 +226,7 @@ impl OpenCodeClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Http`] on transport failure or [`ClawdMuxError::Api`]
+    /// Returns [`ClawMuxError::Http`] on transport failure or [`ClawMuxError::Api`]
     /// on a non-2xx response.
     pub async fn reply_question(&self, request_id: &str, answer: &str) -> Result<()> {
         let path = format!("/question/{request_id}/reply");
@@ -246,7 +246,7 @@ impl OpenCodeClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Http`] on transport failure or [`ClawdMuxError::Api`]
+    /// Returns [`ClawMuxError::Http`] on transport failure or [`ClawMuxError::Api`]
     /// on a non-2xx response.
     pub async fn get_session_messages(&self, session_id: &str) -> Result<Vec<MessageEntry>> {
         let path = format!("/session/{session_id}/message");
@@ -265,7 +265,7 @@ impl OpenCodeClient {
                 body.len(),
                 &body[..body.len().min(500)]
             );
-            ClawdMuxError::Json(e)
+            ClawMuxError::Json(e)
         })?;
         Ok(messages)
     }
@@ -274,7 +274,7 @@ impl OpenCodeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::ClawdMuxError;
+    use crate::error::ClawMuxError;
     use mockito::Server;
 
     fn make_client(url: &str) -> OpenCodeClient {
@@ -311,7 +311,7 @@ mod tests {
         let client = make_client(&server.url());
         let err = client.create_session().await.expect_err("should fail");
         assert!(
-            matches!(err, ClawdMuxError::Api { status: 500, .. }),
+            matches!(err, ClawMuxError::Api { status: 500, .. }),
             "expected Api error with status 500, got: {err:?}"
         );
         mock.assert_async().await;
@@ -392,7 +392,7 @@ mod tests {
         let mock = server
             .mock("POST", "/session/abc/prompt_async")
             .match_body(
-                r#"{"parts":[{"type":"text","text":"do the thing"}],"agent":"clawdmux/implementation"}"#,
+                r#"{"parts":[{"type":"text","text":"do the thing"}],"agent":"clawmux/implementation"}"#,
             )
             .with_status(204)
             .create_async()

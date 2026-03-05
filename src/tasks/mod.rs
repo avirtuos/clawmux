@@ -17,7 +17,7 @@ pub use models::{Question, Story, Task, TaskId, TaskStatus, WorkLogEntry};
 #[allow(unused_imports)]
 pub use writer::write_task;
 
-use crate::error::ClawdMuxError;
+use crate::error::ClawMuxError;
 
 /// Parses a leading integer from a story name like `"10. Big Story"` → `Some(10)`.
 /// Returns `None` if the name does not start with a decimal number followed by `'.'`.
@@ -59,7 +59,7 @@ impl TaskStore {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Io`] if the chosen task directory cannot be read.
+    /// Returns [`ClawMuxError::Io`] if the chosen task directory cannot be read.
     pub fn load_from_disk(&mut self, project_root: &Path) -> crate::error::Result<usize> {
         let tasks_dir = {
             let primary = project_root.join("tasks");
@@ -174,13 +174,13 @@ impl TaskStore {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Internal`] if the task ID is not in the store.
-    /// Returns [`ClawdMuxError::Encode`] or [`ClawdMuxError::Io`] on write failure.
+    /// Returns [`ClawMuxError::Internal`] if the task ID is not in the store.
+    /// Returns [`ClawMuxError::Encode`] or [`ClawMuxError::Io`] on write failure.
     pub fn persist(&mut self, id: &TaskId) -> crate::error::Result<()> {
         let task = self
             .tasks
             .get(id)
-            .ok_or_else(|| ClawdMuxError::Internal(format!("persist: task not found: {id}")))?;
+            .ok_or_else(|| ClawMuxError::Internal(format!("persist: task not found: {id}")))?;
         let content = writer::write_task(task)?;
         let file_path = task.file_path.clone();
         std::fs::write(&file_path, content)?;
@@ -191,13 +191,13 @@ impl TaskStore {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Internal`] if the task ID is not in the store.
-    /// Returns [`ClawdMuxError::Io`] or [`ClawdMuxError::Parse`] on read/parse failure.
+    /// Returns [`ClawMuxError::Internal`] if the task ID is not in the store.
+    /// Returns [`ClawMuxError::Io`] or [`ClawMuxError::Parse`] on read/parse failure.
     pub fn reload(&mut self, id: &TaskId) -> crate::error::Result<()> {
         let file_path = self
             .tasks
             .get(id)
-            .ok_or_else(|| ClawdMuxError::Internal(format!("reload: task not found: {id}")))?
+            .ok_or_else(|| ClawMuxError::Internal(format!("reload: task not found: {id}")))?
             .file_path
             .clone();
         let content = std::fs::read_to_string(&file_path)?;
@@ -331,7 +331,7 @@ mod tests {
         // Neither tasks/ nor docs/tasks/ exists.
         let mut store = TaskStore::new();
         let err = store.load_from_disk(tmp.path()).unwrap_err();
-        assert!(matches!(err, crate::error::ClawdMuxError::Io(_)));
+        assert!(matches!(err, crate::error::ClawMuxError::Io(_)));
     }
 
     #[test]

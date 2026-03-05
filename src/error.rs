@@ -1,18 +1,18 @@
-//! Centralized error type for ClawdMux.
+//! Centralized error type for ClawMux.
 //!
-//! All subsystems return `Result<T, ClawdMuxError>` (via the [`Result`] alias).
+//! All subsystems return `Result<T, ClawMuxError>` (via the [`Result`] alias).
 //! Use the appropriate variant for each error category rather than converting
-//! everything to [`ClawdMuxError::Internal`].
+//! everything to [`ClawMuxError::Internal`].
 
 use thiserror::Error;
 
-/// The primary error type for ClawdMux.
+/// The primary error type for ClawMux.
 ///
 /// Covers all error categories produced by the application's subsystems.
 /// Variants with `#[from]` support automatic conversion via the `?` operator.
 #[allow(dead_code)]
 #[derive(Debug, Error)]
-pub enum ClawdMuxError {
+pub enum ClawMuxError {
     /// An I/O error from the standard library (file, pipe, socket, etc.).
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -72,9 +72,9 @@ pub enum ClawdMuxError {
     Kiro(String),
 }
 
-/// Convenience alias for `Result<T, ClawdMuxError>`.
+/// Convenience alias for `Result<T, ClawMuxError>`.
 #[allow(dead_code)]
-pub type Result<T> = std::result::Result<T, ClawdMuxError>;
+pub type Result<T> = std::result::Result<T, ClawMuxError>;
 
 #[cfg(test)]
 mod tests {
@@ -83,21 +83,21 @@ mod tests {
     #[test]
     fn test_io_error_from_conversion() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
-        let err: ClawdMuxError = io_err.into();
-        assert!(matches!(err, ClawdMuxError::Io(_)));
+        let err: ClawMuxError = io_err.into();
+        assert!(matches!(err, ClawMuxError::Io(_)));
     }
 
     #[test]
     fn test_json_error_from_conversion() {
         let json_err = serde_json::from_str::<serde_json::Value>("not valid json")
             .expect_err("should fail to parse");
-        let err: ClawdMuxError = json_err.into();
-        assert!(matches!(err, ClawdMuxError::Json(_)));
+        let err: ClawMuxError = json_err.into();
+        assert!(matches!(err, ClawMuxError::Json(_)));
     }
 
     #[test]
     fn test_parse_error_display() {
-        let err = ClawdMuxError::Parse {
+        let err = ClawMuxError::Parse {
             file: "tasks/story-1.md".to_string(),
             message: "missing Status field".to_string(),
         };
@@ -122,30 +122,24 @@ mod tests {
 
     #[test]
     fn test_string_wrapping_variant_display() {
-        let cases: &[(&str, ClawdMuxError)] = &[
+        let cases: &[(&str, ClawMuxError)] = &[
             (
                 "api msg",
-                ClawdMuxError::Api {
+                ClawMuxError::Api {
                     status: 500,
                     body: "api msg".to_string(),
                 },
             ),
-            (
-                "encode msg",
-                ClawdMuxError::Encode("encode msg".to_string()),
-            ),
-            ("sse msg", ClawdMuxError::Sse("sse msg".to_string())),
-            (
-                "server msg",
-                ClawdMuxError::Server("server msg".to_string()),
-            ),
+            ("encode msg", ClawMuxError::Encode("encode msg".to_string())),
+            ("sse msg", ClawMuxError::Sse("sse msg".to_string())),
+            ("server msg", ClawMuxError::Server("server msg".to_string())),
             (
                 "workflow msg",
-                ClawdMuxError::Workflow("workflow msg".to_string()),
+                ClawMuxError::Workflow("workflow msg".to_string()),
             ),
             (
                 "internal msg",
-                ClawdMuxError::Internal("internal msg".to_string()),
+                ClawMuxError::Internal("internal msg".to_string()),
             ),
         ];
         for (input, err) in cases {
@@ -159,14 +153,14 @@ mod tests {
 
     #[test]
     fn test_kiro_error_display() {
-        let err = ClawdMuxError::Kiro("process exited unexpectedly".to_string());
+        let err = ClawMuxError::Kiro("process exited unexpectedly".to_string());
         let display = err.to_string();
         assert!(
             display.contains("process exited unexpectedly"),
             "Kiro error display should contain message: {display}"
         );
         assert!(
-            matches!(err, ClawdMuxError::Kiro(_)),
+            matches!(err, ClawMuxError::Kiro(_)),
             "expected Kiro variant"
         );
     }
@@ -175,8 +169,8 @@ mod tests {
     fn test_config_error_from_conversion() {
         let toml_err =
             toml::from_str::<toml::Value>("invalid = [unclosed").expect_err("should fail to parse");
-        let err: ClawdMuxError = toml_err.into();
-        assert!(matches!(err, ClawdMuxError::Config(_)));
+        let err: ClawMuxError = toml_err.into();
+        assert!(matches!(err, ClawMuxError::Config(_)));
     }
 
     #[tokio::test]
@@ -186,7 +180,7 @@ mod tests {
         let reqwest_err = reqwest::get("not-a-valid-url")
             .await
             .expect_err("should fail with invalid URL");
-        let err: ClawdMuxError = reqwest_err.into();
-        assert!(matches!(err, ClawdMuxError::Http(_)));
+        let err: ClawMuxError = reqwest_err.into();
+        assert!(matches!(err, ClawMuxError::Http(_)));
     }
 }

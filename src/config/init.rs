@@ -1,8 +1,8 @@
-//! `clawdmux init` command: dependency checks and project scaffold.
+//! `clawmux init` command: dependency checks and project scaffold.
 //!
 //! Interactive terminal wizard for first-time project setup:
 //! 1. Checks for (and optionally installs) the opencode binary.
-//! 2. Scaffolds `.clawdmux/config.toml`, `.opencode/agents/clawdmux/`, and `tasks/`.
+//! 2. Scaffolds `.clawmux/config.toml`, `.opencode/agents/clawmux/`, and `tasks/`.
 //! 3. Logs a success message.
 
 use std::collections::HashMap;
@@ -10,7 +10,7 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 
 use crate::config::BackendKind;
-use crate::error::{ClawdMuxError, Result};
+use crate::error::{ClawMuxError, Result};
 use crate::opencode::types::ModelId;
 use crate::workflow::agents::AgentKind;
 
@@ -99,7 +99,7 @@ pub fn build_agent_model_map() -> HashMap<AgentKind, ModelId> {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Arguments for the `clawdmux init` subcommand.
+/// Arguments for the `clawmux init` subcommand.
 #[derive(clap::Args, Debug)]
 pub struct InitArgs {
     /// Regenerate agent definition files from built-in defaults, overwriting
@@ -108,19 +108,19 @@ pub struct InitArgs {
     pub reset_agents: bool,
 }
 
-/// Runs the interactive `clawdmux init` wizard.
+/// Runs the interactive `clawmux init` wizard.
 ///
 /// Performs these steps:
 /// 1. Asks which agent backend to use (OpenCode or Kiro).
 /// 2. Checks for the opencode binary if OpenCode is selected; offers to install it.
-/// 3. Scaffolds project-local files (`.clawdmux/config.toml`,
-///    `.opencode/agents/clawdmux/`, `.kiro/agents/`, `tasks/`).
+/// 3. Scaffolds project-local files (`.clawmux/config.toml`,
+///    `.opencode/agents/clawmux/`, `.kiro/agents/`, `tasks/`).
 /// 4. Logs a success summary via `tracing::info!`.
 ///
 /// # Errors
 ///
-/// Returns [`ClawdMuxError::Internal`] if the user declines to install opencode
-/// or an invalid backend choice is entered. Returns [`ClawdMuxError::Io`] for
+/// Returns [`ClawMuxError::Internal`] if the user declines to install opencode
+/// or an invalid backend choice is entered. Returns [`ClawMuxError::Io`] for
 /// filesystem or stdin failures.
 pub fn run_init(project_root: &Path, args: &InitArgs) -> Result<()> {
     let stdin = std::io::stdin();
@@ -156,7 +156,7 @@ pub(crate) fn run_init_with_paths(
     kiro_binary: Option<String>,
 ) -> Result<()> {
     scaffold_project(project_root, args, &backend, kiro_binary.as_deref())?;
-    tracing::info!("clawdmux init complete, run clawdmux to open the TUI");
+    tracing::info!("clawmux init complete, run clawmux to open the TUI");
     Ok(())
 }
 
@@ -166,7 +166,7 @@ pub(crate) fn run_init_with_paths(
 /// Because the binary directory is therefore not added to `PATH` automatically,
 /// a post-install `opencode --version` check would always fail. Instead, after
 /// a successful install the user is instructed to add the binary directory to
-/// their `PATH` and re-run `clawdmux init`.
+/// their `PATH` and re-run `clawmux init`.
 fn check_or_install_opencode() -> Result<()> {
     match which::which("opencode") {
         Ok(path) => {
@@ -177,18 +177,18 @@ fn check_or_install_opencode() -> Result<()> {
             println!("Checking for opencode... not found.");
             println!("opencode is required. Install it now? [Y/n]");
             print!("> ");
-            std::io::stdout().flush().map_err(ClawdMuxError::Io)?;
+            std::io::stdout().flush().map_err(ClawMuxError::Io)?;
 
             let mut response = String::new();
             std::io::stdin()
                 .read_line(&mut response)
-                .map_err(ClawdMuxError::Io)?;
+                .map_err(ClawMuxError::Io)?;
 
             if response.trim().eq_ignore_ascii_case("n")
                 || response.trim().eq_ignore_ascii_case("no")
             {
-                return Err(ClawdMuxError::Internal(
-                    "opencode is required to use clawdmux".to_string(),
+                return Err(ClawMuxError::Internal(
+                    "opencode is required to use clawmux".to_string(),
                 ));
             }
 
@@ -196,10 +196,10 @@ fn check_or_install_opencode() -> Result<()> {
                 .arg("-c")
                 .arg("curl -fsSL https://opencode.ai/install | bash -s -- --no-modify-path")
                 .status()
-                .map_err(ClawdMuxError::Io)?;
+                .map_err(ClawMuxError::Io)?;
 
             if !status.success() {
-                return Err(ClawdMuxError::Internal(
+                return Err(ClawMuxError::Internal(
                     "opencode installation failed".to_string(),
                 ));
             }
@@ -207,7 +207,7 @@ fn check_or_install_opencode() -> Result<()> {
             tracing::info!("opencode installed, PATH update required before use");
             println!(
                 "opencode installed. Add the opencode binary directory to your PATH, \
-                 then re-run clawdmux init."
+                 then re-run clawmux init."
             );
             Ok(())
         }
@@ -225,40 +225,40 @@ pub(crate) fn select_backend_from_reader<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
 ) -> Result<(BackendKind, Option<String>)> {
-    writeln!(writer, "Which agent backend would you like to use?").map_err(ClawdMuxError::Io)?;
+    writeln!(writer, "Which agent backend would you like to use?").map_err(ClawMuxError::Io)?;
     writeln!(
         writer,
         "  [1] OpenCode (recommended)  Full REST API, 75+ LLM providers"
     )
-    .map_err(ClawdMuxError::Io)?;
+    .map_err(ClawMuxError::Io)?;
     writeln!(
         writer,
         "  [2] Kiro                    Agent Client Protocol (ACP), stdin/stdout JSON-RPC"
     )
-    .map_err(ClawdMuxError::Io)?;
-    write!(writer, "> ").map_err(ClawdMuxError::Io)?;
-    writer.flush().map_err(ClawdMuxError::Io)?;
+    .map_err(ClawMuxError::Io)?;
+    write!(writer, "> ").map_err(ClawMuxError::Io)?;
+    writer.flush().map_err(ClawMuxError::Io)?;
 
     let mut choice = String::new();
-    reader.read_line(&mut choice).map_err(ClawdMuxError::Io)?;
+    reader.read_line(&mut choice).map_err(ClawMuxError::Io)?;
 
     match choice.trim() {
         "" | "1" => Ok((BackendKind::OpenCode, None)),
         "2" => {
             // Check if kiro is on PATH; prompt for binary path if not found.
             let kiro_binary = if which::which("kiro").is_err() {
-                writeln!(writer, "kiro not found in PATH.").map_err(ClawdMuxError::Io)?;
+                writeln!(writer, "kiro not found in PATH.").map_err(ClawMuxError::Io)?;
                 write!(
                     writer,
                     "kiro binary path (leave blank to use 'kiro' from PATH at runtime): "
                 )
-                .map_err(ClawdMuxError::Io)?;
-                writer.flush().map_err(ClawdMuxError::Io)?;
+                .map_err(ClawMuxError::Io)?;
+                writer.flush().map_err(ClawMuxError::Io)?;
 
                 let mut binary_input = String::new();
                 reader
                     .read_line(&mut binary_input)
-                    .map_err(ClawdMuxError::Io)?;
+                    .map_err(ClawMuxError::Io)?;
                 let trimmed = binary_input.trim();
                 if trimmed.is_empty() {
                     None
@@ -270,14 +270,14 @@ pub(crate) fn select_backend_from_reader<R: BufRead, W: Write>(
             };
             Ok((BackendKind::Kiro, kiro_binary))
         }
-        other => Err(ClawdMuxError::Internal(format!(
+        other => Err(ClawMuxError::Internal(format!(
             "invalid backend choice: {}",
             other
         ))),
     }
 }
 
-/// Writes built-in agent definition files to `.opencode/agents/clawdmux/`.
+/// Writes built-in agent definition files to `.opencode/agents/clawmux/`.
 ///
 /// Always overwrites existing files. Creates the directory if it does not exist.
 ///
@@ -286,8 +286,8 @@ pub fn update_agent_files(project_root: &Path) -> Result<usize> {
     let agents_dir = project_root
         .join(".opencode")
         .join("agents")
-        .join("clawdmux");
-    std::fs::create_dir_all(&agents_dir).map_err(ClawdMuxError::Io)?;
+        .join("clawmux");
+    std::fs::create_dir_all(&agents_dir).map_err(ClawMuxError::Io)?;
 
     let mut count = 0usize;
     for agent in AgentKind::all() {
@@ -297,14 +297,14 @@ pub fn update_agent_files(project_root: &Path) -> Result<usize> {
             continue;
         };
         let file_path = agents_dir.join(file_name);
-        std::fs::write(&file_path, content).map_err(ClawdMuxError::Io)?;
+        std::fs::write(&file_path, content).map_err(ClawMuxError::Io)?;
         tracing::info!(path = %file_path.display(), "wrote agent definition");
         count += 1;
     }
     Ok(count)
 }
 
-/// Arguments for the `clawdmux update-agents` subcommand.
+/// Arguments for the `clawmux update-agents` subcommand.
 #[derive(clap::Args, Debug)]
 pub struct UpdateAgentsArgs {}
 
@@ -324,7 +324,7 @@ pub fn run_update_agents(project_root: &Path, _args: &UpdateAgentsArgs) -> Resul
 /// are also overwritten when `args.reset_agents` is `true`.
 ///
 /// # Arguments
-/// * `backend` – the agent backend to record in `.clawdmux/config.toml`.
+/// * `backend` – the agent backend to record in `.clawmux/config.toml`.
 /// * `kiro_binary` – optional explicit path to the kiro binary; written to the
 ///   config only when `backend` is [`BackendKind::Kiro`] and a path is given.
 pub(crate) fn scaffold_project(
@@ -335,29 +335,29 @@ pub(crate) fn scaffold_project(
 ) -> Result<()> {
     tracing::info!("scaffolding project");
 
-    // .clawdmux/config.toml
-    let clawdmux_dir = project_root.join(".clawdmux");
-    let project_config_path = clawdmux_dir.join("config.toml");
+    // .clawmux/config.toml
+    let clawmux_dir = project_root.join(".clawmux");
+    let project_config_path = clawmux_dir.join("config.toml");
     if !project_config_path.exists() {
-        std::fs::create_dir_all(&clawdmux_dir).map_err(ClawdMuxError::Io)?;
+        std::fs::create_dir_all(&clawmux_dir).map_err(ClawMuxError::Io)?;
         let config_content = make_project_config_content(backend, kiro_binary);
-        std::fs::write(&project_config_path, config_content).map_err(ClawdMuxError::Io)?;
+        std::fs::write(&project_config_path, config_content).map_err(ClawMuxError::Io)?;
         tracing::info!(path = %project_config_path.display(), "created project config");
     }
 
     // tasks/ with seed files
     let tasks_dir = project_root.join("tasks");
-    std::fs::create_dir_all(&tasks_dir).map_err(ClawdMuxError::Io)?;
+    std::fs::create_dir_all(&tasks_dir).map_err(ClawMuxError::Io)?;
 
     for &(file_name, content) in TASK_SEED_FILES {
         let file_path = tasks_dir.join(file_name);
         if !file_path.exists() {
-            std::fs::write(&file_path, content).map_err(ClawdMuxError::Io)?;
+            std::fs::write(&file_path, content).map_err(ClawMuxError::Io)?;
             tracing::info!(path = %file_path.display(), "created task seed file");
         }
     }
 
-    // .opencode/agents/clawdmux/ — delegate to update_agent_files when resetting,
+    // .opencode/agents/clawmux/ — delegate to update_agent_files when resetting,
     // otherwise only write files that do not already exist.
     if args.reset_agents {
         update_agent_files(project_root)?;
@@ -365,8 +365,8 @@ pub(crate) fn scaffold_project(
         let agents_dir = project_root
             .join(".opencode")
             .join("agents")
-            .join("clawdmux");
-        std::fs::create_dir_all(&agents_dir).map_err(ClawdMuxError::Io)?;
+            .join("clawmux");
+        std::fs::create_dir_all(&agents_dir).map_err(ClawMuxError::Io)?;
 
         for agent in AgentKind::all() {
             let (Some(file_name), Some(content)) =
@@ -376,7 +376,7 @@ pub(crate) fn scaffold_project(
             };
             let file_path = agents_dir.join(file_name);
             if !file_path.exists() {
-                std::fs::write(&file_path, content).map_err(ClawdMuxError::Io)?;
+                std::fs::write(&file_path, content).map_err(ClawMuxError::Io)?;
                 tracing::info!(path = %file_path.display(), "created agent definition");
             }
         }
@@ -398,11 +398,11 @@ pub(crate) fn scaffold_project(
 ///
 /// # Errors
 ///
-/// Returns [`ClawdMuxError::Io`] if the directory cannot be created or a
+/// Returns [`ClawMuxError::Io`] if the directory cannot be created or a
 /// file cannot be written.
 pub fn scaffold_kiro_agents(project_root: &Path, reset: bool) -> Result<usize> {
     let agents_dir = project_root.join(".kiro").join("agents");
-    std::fs::create_dir_all(&agents_dir).map_err(ClawdMuxError::Io)?;
+    std::fs::create_dir_all(&agents_dir).map_err(ClawMuxError::Io)?;
 
     let mut count = 0usize;
     for agent in AgentKind::all() {
@@ -413,7 +413,7 @@ pub fn scaffold_kiro_agents(project_root: &Path, reset: bool) -> Result<usize> {
             continue;
         }
         let json = build_kiro_agent_json(agent);
-        std::fs::write(&file_path, json).map_err(ClawdMuxError::Io)?;
+        std::fs::write(&file_path, json).map_err(ClawMuxError::Io)?;
         tracing::info!(path = %file_path.display(), "wrote kiro agent config");
         count += 1;
     }
@@ -423,7 +423,7 @@ pub fn scaffold_kiro_agents(project_root: &Path, reset: bool) -> Result<usize> {
 /// Builds the JSON config string for a single kiro agent.
 fn build_kiro_agent_json(agent: &AgentKind) -> String {
     let name = agent.kiro_agent_name();
-    let description = format!("ClawdMux {} Agent", agent.display_name());
+    let description = format!("ClawMux {} Agent", agent.display_name());
 
     // Extract system prompt by stripping YAML frontmatter from the embedded .md.
     let prompt = agent_definition_content(agent)
@@ -510,7 +510,7 @@ fn agent_definition_content(agent: &AgentKind) -> Option<&'static str> {
     }
 }
 
-/// Generates the content for `.clawdmux/config.toml` based on the chosen backend.
+/// Generates the content for `.clawmux/config.toml` based on the chosen backend.
 ///
 /// The OpenCode section is always included (used for task-fix requests regardless
 /// of backend). The `backend` key is omitted when it equals the default (`opencode`)
@@ -626,8 +626,8 @@ mod tests {
         .unwrap();
 
         assert!(
-            project_dir.path().join(".clawdmux/config.toml").exists(),
-            ".clawdmux/config.toml should be created"
+            project_dir.path().join(".clawmux/config.toml").exists(),
+            ".clawmux/config.toml should be created"
         );
     }
 
@@ -705,7 +705,7 @@ mod tests {
         )
         .unwrap();
 
-        let agents_dir = project_dir.path().join(".opencode/agents/clawdmux");
+        let agents_dir = project_dir.path().join(".opencode/agents/clawmux");
 
         for agent in AgentKind::all() {
             let file_name = agent_file_name(agent).expect("all() never yields Human");
@@ -733,7 +733,7 @@ mod tests {
         run_init_with_paths(project_dir.path(), &args, BackendKind::OpenCode, None).unwrap();
         run_init_with_paths(project_dir.path(), &args, BackendKind::OpenCode, None).unwrap();
 
-        let agents_dir = project_dir.path().join(".opencode/agents/clawdmux");
+        let agents_dir = project_dir.path().join(".opencode/agents/clawmux");
         for agent in AgentKind::all() {
             let file_path = agents_dir.join(agent_file_name(agent).unwrap());
             assert!(
@@ -760,7 +760,7 @@ mod tests {
 
         let intake_path = project_dir
             .path()
-            .join(".opencode/agents/clawdmux/intake.md");
+            .join(".opencode/agents/clawmux/intake.md");
         std::fs::write(&intake_path, "corrupted content").unwrap();
         assert_eq!(
             std::fs::read_to_string(&intake_path).unwrap(),
@@ -791,7 +791,7 @@ mod tests {
         let count = update_agent_files(project_dir.path()).unwrap();
         assert_eq!(count, 7, "should write exactly 7 agent files");
 
-        let agents_dir = project_dir.path().join(".opencode/agents/clawdmux");
+        let agents_dir = project_dir.path().join(".opencode/agents/clawmux");
         for agent in AgentKind::all() {
             let file_name = agent_file_name(agent).expect("all() never yields Human");
             let file_path = agents_dir.join(file_name);
@@ -811,7 +811,7 @@ mod tests {
         // Corrupt one file.
         let intake_path = project_dir
             .path()
-            .join(".opencode/agents/clawdmux/intake.md");
+            .join(".opencode/agents/clawmux/intake.md");
         std::fs::write(&intake_path, "corrupted content").unwrap();
 
         // Second call must restore it.
@@ -830,7 +830,7 @@ mod tests {
 
         run_update_agents(project_dir.path(), &UpdateAgentsArgs {}).unwrap();
 
-        let agents_dir = project_dir.path().join(".opencode/agents/clawdmux");
+        let agents_dir = project_dir.path().join(".opencode/agents/clawmux");
         for agent in AgentKind::all() {
             let file_name = agent_file_name(agent).expect("all() never yields Human");
             let file_path = agents_dir.join(file_name);
@@ -883,7 +883,7 @@ mod tests {
 
         scaffold_kiro_agents(project_dir.path(), false).unwrap();
 
-        let intake_path = project_dir.path().join(".kiro/agents/clawdmux-intake.json");
+        let intake_path = project_dir.path().join(".kiro/agents/clawmux-intake.json");
         std::fs::write(&intake_path, "custom content").unwrap();
 
         // Second call without reset should NOT overwrite.
@@ -903,7 +903,7 @@ mod tests {
 
         scaffold_kiro_agents(project_dir.path(), false).unwrap();
 
-        let intake_path = project_dir.path().join(".kiro/agents/clawdmux-intake.json");
+        let intake_path = project_dir.path().join(".kiro/agents/clawmux-intake.json");
         std::fs::write(&intake_path, "corrupted content").unwrap();
 
         // Call with reset=true should overwrite.
@@ -985,7 +985,7 @@ mod tests {
         let mut writer = io::Cursor::new(Vec::new());
         let result = select_backend_from_reader(&mut reader, &mut writer);
         assert!(
-            matches!(result, Err(ClawdMuxError::Internal(_))),
+            matches!(result, Err(ClawMuxError::Internal(_))),
             "expected Internal error for invalid choice, got: {:?}",
             result
         );

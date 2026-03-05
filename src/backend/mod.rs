@@ -1,4 +1,4 @@
-//! Backend abstraction layer for ClawdMux.
+//! Backend abstraction layer for ClawMux.
 //!
 //! Defines the [`AgentBackend`] trait that decouples the application from any
 //! specific AI coding assistant backend (OpenCode, kiro, etc.).  All session

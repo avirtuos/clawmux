@@ -13,7 +13,7 @@ use tokio::io::AsyncReadExt;
 use tokio::time::{sleep, timeout};
 
 use crate::config::{AppConfig, ServerMode};
-use crate::error::{ClawdMuxError, Result};
+use crate::error::{ClawMuxError, Result};
 use crate::opencode::OpenCodeClient;
 
 /// RAII guard that kills a child process by PID on drop.
@@ -92,7 +92,7 @@ impl OpenCodeServer {
     /// Behavior depends on the configured [`ServerMode`]:
     ///
     /// - **External**: Performs a single health check. Returns `Ok` on success
-    ///   or [`ClawdMuxError::Server`] if the server is unreachable.
+    ///   or [`ClawMuxError::Server`] if the server is unreachable.
     /// - **Auto**: Attempts a health check first; if the server is already running,
     ///   returns immediately with no child process. Otherwise spawns
     ///   `opencode serve --port <port> --hostname <hostname>`, polls health with
@@ -104,8 +104,8 @@ impl OpenCodeServer {
     ///
     /// # Errors
     ///
-    /// - [`ClawdMuxError::Server`] if External mode and server is unreachable.
-    /// - [`ClawdMuxError::Server`] if Auto mode and `opencode` binary is not found
+    /// - [`ClawMuxError::Server`] if External mode and server is unreachable.
+    /// - [`ClawMuxError::Server`] if Auto mode and `opencode` binary is not found
     ///   or the server fails to become healthy within 30 seconds.
     pub async fn ensure_running<F>(config: &AppConfig, mut on_status: F) -> Result<Self>
     where
@@ -139,7 +139,7 @@ impl OpenCodeServer {
                     "External mode: opencode server not reachable at {}",
                     base_url
                 );
-                Err(ClawdMuxError::Server(format!(
+                Err(ClawMuxError::Server(format!(
                     "opencode server not reachable at {} (external mode)",
                     base_url
                 )))
@@ -182,7 +182,7 @@ impl OpenCodeServer {
     ///
     /// # Errors
     ///
-    /// Returns [`ClawdMuxError::Server`] if the server does not become healthy
+    /// Returns [`ClawMuxError::Server`] if the server does not become healthy
     /// within 30 seconds.
     async fn wait_for_existing_server<F>(
         base_url: String,
@@ -264,7 +264,7 @@ impl OpenCodeServer {
             })
         } else {
             let port = base_url.rsplit(':').next().unwrap_or("unknown").to_string();
-            Err(ClawdMuxError::Server(format!(
+            Err(ClawMuxError::Server(format!(
                 "existing process on port {} did not become healthy within 30 seconds (last error: {})",
                 port,
                 last_error.as_deref().unwrap_or("unknown")
@@ -273,9 +273,9 @@ impl OpenCodeServer {
     }
 
     /// Convert a health-check error into a short human-readable hint for the loading screen.
-    fn error_hint(e: &ClawdMuxError) -> String {
+    fn error_hint(e: &ClawMuxError) -> String {
         match e {
-            ClawdMuxError::Http(req_err) => {
+            ClawMuxError::Http(req_err) => {
                 if req_err.is_connect() {
                     "connection failed".to_string()
                 } else if req_err.is_timeout() {
@@ -286,7 +286,7 @@ impl OpenCodeServer {
                     format!("HTTP error: {}", req_err)
                 }
             }
-            ClawdMuxError::Api { status, .. } => format!("HTTP {}", status),
+            ClawMuxError::Api { status, .. } => format!("HTTP {}", status),
             _ => e.to_string(),
         }
     }
@@ -305,7 +305,7 @@ impl OpenCodeServer {
     {
         on_status("Locating opencode binary...");
         let opencode_bin = which::which("opencode")
-            .map_err(|e| ClawdMuxError::Server(format!("opencode binary not found: {}", e)))?;
+            .map_err(|e| ClawMuxError::Server(format!("opencode binary not found: {}", e)))?;
 
         let env_vars = config.global.env_vars_for_opencode();
 
@@ -342,7 +342,7 @@ impl OpenCodeServer {
         on_status("Starting opencode server...");
         let mut child = cmd
             .spawn()
-            .map_err(|e| ClawdMuxError::Server(format!("failed to spawn opencode: {}", e)))?;
+            .map_err(|e| ClawMuxError::Server(format!("failed to spawn opencode: {}", e)))?;
 
         tracing::info!(
             "Spawned opencode server (pid={:?}), waiting for health at {}",
@@ -454,7 +454,7 @@ impl OpenCodeServer {
             sleep(delay).await;
 
             // Detect if the child process exited before it could become healthy.
-            if let Some(exit_status) = child.try_wait().map_err(ClawdMuxError::Io)? {
+            if let Some(exit_status) = child.try_wait().map_err(ClawMuxError::Io)? {
                 let stdout_output = Self::collected_output(&stdout_buf);
                 let stderr_output = Self::collected_output(&stderr_buf);
                 tracing::warn!("opencode server exited early with status: {}", exit_status);
@@ -462,7 +462,7 @@ impl OpenCodeServer {
                 tracing::info!("opencode stderr (captured): {:?}", stderr_output.trim());
                 // Process already exited on its own — nothing left to kill.
                 guard.disarm();
-                return Err(ClawdMuxError::Server(format!(
+                return Err(ClawMuxError::Server(format!(
                     "opencode server exited before becoming healthy (status: {}){}",
                     exit_status,
                     if stderr_output.is_empty() {
@@ -520,7 +520,7 @@ impl OpenCodeServer {
             let stderr_output = Self::collected_output(&stderr_buf);
             tracing::info!("opencode stdout (captured): {:?}", stdout_output.trim());
             tracing::info!("opencode stderr (captured): {:?}", stderr_output.trim());
-            Err(ClawdMuxError::Server(format!(
+            Err(ClawMuxError::Server(format!(
                 "opencode server did not become healthy within 30 seconds (last error: {}){}",
                 last_error.as_deref().unwrap_or("unknown"),
                 if stderr_output.is_empty() {
@@ -640,7 +640,7 @@ mod tests {
         let config = make_config(ServerMode::External, port);
         let result = OpenCodeServer::ensure_running(&config, |_| {}).await;
         assert!(
-            matches!(result, Err(ClawdMuxError::Server(_))),
+            matches!(result, Err(ClawMuxError::Server(_))),
             "Expected Server error in external mode with unhealthy server, got: {:?}",
             result
         );
@@ -672,21 +672,21 @@ mod tests {
     #[test]
     fn test_error_hint_format() {
         // Api errors show the HTTP status code.
-        let api_err = ClawdMuxError::Api {
+        let api_err = ClawMuxError::Api {
             status: 500,
             body: "internal server error".to_string(),
         };
         assert_eq!(OpenCodeServer::error_hint(&api_err), "HTTP 500");
 
         // Non-Http/Api errors show their Display output.
-        let server_err = ClawdMuxError::Server("process crashed".to_string());
+        let server_err = ClawMuxError::Server("process crashed".to_string());
         let hint = OpenCodeServer::error_hint(&server_err);
         assert!(
             hint.contains("process crashed"),
             "expected hint to contain 'process crashed', got: {hint}"
         );
 
-        let sse_err = ClawdMuxError::Sse("stream broken".to_string());
+        let sse_err = ClawMuxError::Sse("stream broken".to_string());
         let hint = OpenCodeServer::error_hint(&sse_err);
         assert!(
             hint.contains("stream broken"),
@@ -709,7 +709,7 @@ mod tests {
             .send()
             .await
             .expect_err("should fail to connect");
-        let claw_err = ClawdMuxError::Http(err);
+        let claw_err = ClawMuxError::Http(err);
         assert_eq!(OpenCodeServer::error_hint(&claw_err), "connection failed");
     }
 
@@ -831,11 +831,11 @@ mod tests {
         std::env::set_var("PATH", &original_path);
 
         assert!(
-            matches!(result, Err(ClawdMuxError::Server(_))),
+            matches!(result, Err(ClawMuxError::Server(_))),
             "Expected Server error when binary not found, got: {:?}",
             result
         );
-        if let Err(ClawdMuxError::Server(ref msg)) = result {
+        if let Err(ClawMuxError::Server(ref msg)) = result {
             assert!(
                 msg.contains("binary not found"),
                 "Expected 'binary not found' in error message, got: {:?}",

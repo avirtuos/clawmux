@@ -1,4 +1,4 @@
-//! Entry point for ClawdMux.
+//! Entry point for ClawMux.
 //!
 //! Bootstraps logging, parses CLI arguments, and dispatches to the appropriate command.
 
@@ -34,13 +34,13 @@ use crate::opencode::OpenCodeClient;
 use crate::tasks::models::TaskId;
 use crate::tasks::TaskStore;
 
-/// ClawdMux: GenAI coding assistance multiplexer and task orchestrator.
+/// ClawMux: GenAI coding assistance multiplexer and task orchestrator.
 ///
 /// Run without a subcommand to launch the interactive TUI.
 /// Use `init` to set up a new project, or `update-agents` to refresh
 /// agent definitions after upgrading.
 #[derive(Parser, Debug)]
-#[command(name = "clawdmux", version, about, long_about)]
+#[command(name = "clawmux", version, about, long_about)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -49,34 +49,34 @@ struct Cli {
 /// Available CLI subcommands.
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Initialize the project for use with ClawdMux.
+    /// Initialize the project for use with ClawMux.
     Init(config::init::InitArgs),
     /// Update agent definition files from built-in defaults.
     ///
-    /// Overwrites `.opencode/agents/clawdmux/*.md` with the latest
-    /// built-in agent prompts. Use this after upgrading ClawdMux to
+    /// Overwrites `.opencode/agents/clawmux/*.md` with the latest
+    /// built-in agent prompts. Use this after upgrading ClawMux to
     /// pick up new agent definitions.
     UpdateAgents(config::init::UpdateAgentsArgs),
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Log to ~/.clawdmux/ so the log file never appears inside the project
+    // Log to ~/.clawmux/ so the log file never appears inside the project
     // directory (where it could be picked up by OpenCode's file tracking and
     // embedded in huge session diffs). Falls back to the platform data-local
     // directory if $HOME is unavailable.
     let log_dir = {
         let dir = dirs::home_dir()
-            .map(|h| h.join(".clawdmux"))
+            .map(|h| h.join(".clawmux"))
             .unwrap_or_else(|| {
                 dirs::data_local_dir()
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join("clawdmux")
+                    .join("clawmux")
             });
         std::fs::create_dir_all(&dir)?;
         dir
     };
-    let file_appender = tracing_appender::rolling::never(log_dir, "clawdmux.log");
+    let file_appender = tracing_appender::rolling::never(log_dir, "clawmux.log");
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_writer(file_appender)
@@ -87,16 +87,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    tracing::info!("ClawdMux starting v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("ClawMux starting v{}", env!("CARGO_PKG_VERSION"));
 
     match cli.command {
         Some(Commands::Init(args)) => {
-            tracing::info!("ClawdMux init command invoked");
+            tracing::info!("ClawMux init command invoked");
             let project_root = std::env::current_dir()?;
             config::init::run_init(&project_root, &args)?;
         }
         Some(Commands::UpdateAgents(args)) => {
-            tracing::info!("ClawdMux update-agents command invoked");
+            tracing::info!("ClawMux update-agents command invoked");
             let project_root = std::env::current_dir()?;
             config::init::run_update_agents(&project_root, &args)?;
         }
@@ -110,9 +110,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Checks whether the project has been initialized with `clawdmux init`.
+/// Checks whether the project has been initialized with `clawmux init`.
 ///
-/// Looks for `.opencode/agents/clawdmux/` in `project_root`. If missing,
+/// Looks for `.opencode/agents/clawmux/` in `project_root`. If missing,
 /// prompts the user on stdout/stdin (before TUI starts) and offers to
 /// scaffold the agent definition files non-interactively.
 fn check_project_init(project_root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -120,12 +120,12 @@ fn check_project_init(project_root: &std::path::Path) -> Result<(), Box<dyn std:
     let agents_dir = project_root
         .join(".opencode")
         .join("agents")
-        .join("clawdmux");
+        .join("clawmux");
     if agents_dir.exists() {
         return Ok(());
     }
     println!(
-        "ClawdMux agent definitions not found at {}.",
+        "ClawMux agent definitions not found at {}.",
         agents_dir.display()
     );
     print!("Scaffold agent definition files now? [Y/n] ");
@@ -145,7 +145,7 @@ fn check_project_init(project_root: &std::path::Path) -> Result<(), Box<dyn std:
             &crate::config::BackendKind::default(),
             None,
         )?;
-        println!("Agent files scaffolded. You can now launch clawdmux.");
+        println!("Agent files scaffolded. You can now launch clawmux.");
     } else {
         tracing::warn!("Agent definitions not scaffolded; task sessions will likely fail.");
         println!("Warning: Continuing without agent definitions. Task sessions may fail.");
@@ -236,7 +236,7 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     let opencode_client: Option<Arc<OpenCodeClient>> = server.as_ref().map(|s| {
         let base_url = s.base_url().to_string();
         let auth = if config.has_explicit_password() {
-            Some(("clawdmux".to_string(), config.effective_opencode_password()))
+            Some(("clawmux".to_string(), config.effective_opencode_password()))
         } else {
             None
         };
@@ -456,7 +456,7 @@ fn spawn_fix_request(
 
     let task_id = task_id.clone();
     let auth = if config.has_explicit_password() {
-        Some(("clawdmux".to_string(), config.effective_opencode_password()))
+        Some(("clawmux".to_string(), config.effective_opencode_password()))
     } else {
         None
     };
@@ -479,7 +479,7 @@ fn spawn_fix_request(
 
         let prompt = build_fix_prompt(&error_message, &raw_content);
         // Use no agent (None) so OpenCode uses its default model without requiring
-        // a custom `.opencode/agents/clawdmux/` definition file.
+        // a custom `.opencode/agents/clawmux/` definition file.
         if let Err(e) = client
             .send_prompt_async(&session.id, None, default_model.as_ref(), &prompt)
             .await
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn all_modules_accessible() {
         let _ = std::any::type_name::<app::App>();
-        let _ = std::any::type_name::<error::ClawdMuxError>();
+        let _ = std::any::type_name::<error::ClawMuxError>();
         let _ = std::any::type_name::<messages::AppMessage>();
         let _ = std::any::type_name::<workflow::agents::AgentKind>();
         assert!(true);

@@ -15,7 +15,7 @@ permission:
     "git status": allow
     "*": ask
 ---
-You are the Implementation Agent in the ClawdMux pipeline. Your job is to
+You are the Implementation Agent in the ClawMux pipeline. Your job is to
 implement the code changes described in the task's implementation plan.
 
 Follow the plan precisely. Prefer editing existing files over creating new ones.

@@ -1,7 +1,7 @@
 //! Builds user messages from task context and prior agent work.
 //!
 //! The system prompt lives in the opencode agent definition file
-//! (`.opencode/agents/clawdmux/<agent>.md`). This module only composes the
+//! (`.opencode/agents/clawmux/<agent>.md`). This module only composes the
 //! user-facing message injected at runtime, combining task description, story
 //! context, accumulated prior work, and any kickback reason.
 
@@ -186,7 +186,7 @@ fn section_kickback(reason: &str) -> String {
 #[allow(dead_code)]
 fn section_your_role(agent: &AgentKind) -> String {
     format!(
-        "## Your Role\nYou are the {}, step {} of 7 in the ClawdMux pipeline.\n{}",
+        "## Your Role\nYou are the {}, step {} of 7 in the ClawMux pipeline.\n{}",
         agent.display_name(),
         agent.pipeline_index() + 1,
         role_description(agent)

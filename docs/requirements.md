@@ -4,7 +4,7 @@ This app is intended to accelerate development when using a GenAI assistance suc
 
 # Work Flow
 
-The persona of each agent is configured via the agent's personality file under the .claudmux folder in the project directory. This folder is created automatically by claudmux the first time it runs in your project and it also creates the agents sub-folder within this directory with a text file per agent pre-populated with the default personality clawdmux ships with for each agent. Any of the agents may prompt the team leader (human) for additional information by asking questions.
+The persona of each agent is configured via the agent's personality file under the .claudmux folder in the project directory. This folder is created automatically by claudmux the first time it runs in your project and it also creates the agents sub-folder within this directory with a text file per agent pre-populated with the default personality clawmux ships with for each agent. Any of the agents may prompt the team leader (human) for additional information by asking questions.
 
 ```
 1. Intake Agent - This agent is responsible for reviewing the task file and suggesting any missing fields as well as prompting the team leader (human) for missing details it can not infer.

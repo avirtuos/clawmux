@@ -218,7 +218,7 @@ impl AgentBackend for KiroBackend {
                 if let Some(process) = map.get(&session_id) {
                     process.send_prompt(&prompt, async_tx.clone()).await
                 } else {
-                    Err(crate::error::ClawdMuxError::Kiro(format!(
+                    Err(crate::error::ClawMuxError::Kiro(format!(
                         "no active kiro session for session_id={session_id}"
                     )))
                 }
@@ -413,7 +413,7 @@ async fn run_git_diff() -> crate::error::Result<Vec<FileDiff>> {
         .stderr(Stdio::null())
         .output()
         .await
-        .map_err(crate::error::ClawdMuxError::Io)?;
+        .map_err(crate::error::ClawMuxError::Io)?;
 
     let text = String::from_utf8_lossy(&output.stdout);
     Ok(parse_unified_diff(&text))
@@ -525,9 +525,9 @@ async fn run_git_commit(commit_message: &str, file_paths: &[String]) -> crate::e
             .args(["add", "-A"])
             .status()
             .await
-            .map_err(crate::error::ClawdMuxError::Io)?;
+            .map_err(crate::error::ClawMuxError::Io)?;
         if !status.success() {
-            return Err(crate::error::ClawdMuxError::Kiro(
+            return Err(crate::error::ClawMuxError::Kiro(
                 "git add -A failed".to_string(),
             ));
         }
@@ -537,12 +537,9 @@ async fn run_git_commit(commit_message: &str, file_paths: &[String]) -> crate::e
         for path in file_paths {
             cmd.arg(path);
         }
-        let status = cmd
-            .status()
-            .await
-            .map_err(crate::error::ClawdMuxError::Io)?;
+        let status = cmd.status().await.map_err(crate::error::ClawMuxError::Io)?;
         if !status.success() {
-            return Err(crate::error::ClawdMuxError::Kiro(
+            return Err(crate::error::ClawMuxError::Kiro(
                 "git add failed".to_string(),
             ));
         }
@@ -553,12 +550,12 @@ async fn run_git_commit(commit_message: &str, file_paths: &[String]) -> crate::e
         .args(["commit", "-m", commit_message])
         .status()
         .await
-        .map_err(crate::error::ClawdMuxError::Io)?;
+        .map_err(crate::error::ClawMuxError::Io)?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(crate::error::ClawdMuxError::Kiro(
+        Err(crate::error::ClawMuxError::Kiro(
             "git commit failed".to_string(),
         ))
     }
