@@ -264,5 +264,4 @@ mod tests {
         let resp = parse_response(text).expect("should parse despite prose action");
         assert!(matches!(resp, AgentResponse::Complete { ref summary, .. } if summary == "done"));
     }
-
 }
