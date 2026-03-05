@@ -318,7 +318,7 @@ impl KiroProcess {
 ///
 /// Uses `binary` if provided, otherwise tries `"kiro"` from PATH.
 pub fn resolve_binary(binary: Option<&str>) -> String {
-    binary.unwrap_or("kiro").to_string()
+    binary.unwrap_or("kiro-cli").to_string()
 }
 
 /// Check whether the kiro binary is available on this system.
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn test_resolve_binary_default() {
-        assert_eq!(resolve_binary(None), "kiro");
+        assert_eq!(resolve_binary(None), "kiro-cli");
     }
 
     #[test]

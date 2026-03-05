@@ -574,7 +574,7 @@ mod tests {
     #[test]
     fn test_kiro_backend_binary_default() {
         let b = KiroBackend::new(None, "/tmp".to_string());
-        assert_eq!(b.binary, "kiro");
+        assert_eq!(b.binary, "kiro-cli");
     }
 
     #[test]
