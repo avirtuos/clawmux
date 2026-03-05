@@ -77,7 +77,7 @@ impl Default for OpenCodeConfig {
 }
 
 /// Workflow behavior settings from `.clawmux/config.toml`.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WorkflowConfig {
     /// When `true`, require human approval before starting the next agent.
@@ -85,6 +85,26 @@ pub struct WorkflowConfig {
     /// The human presses `n` on the Team Status tab (Tab 5) to approve.
     /// Defaults to `false` so agent transitions happen automatically.
     pub approval_gate: bool,
+    /// When `true`, ring the terminal bell and send a desktop notification
+    /// whenever an agent needs human attention (question, approval gate,
+    /// error, permission request, etc.).
+    ///
+    /// Defaults to `true`. Set to `false` to silence all notifications.
+    #[serde(default = "default_notifications")]
+    pub notifications: bool,
+}
+
+fn default_notifications() -> bool {
+    true
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            approval_gate: false,
+            notifications: default_notifications(),
+        }
+    }
 }
 
 /// Private wrapper for deserializing the project-level TOML, which uses an
@@ -356,6 +376,19 @@ password = "mypassword"
         let toml = "approval_gate = true\n";
         let config: WorkflowConfig = toml::from_str(toml).unwrap();
         assert!(config.approval_gate);
+    }
+
+    #[test]
+    fn test_workflow_config_notifications_default_true() {
+        let config: WorkflowConfig = toml::from_str("").unwrap();
+        assert!(config.notifications, "notifications should default to true");
+    }
+
+    #[test]
+    fn test_workflow_config_notifications_explicit_false() {
+        let toml = "notifications = false\n";
+        let config: WorkflowConfig = toml::from_str(toml).unwrap();
+        assert!(!config.notifications);
     }
 
     #[test]

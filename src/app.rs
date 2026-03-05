@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::backend::AgentBackend;
 use crate::messages::AppMessage;
+use crate::notifications::Notifier;
 use crate::opencode::events::SessionMap;
 use crate::opencode::types::{DiffStatus, ModelId};
 use crate::tasks::models::{status_to_index, Question, SuggestedFix, TaskStatus, WorkLogEntry};
@@ -104,6 +105,8 @@ pub struct App {
     pub agent_models: HashMap<AgentKind, ModelId>,
     /// Default model from the global provider config, used for commit/fix sessions.
     pub default_model: Option<ModelId>,
+    /// Sends terminal bell and desktop notifications when human attention is needed.
+    notifier: Notifier,
 }
 
 impl App {
@@ -116,14 +119,17 @@ impl App {
     /// * `session_map` - Shared map correlating session IDs to tasks and agents.
     /// * `async_tx` - Channel sender for routing async task results back to the event loop.
     /// * `approval_gate` - When `true`, pause and require human approval between agents.
+    /// * `notifications` - When `true`, ring the bell and send desktop notifications.
     /// * `agent_models` - Per-agent model IDs parsed from embedded agent frontmatter.
     /// * `default_model` - Fallback model for sessions without a dedicated agent.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         task_store: TaskStore,
         backend: Box<dyn AgentBackend>,
         session_map: SessionMap,
         async_tx: mpsc::Sender<AppMessage>,
         approval_gate: bool,
+        notifications: bool,
         agent_models: HashMap<AgentKind, ModelId>,
         default_model: Option<ModelId>,
     ) -> Self {
@@ -156,6 +162,7 @@ impl App {
             pending_commit_sessions: HashMap::new(),
             agent_models,
             default_model,
+            notifier: Notifier::new(notifications),
         }
     }
 
@@ -254,6 +261,7 @@ impl App {
             session_map,
             tx,
             false,
+            false,
             HashMap::new(),
             None,
         )
@@ -291,6 +299,15 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Sends a human-attention notification for the given task and reason.
+    ///
+    /// Delegates to [`Notifier::notify`] with the title `"ClawMux"` and a
+    /// body of `"[<task_id>] <reason>"`. Debouncing is handled inside `Notifier`.
+    fn notify_human(&mut self, reason: &str, task_id: &TaskId) {
+        let body = format!("[{}] {}", task_id, reason);
+        self.notifier.notify("ClawMux", &body);
     }
 
     /// Processes a single [`AppMessage`], mutating state and returning
@@ -541,6 +558,7 @@ impl App {
                     &task_id,
                     format!("ERROR ({}): {}", current_agent.display_name(), error),
                 );
+                self.notify_human(&format!("ERROR: {}", error), &task_id);
                 tracing::warn!(
                     "Session error for task {} ({}): {}",
                     task_id,
@@ -753,6 +771,7 @@ impl App {
             AppMessage::CommitFailed { task_id, error } => {
                 self.tab2_state
                     .push_banner(&task_id, format!("[Commit] Commit failed: {}", error));
+                self.notify_human("Commit failed", &task_id);
                 tracing::warn!("Commit failed for task {}: {}", task_id, error);
                 vec![]
             }
@@ -903,6 +922,19 @@ impl App {
                             summary,
                         });
                         self.sync_task_with_workflow(&task_id, agent);
+                        // Notify if the phase transitioned to one requiring human attention.
+                        match self.workflow_engine.state(&task_id).map(|s| &s.phase) {
+                            Some(WorkflowPhase::AwaitingApproval { .. }) => {
+                                self.notify_human(
+                                    &format!("Awaiting approval for {}", agent.display_name()),
+                                    &task_id,
+                                );
+                            }
+                            Some(WorkflowPhase::PendingReview) => {
+                                self.notify_human("All agents complete - review needed", &task_id);
+                            }
+                            _ => {}
+                        }
                         msgs.push(AppMessage::TaskUpdated {
                             task_id: task_id.clone(),
                         });
@@ -926,6 +958,10 @@ impl App {
                         self.tab2_state.push_banner(
                             &task_id,
                             format!("{} has a question (see Task Details)", agent.display_name()),
+                        );
+                        self.notify_human(
+                            &format!("{} has a question", agent.display_name()),
+                            &task_id,
                         );
                         let mut msgs =
                             self.workflow_engine
@@ -971,6 +1007,16 @@ impl App {
                         });
                         if let Some(task) = self.task_store.get_mut(&task_id) {
                             task.assign_to(Some(to), from);
+                        }
+                        // Notify if the kickback triggered an approval gate.
+                        if matches!(
+                            self.workflow_engine.state(&task_id).map(|s| &s.phase),
+                            Some(WorkflowPhase::AwaitingApproval { .. })
+                        ) {
+                            self.notify_human(
+                                &format!("Awaiting approval for {}", to.display_name()),
+                                &task_id,
+                            );
                         }
                         msgs.push(AppMessage::TaskUpdated { task_id });
                         msgs
@@ -1193,6 +1239,7 @@ impl App {
                     &task_id,
                     format!("[Permission] {} requested", request.permission),
                 );
+                self.notify_human("Permission requested", &task_id);
                 self.tab2_state.push_permission(task_id, request);
                 vec![]
             }
@@ -1286,6 +1333,10 @@ impl App {
                         "{} has a question (see Questions tab)",
                         agent.display_name()
                     ),
+                );
+                self.notify_human(
+                    &format!("{} has a question", agent.display_name()),
+                    &task_id,
                 );
                 // Stop the idle timer while the human is answering; clear thinking indicator.
                 self.tab2_state.clear_awaiting(&task_id);
@@ -3740,6 +3791,7 @@ mod tests {
             session_map,
             tx,
             false,
+            false,
             HashMap::new(),
             None,
         );
@@ -4150,6 +4202,7 @@ mod tests {
             Box::new(crate::backend::NullBackend),
             session_map,
             tx,
+            false,
             false,
             HashMap::new(),
             None,

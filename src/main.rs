@@ -7,6 +7,7 @@ mod backend;
 mod config;
 mod error;
 mod messages;
+mod notifications;
 mod opencode;
 mod tasks;
 mod tui;
@@ -276,6 +277,7 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&session_map),
         async_tx.clone(),
         config.workflow.approval_gate,
+        config.workflow.notifications,
         agent_models,
         default_model,
     );
