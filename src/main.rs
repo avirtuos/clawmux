@@ -112,23 +112,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Checks whether the project has been initialized with `clawmux init`.
 ///
-/// Looks for `.opencode/agents/clawmux/` in `project_root`. If missing,
+/// Looks for `.clawmux/config.toml` in `project_root`. If missing,
 /// prompts the user on stdout/stdin (before TUI starts) and offers to
 /// scaffold the agent definition files non-interactively.
 fn check_project_init(project_root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{BufRead, Write};
-    let agents_dir = project_root
-        .join(".opencode")
-        .join("agents")
-        .join("clawmux");
-    if agents_dir.exists() {
+    // Use .clawmux/config.toml as the universal init marker — it exists for
+    // every backend, unlike .opencode/agents/ which is OpenCode-specific.
+    let config_file = project_root.join(".clawmux").join("config.toml");
+    if config_file.exists() {
         return Ok(());
     }
-    println!(
-        "ClawMux agent definitions not found at {}.",
-        agents_dir.display()
-    );
-    print!("Scaffold agent definition files now? [Y/n] ");
+    println!("ClawMux project not initialized (no .clawmux/config.toml found).");
+    print!("Run interactive setup now? [Y/n] ");
     std::io::stdout().flush()?;
     let mut input = String::new();
     std::io::stdin().lock().read_line(&mut input)?;
@@ -137,18 +133,15 @@ fn check_project_init(project_root: &std::path::Path) -> Result<(), Box<dyn std:
         || response.eq_ignore_ascii_case("y")
         || response.eq_ignore_ascii_case("yes")
     {
-        config::init::scaffold_project(
+        config::init::run_init(
             project_root,
             &config::init::InitArgs {
                 reset_agents: false,
             },
-            &crate::config::BackendKind::default(),
-            None,
         )?;
-        println!("Agent files scaffolded. You can now launch clawmux.");
     } else {
-        tracing::warn!("Agent definitions not scaffolded; task sessions will likely fail.");
-        println!("Warning: Continuing without agent definitions. Task sessions may fail.");
+        tracing::warn!("Project not initialized; task sessions will likely fail.");
+        println!("Warning: Continuing without initialization. Task sessions may fail.");
     }
     Ok(())
 }
@@ -191,40 +184,45 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     // Use a crossterm EventStream to detect Ctrl+C in raw mode (ratatui disables
     // the kernel ISIG flag, so tokio::signal::ctrl_c() is ineffective here).
     let mut startup_events = crossterm::event::EventStream::new();
-    let mut server = tokio::select! {
-        result = OpenCodeServer::ensure_running(&config, |status| {
-            let _ = terminal.draw(|f| tui::draw_loading_screen(f, status));
-        }) => {
-            match result {
-                Ok(s) => {
-                    tracing::info!("OpenCode server at {}", s.base_url());
-                    Some(s)
-                }
-                Err(e) => {
-                    tracing::warn!("OpenCode server unavailable, continuing without it: {}", e);
-                    let _ = terminal.draw(|f| {
-                        tui::draw_loading_screen(f, "OpenCode server unavailable, starting without it");
-                    });
-                    None
-                }
-            }
-        }
-        _ = async {
-            use crossterm::event::{Event, KeyCode, KeyModifiers};
-            while let Some(Ok(event)) = startup_events.next().await {
-                if let Event::Key(key) = event {
-                    if key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        return;
+    let mut server = if config.backend == BackendKind::OpenCode {
+        tokio::select! {
+            result = OpenCodeServer::ensure_running(&config, |status| {
+                let _ = terminal.draw(|f| tui::draw_loading_screen(f, status));
+            }) => {
+                match result {
+                    Ok(s) => {
+                        tracing::info!("OpenCode server at {}", s.base_url());
+                        Some(s)
+                    }
+                    Err(e) => {
+                        tracing::warn!("OpenCode server unavailable, continuing without it: {}", e);
+                        let _ = terminal.draw(|f| {
+                            tui::draw_loading_screen(f, "OpenCode server unavailable, starting without it");
+                        });
+                        None
                     }
                 }
             }
-        } => {
-            tracing::info!("Ctrl+C received during startup, exiting");
-            ratatui::restore();
-            return Ok(());
+            _ = async {
+                use crossterm::event::{Event, KeyCode, KeyModifiers};
+                while let Some(Ok(event)) = startup_events.next().await {
+                    if let Event::Key(key) = event {
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            return;
+                        }
+                    }
+                }
+            } => {
+                tracing::info!("Ctrl+C received during startup, exiting");
+                ratatui::restore();
+                return Ok(());
+            }
         }
+    } else {
+        tracing::info!("Skipping OpenCode server (backend={:?})", config.backend);
+        None
     };
     // Drop startup_events so the main loop's EventStream can take over stdin.
     drop(startup_events);
