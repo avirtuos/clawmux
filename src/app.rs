@@ -809,46 +809,27 @@ impl App {
                     }];
                 }
 
-                // Guard: ignore completions from child sessions.  When the engine
-                // has a registered primary session_id, only that session's
-                // completion should advance the pipeline.  A None expected_session
-                // means no session has been registered yet, so the completion
-                // passes through (handles CreateSession error path).
-                let expected_session = self
+                // Guard: only advance the workflow when the current phase is Running.
+                // In OpenCode >= 1.2, primary ("conductor") sessions delegate work to
+                // child sessions that fire session.idle when the agent's turn completes.
+                // The conductor stays alive indefinitely without firing its own
+                // session.idle, so a session-id equality check incorrectly drops the
+                // child's completion and leaves the task hung.  The phase check prevents
+                // double-advancement instead: once the first completion transitions the
+                // workflow to AwaitingApproval (or any non-Running state), subsequent
+                // completions from the same turn are silently dropped.
+                let phase = self
                     .workflow_engine
                     .state(&task_id)
-                    .and_then(|s| s.session_id.clone());
-                if let Some(ref expected) = expected_session {
-                    if *expected != session_id {
-                        tracing::debug!(
-                            "Ignoring child SessionCompleted for task {} (session {} != expected {})",
-                            task_id,
-                            session_id,
-                            expected
-                        );
-                        return vec![];
-                    }
-                }
-
-                // Guard: when no session is registered (session_id == None) and the
-                // workflow is in AwaitingApproval, drop the completion.  The engine
-                // cleared session_id after AgentCompleted but is waiting for the human
-                // to press Ctrl+N before advancing — a spurious or stale event here
-                // would otherwise spawn a second idle session for the current agent
-                // instead of the correct next one.
-                if expected_session.is_none() {
-                    let is_awaiting_approval = self
-                        .workflow_engine
-                        .state(&task_id)
-                        .map(|s| matches!(s.phase, WorkflowPhase::AwaitingApproval { .. }))
-                        .unwrap_or(false);
-                    if is_awaiting_approval {
-                        tracing::debug!(
-                            "Ignoring SessionCompleted for task {} (session_id=None, AwaitingApproval phase)",
-                            task_id
-                        );
-                        return vec![];
-                    }
+                    .map(|s| s.phase.clone());
+                if !matches!(phase, Some(WorkflowPhase::Running)) {
+                    tracing::debug!(
+                        "Ignoring SessionCompleted for task {} (session {}) - phase is {:?}, not Running",
+                        task_id,
+                        session_id,
+                        phase
+                    );
+                    return vec![];
                 }
 
                 self.tab2_state.clear_awaiting(&task_id);
@@ -1968,20 +1949,57 @@ mod tests {
             1,
             "answer_inputs should have one entry for the new unanswered question"
         );
+    }
 
-        // A second question should extend answer_inputs to 2.
-        let response_json2 =
-            r#"{"action":"question","question":"Which file?","context":"Need file"}"#;
-        app.handle_message(AppMessage::SessionCompleted {
-            task_id: task_id.clone(),
-            session_id: "sess-2".to_string(),
-            response_text: response_json2.to_string(),
-        });
+    /// Verifies that sync_answer_inputs produces one textarea per unanswered question
+    /// when the task directly holds multiple unanswered questions.
+    #[test]
+    fn test_sync_answer_inputs_multiple_unanswered_questions() {
+        use crate::tasks::models::{Question, Task, TaskStatus};
+        use std::path::PathBuf;
+
+        let mut app = App::test_default();
+        let task = Task {
+            id: TaskId::from_path("tasks/1.1.md"),
+            story_name: "1. Story".to_string(),
+            name: "1.1".to_string(),
+            status: TaskStatus::InProgress,
+            assigned_to: None,
+            description: String::new(),
+            starting_prompt: None,
+            questions: vec![
+                Question {
+                    agent: AgentKind::Intake,
+                    text: "What is scope?".to_string(),
+                    answer: None,
+                    opencode_request_id: None,
+                },
+                Question {
+                    agent: AgentKind::Intake,
+                    text: "Which file?".to_string(),
+                    answer: None,
+                    opencode_request_id: None,
+                },
+            ],
+            design: None,
+            implementation_plan: None,
+            work_log: Vec::new(),
+            file_path: PathBuf::from("tasks/1.1.md"),
+            extra_sections: Vec::new(),
+            parse_error: None,
+        };
+        app.task_store.insert(task);
+        let task = app
+            .task_store
+            .get(&TaskId::from_path("tasks/1.1.md"))
+            .cloned()
+            .unwrap();
+        app.questions_state.sync_answer_inputs(&task);
 
         assert_eq!(
             app.questions_state.answer_inputs.len(),
             2,
-            "answer_inputs should have two entries after two unanswered questions"
+            "answer_inputs should have two entries for two unanswered questions"
         );
     }
 
@@ -3580,10 +3598,16 @@ mod tests {
         );
     }
 
-    /// Verifies that `SessionCompleted` for a child session (not the primary) is ignored
-    /// and does not advance the pipeline.
+    /// Verifies that `SessionCompleted` from a child session (different session_id than
+    /// the registered primary) is accepted and advances the pipeline when the workflow
+    /// phase is Running.
+    ///
+    /// In OpenCode >= 1.2, primary ("conductor") sessions delegate work to child
+    /// sessions that fire session.idle when the agent's turn completes.  The conductor
+    /// stays alive without firing its own session.idle, so we must accept child
+    /// completions to avoid hanging the task.
     #[test]
-    fn test_child_session_completed_skipped() {
+    fn test_child_session_completed_advances_pipeline() {
         let mut app = App::test_default();
         let task_id = make_task_with_active_session(&mut app, "primary");
 
@@ -3593,19 +3617,57 @@ mod tests {
             response_text: r#"{"action":"complete","summary":"done"}"#.to_string(),
         });
 
+        // Child completion must be accepted: pipeline should produce at least TaskUpdated.
         assert!(
-            msgs.is_empty(),
-            "child SessionCompleted should produce no messages, got: {msgs:?}"
+            msgs.iter().any(|m| matches!(m, AppMessage::TaskUpdated { .. })),
+            "child SessionCompleted should produce TaskUpdated when phase is Running, got: {msgs:?}"
         );
-        // Workflow must still be in Running phase with the primary session.
+        // The workflow should have advanced: session_id cleared by the engine.
         let state = app
             .workflow_engine
             .state(&task_id)
             .expect("state should exist");
-        assert_eq!(
-            state.session_id.as_deref(),
-            Some("primary"),
-            "engine should still track the primary session"
+        assert!(
+            state.session_id.is_none(),
+            "engine session_id should be cleared after advancing, got: {:?}",
+            state.session_id
+        );
+    }
+
+    /// Verifies that a second `SessionCompleted` is dropped when the workflow phase
+    /// is no longer Running (prevents double-advancement when both a child session
+    /// and the primary conductor fire session.idle for the same turn).
+    #[test]
+    fn test_secondary_completion_ignored_when_phase_not_running() {
+        let mut app = App::test_default();
+        // Enable the approval gate so the first completion transitions to
+        // AwaitingApproval — a non-Running phase — making the guard testable.
+        app.workflow_engine.set_approval_gate(true);
+        let task_id = make_task_with_active_session(&mut app, "primary");
+
+        // First completion: accepted, transitions phase to AwaitingApproval.
+        app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "primary".to_string(),
+            response_text: r#"{"action":"complete","summary":"done"}"#.to_string(),
+        });
+
+        // Phase should now be AwaitingApproval (not Running).
+        let phase = app.workflow_engine.state(&task_id).map(|s| s.phase.clone());
+        assert!(
+            !matches!(phase, Some(WorkflowPhase::Running)),
+            "phase should have advanced past Running after first completion, got: {phase:?}"
+        );
+
+        // Second completion (e.g. the conductor session firing late): must be dropped.
+        let msgs = app.handle_message(AppMessage::SessionCompleted {
+            task_id: task_id.clone(),
+            session_id: "conductor".to_string(),
+            response_text: String::new(),
+        });
+        assert!(
+            msgs.is_empty(),
+            "second SessionCompleted should be ignored when phase is not Running, got: {msgs:?}"
         );
     }
 
