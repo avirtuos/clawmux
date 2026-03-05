@@ -24,14 +24,8 @@ ClawMux is a GenAI coding assistance multiplexer and task orchestrator. It manag
 - TUI -- terminal UI renders with left-pane task list navigation and Tab 1 (task details view)
 - Task markdown parsing and writing -- round-trip fidelity for all task file sections
 - OpenCode HTTP client -- session creation, SSE event streaming, server lifecycle management (auto-start/reuse)
+- kiro-cli -- ACP (agent control protocol) integration to use kiro-cli as a backend.
 - Workflow state machine -- pure state transition logic for all 7 agents and human-in-the-loop gates
-
-### What's next
-
-- Prompt composition (Task 6.2)
-- Tabs 2-4: agent activity feed, team status, code review with inline comments
-- Message dispatcher wiring all subsystems together
-- End-to-end integration: task -> agent -> TUI
 
 ## Getting Started
 
@@ -54,12 +48,6 @@ Run the interactive setup command once per project:
 clawmux init
 ```
 
-This will:
-1. Check for and optionally install the `opencode` binary
-2. Configure your LLM provider credentials (stored in `~/.config/clawmux/config.toml`)
-3. Scaffold the project directory structure (`.clawmux/`, `.opencode/agents/`, `tasks/`)
-4. Generate default agent definition files
-
 To regenerate agent definitions from built-in defaults:
 
 ```bash
@@ -71,8 +59,6 @@ clawmux init --reset-agents
 ```bash
 clawmux
 ```
-
-The TUI requires an interactive terminal. Log output is written to `clawmux.log` in the working directory to avoid corrupting the terminal display.
 
 ## Task File Format
 
@@ -112,7 +98,7 @@ A1: Rust
 
 ## Architecture
 
-ClawMux acts as a client to an `opencode serve` HTTP server. See `docs/design.md` for the full architecture documentation.
+ClawMux acts as a client to an `opencode serve` HTTP server or `kiro-cli` via agent-control-protocol (ACP). See `docs/design.md` for the full architecture documentation.
 
 ## Module Structure
 
@@ -153,19 +139,6 @@ src/
     └── prompt_composer.rs -- Task-to-prompt construction
 ```
 
-## TODO
-
-- **Improve password support for opencode local auth**: Write a project-specific opencode config that enables auth when clawmux spawns the server, so credentials can be verified end-to-end rather than relying on the user to configure opencode separately.
-
-## Development
-
-```bash
-cargo build
-cargo test           # 185 tests
-cargo clippy -- -D warnings
-```
-
-Run with a terminal attached:
 
 ```bash
 cargo run
