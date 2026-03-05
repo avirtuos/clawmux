@@ -263,18 +263,24 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         default_model,
     );
     let mut event_stream = crossterm::event::EventStream::new();
-    let mut tick_interval = tokio::time::interval(Duration::from_millis(250));
+    let mut tick_interval = tokio::time::interval(Duration::from_millis(1000));
     tick_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         terminal.draw(|frame| tui::draw(frame, &app))?;
 
-        let messages: Vec<AppMessage> = tokio::select! {
+        let first_messages: Vec<AppMessage> = tokio::select! {
             maybe_event = event_stream.next() => {
-                if let Some(Ok(event)) = maybe_event {
-                    app.handle_message(AppMessage::TerminalEvent(event))
-                } else {
-                    vec![]
+                match maybe_event {
+                    Some(Ok(event)) => app.handle_message(AppMessage::TerminalEvent(event)),
+                    Some(Err(e)) => {
+                        tracing::warn!("Terminal event stream error: {}", e);
+                        vec![]
+                    }
+                    None => {
+                        tracing::warn!("Terminal event stream closed, shutting down");
+                        app.handle_message(AppMessage::Shutdown)
+                    }
                 }
             }
             _ = tick_interval.tick() => {
@@ -288,9 +294,20 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+        // Drain any immediately-available async messages to batch-process them
+        // before the next draw, reducing redundant redraws during high-frequency
+        // streaming (e.g. SSE token deltas).
+        let mut queue = std::collections::VecDeque::from(first_messages);
+        const MAX_DRAIN: usize = 200;
+        for _ in 0..MAX_DRAIN {
+            match async_rx.try_recv() {
+                Ok(msg) => queue.extend(app.handle_message(msg)),
+                Err(_) => break,
+            }
+        }
+
         // Dispatch any follow-up messages produced by the handler,
         // including messages produced by follow-up handlers themselves.
-        let mut queue = std::collections::VecDeque::from(messages);
         while let Some(msg) = queue.pop_front() {
             // Intercept RequestTaskFix to spawn an async fix task.
             if let AppMessage::RequestTaskFix { ref task_id } = msg {
