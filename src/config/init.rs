@@ -435,19 +435,23 @@ fn build_kiro_agent_json(agent: &AgentKind) -> String {
 
     // Determine tool set and model based on agent role.
     // `tools` declares which tools are available; `allowed_tools` are auto-approved without user
-    // prompting. Tools in `tools` but NOT in `allowed_tools` trigger a TUI permission dialog.
+    // prompting. When kiro runs headlessly it does not send session/request_permission for tools
+    // outside allowedTools -- it silently auto-runs them. To ensure agents use the native write
+    // tool (rather than falling back to `cat > file` via shell), write is auto-approved.
+    // shell is kept available but not auto-approved; kiro will prompt or auto-run it depending
+    // on its own headless-mode behaviour.
     //
     // Tool names here are kiro-cli built-in names (write, shell, glob, grep, thinking),
     // NOT the ACP protocol-level tool kind names (edit, execute, search, think).
     let (tools_json, allowed_tools_json, model) = match agent {
         AgentKind::Implementation => (
             r#"["read","write","glob","grep","shell","thinking"]"#,
-            r#"["read","glob","grep","thinking"]"#,
+            r#"["read","write","glob","grep","thinking"]"#,
             "claude-sonnet-4-6",
         ),
         AgentKind::Planning | AgentKind::CodeQuality | AgentKind::CodeReview => (
-            r#"["read","glob","grep","shell","thinking"]"#,
-            r#"["read","glob","grep","thinking"]"#,
+            r#"["read","write","glob","grep","shell","thinking"]"#,
+            r#"["read","write","glob","grep","thinking"]"#,
             "claude-sonnet-4-6",
         ),
         _ => (
