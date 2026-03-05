@@ -77,7 +77,7 @@ impl Default for OpenCodeConfig {
 }
 
 /// Workflow behavior settings from `.clawmux/config.toml`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WorkflowConfig {
     /// When `true`, require human approval before starting the next agent.
@@ -85,14 +85,6 @@ pub struct WorkflowConfig {
     /// The human presses `n` on the Team Status tab (Tab 5) to approve.
     /// Defaults to `false` so agent transitions happen automatically.
     pub approval_gate: bool,
-}
-
-impl Default for WorkflowConfig {
-    fn default() -> Self {
-        Self {
-            approval_gate: false,
-        }
-    }
 }
 
 /// Private wrapper for deserializing the project-level TOML, which uses an
@@ -353,7 +345,10 @@ password = "mypassword"
     #[test]
     fn test_workflow_config_defaults_approval_gate_false() {
         let config: WorkflowConfig = toml::from_str("").unwrap();
-        assert!(!config.approval_gate, "approval_gate should default to false");
+        assert!(
+            !config.approval_gate,
+            "approval_gate should default to false"
+        );
     }
 
     #[test]
