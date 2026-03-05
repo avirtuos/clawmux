@@ -3,6 +3,7 @@
 //! Bootstraps logging, parses CLI arguments, and dispatches to the appropriate command.
 
 mod app;
+mod backend;
 mod config;
 mod error;
 mod messages;
@@ -22,8 +23,9 @@ use tokio::time::MissedTickBehavior;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::App;
+use crate::backend::kiro::KiroBackend;
 use crate::config::init::build_agent_model_map;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, BackendKind};
 use crate::messages::AppMessage;
 use crate::opencode::events::EventStreamConsumer;
 use crate::opencode::server::OpenCodeServer;
@@ -85,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    tracing::info!("ClawdMux starting");
+    tracing::info!("ClawdMux starting v{}", env!("CARGO_PKG_VERSION"));
 
     match cli.command {
         Some(Commands::Init(args)) => {
@@ -112,8 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Looks for `.opencode/agents/clawdmux/` in `project_root`. If missing,
 /// prompts the user on stdout/stdin (before TUI starts) and offers to
-/// scaffold the agent definition files non-interactively. Provider credentials
-/// still require `clawdmux init` to be run separately.
+/// scaffold the agent definition files non-interactively.
 fn check_project_init(project_root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{BufRead, Write};
     let agents_dir = project_root
@@ -141,10 +142,10 @@ fn check_project_init(project_root: &std::path::Path) -> Result<(), Box<dyn std:
             &config::init::InitArgs {
                 reset_agents: false,
             },
+            &crate::config::BackendKind::default(),
+            None,
         )?;
-        println!(
-            "Agent files scaffolded. Run 'clawdmux init' to configure your LLM provider if needed."
-        );
+        println!("Agent files scaffolded. You can now launch clawdmux.");
     } else {
         tracing::warn!("Agent definitions not scaffolded; task sessions will likely fail.");
         println!("Warning: Continuing without agent definitions. Task sessions may fail.");
@@ -228,7 +229,7 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     // Drop startup_events so the main loop's EventStream can take over stdin.
     drop(startup_events);
 
-    // 6. Build the shared channel (64-slot), session map, and optional OpenCodeClient.
+    // 6. Build the shared channel (64-slot), session map, and OpenCode backend.
     let (async_tx, mut async_rx) = mpsc::channel::<AppMessage>(64);
     let session_map = Arc::new(RwLock::new(HashMap::new()));
 
@@ -241,6 +242,19 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         };
         Arc::new(OpenCodeClient::new(base_url, auth))
     });
+    let backend: Box<dyn crate::backend::AgentBackend> = match config.backend {
+        BackendKind::Kiro => {
+            tracing::info!("using kiro backend (ACP)");
+            Box::new(KiroBackend::new(
+                config.kiro.binary.clone(),
+                project_root.to_string_lossy().into_owned(),
+            ))
+        }
+        BackendKind::OpenCode => {
+            tracing::info!("using opencode backend");
+            Box::new(backend::OpenCodeBackend::new(opencode_client.clone()))
+        }
+    };
 
     // 7. Spawn the EventStreamConsumer if the server is available.
     if let Some(ref s) = server {
@@ -253,9 +267,14 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    tracing::info!(
+        "Agent backend: {} (available: {})",
+        backend.name(),
+        backend.is_available()
+    );
     let mut app = App::new(
         task_store,
-        opencode_client,
+        backend,
         Arc::clone(&session_map),
         async_tx.clone(),
         config.workflow.approval_gate,

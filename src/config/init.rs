@@ -1,16 +1,15 @@
-//! `clawdmux init` command: dependency checks, provider setup, and project scaffold.
+//! `clawdmux init` command: dependency checks and project scaffold.
 //!
 //! Interactive terminal wizard for first-time project setup:
 //! 1. Checks for (and optionally installs) the opencode binary.
-//! 2. Configures LLM provider credentials in `~/.config/clawdmux/config.toml`.
-//! 3. Scaffolds `.clawdmux/config.toml`, `.opencode/agents/clawdmux/`, and `tasks/`.
-//! 4. Logs a success message.
+//! 2. Scaffolds `.clawdmux/config.toml`, `.opencode/agents/clawdmux/`, and `tasks/`.
+//! 3. Logs a success message.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
 
-use crate::config::providers::{GlobalConfig, ProviderConfig, ProviderSection};
+use crate::config::BackendKind;
 use crate::error::{ClawdMuxError, Result};
 use crate::opencode::types::ModelId;
 use crate::workflow::agents::AgentKind;
@@ -111,26 +110,28 @@ pub struct InitArgs {
 
 /// Runs the interactive `clawdmux init` wizard.
 ///
-/// Performs four steps:
-/// 1. Checks for the opencode binary; offers to install it if missing.
-/// 2. Checks for provider credentials in the global config; prompts if absent.
+/// Performs these steps:
+/// 1. Asks which agent backend to use (OpenCode or Kiro).
+/// 2. Checks for the opencode binary if OpenCode is selected; offers to install it.
 /// 3. Scaffolds project-local files (`.clawdmux/config.toml`,
-///    `.opencode/agents/clawdmux/`, `tasks/`).
+///    `.opencode/agents/clawdmux/`, `.kiro/agents/`, `tasks/`).
 /// 4. Logs a success summary via `tracing::info!`.
 ///
 /// # Errors
 ///
-/// Returns [`ClawdMuxError::Internal`] if the platform config directory cannot
-/// be resolved, the user declines to install opencode, or an invalid provider
-/// choice is entered. Returns [`ClawdMuxError::Io`] for filesystem or stdin
-/// failures.
+/// Returns [`ClawdMuxError::Internal`] if the user declines to install opencode
+/// or an invalid backend choice is entered. Returns [`ClawdMuxError::Io`] for
+/// filesystem or stdin failures.
 pub fn run_init(project_root: &Path, args: &InitArgs) -> Result<()> {
-    check_or_install_opencode()?;
-    let global_config_dir = dirs::config_dir().ok_or_else(|| {
-        ClawdMuxError::Internal("could not determine platform config directory".to_string())
-    })?;
-    let global_config_path = global_config_dir.join("clawdmux").join("config.toml");
-    run_init_with_paths(&global_config_path, project_root, args)
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let (backend, kiro_binary) = select_backend_from_reader(&mut stdin.lock(), &mut stdout.lock())?;
+
+    if matches!(backend, BackendKind::OpenCode) {
+        check_or_install_opencode()?;
+    }
+
+    run_init_with_paths(project_root, args, backend, kiro_binary)
 }
 
 // ---------------------------------------------------------------------------
@@ -139,17 +140,22 @@ pub fn run_init(project_root: &Path, args: &InitArgs) -> Result<()> {
 
 /// Inner implementation used by both [`run_init`] and tests.
 ///
-/// Accepts an explicit `global_config_path` so tests can supply a
-/// `TempDir`-based path without touching `~/.config/clawdmux/config.toml`.
-/// The opencode binary check is intentionally excluded here; it lives only in
-/// the interactive [`run_init`] entry point.
+/// Accepts the pre-selected `backend` so tests can skip interactive prompts.
+/// The opencode binary check and interactive backend selection are intentionally
+/// excluded here; they live only in the interactive [`run_init`] entry point.
+///
+/// # Arguments
+/// * `project_root` – root of the project being initialised.
+/// * `args` – init command arguments (e.g. `reset_agents`).
+/// * `backend` – the agent backend selected by the user.
+/// * `kiro_binary` – optional path to the kiro binary (only used when `backend` is `Kiro`).
 pub(crate) fn run_init_with_paths(
-    global_config_path: &Path,
     project_root: &Path,
     args: &InitArgs,
+    backend: BackendKind,
+    kiro_binary: Option<String>,
 ) -> Result<()> {
-    configure_provider(global_config_path)?;
-    scaffold_project(project_root, args)?;
+    scaffold_project(project_root, args, &backend, kiro_binary.as_deref())?;
     tracing::info!("clawdmux init complete, run clawdmux to open the TUI");
     Ok(())
 }
@@ -208,53 +214,26 @@ fn check_or_install_opencode() -> Result<()> {
     }
 }
 
-/// Step 2: ensure the global config has a configured LLM provider.
+/// Core backend-selection logic with injected I/O for testability.
 ///
-/// Thin wrapper around [`configure_provider_from_reader`] that supplies the
-/// real stdin and stdout.
-fn configure_provider(global_config_path: &Path) -> Result<()> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    configure_provider_from_reader(global_config_path, &mut stdin.lock(), &mut stdout.lock())
-}
-
-/// Core provider-configuration logic, accepting injected I/O for testability.
+/// Presents a numbered menu of available backends and reads the user's choice.
+/// If kiro is selected and the `kiro` binary is not found on `PATH`, prompts
+/// for an optional explicit binary path.
 ///
-/// If `provider.default` is already set in the global config this is a no-op.
-/// Otherwise the user is prompted to choose a provider, enter a default model,
-/// and enter an API key. All inputs are read from `reader`; all prompts are
-/// written to `writer`.
-///
-/// Note: because all input (including the API key) is read via `reader`, the
-/// production wrapper [`configure_provider`] passes the real stdin, which means
-/// the API key is visible while being typed. If hidden entry is needed, wire a
-/// `rpassword`-backed reader at the call site.
-pub(crate) fn configure_provider_from_reader<R: BufRead, W: Write>(
-    global_config_path: &Path,
+/// Returns `(BackendKind, Option<kiro_binary_path>)`.
+pub(crate) fn select_backend_from_reader<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
-) -> Result<()> {
-    let mut config = match GlobalConfig::load(global_config_path) {
-        Ok(cfg) => cfg,
-        Err(ClawdMuxError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            GlobalConfig::default()
-        }
-        Err(e) => return Err(e),
-    };
-
-    if !config.provider.default.is_empty() {
-        tracing::info!(
-            provider = %config.provider.default,
-            "LLM provider already configured"
-        );
-        return Ok(());
-    }
-
-    writeln!(writer, "No LLM provider configured. Let us set one up.")
-        .map_err(ClawdMuxError::Io)?;
+) -> Result<(BackendKind, Option<String>)> {
+    writeln!(writer, "Which agent backend would you like to use?").map_err(ClawdMuxError::Io)?;
     writeln!(
         writer,
-        "Provider: [1] Anthropic  [2] OpenAI  [3] Google  [4] OpenRouter"
+        "  [1] OpenCode (recommended)  Full REST API, 75+ LLM providers"
+    )
+    .map_err(ClawdMuxError::Io)?;
+    writeln!(
+        writer,
+        "  [2] Kiro                    Agent Client Protocol (ACP), stdin/stdout JSON-RPC"
     )
     .map_err(ClawdMuxError::Io)?;
     write!(writer, "> ").map_err(ClawdMuxError::Io)?;
@@ -263,82 +242,39 @@ pub(crate) fn configure_provider_from_reader<R: BufRead, W: Write>(
     let mut choice = String::new();
     reader.read_line(&mut choice).map_err(ClawdMuxError::Io)?;
 
-    let (provider_name, default_model_hint) = match choice.trim() {
-        "1" => ("anthropic", "claude-sonnet-4-5"),
-        "2" => ("openai", "gpt-4o"),
-        "3" => ("google", "gemini-2.0-flash"),
-        "4" => ("openrouter", "openrouter/openrouter/auto"),
-        other => {
-            return Err(ClawdMuxError::Internal(format!(
-                "invalid provider choice: {}",
-                other
-            )))
+    match choice.trim() {
+        "" | "1" => Ok((BackendKind::OpenCode, None)),
+        "2" => {
+            // Check if kiro is on PATH; prompt for binary path if not found.
+            let kiro_binary = if which::which("kiro").is_err() {
+                writeln!(writer, "kiro not found in PATH.").map_err(ClawdMuxError::Io)?;
+                write!(
+                    writer,
+                    "kiro binary path (leave blank to use 'kiro' from PATH at runtime): "
+                )
+                .map_err(ClawdMuxError::Io)?;
+                writer.flush().map_err(ClawdMuxError::Io)?;
+
+                let mut binary_input = String::new();
+                reader
+                    .read_line(&mut binary_input)
+                    .map_err(ClawdMuxError::Io)?;
+                let trimmed = binary_input.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            } else {
+                None
+            };
+            Ok((BackendKind::Kiro, kiro_binary))
         }
-    };
-
-    write!(writer, "Default model [{}]: ", default_model_hint).map_err(ClawdMuxError::Io)?;
-    writer.flush().map_err(ClawdMuxError::Io)?;
-
-    let mut model_input = String::new();
-    reader
-        .read_line(&mut model_input)
-        .map_err(ClawdMuxError::Io)?;
-    let model = {
-        let trimmed = model_input.trim();
-        if trimmed.is_empty() {
-            default_model_hint.to_string()
-        } else {
-            trimmed.to_string()
-        }
-    };
-
-    write!(writer, "API key: ").map_err(ClawdMuxError::Io)?;
-    writer.flush().map_err(ClawdMuxError::Io)?;
-
-    let mut api_key_input = String::new();
-    reader
-        .read_line(&mut api_key_input)
-        .map_err(ClawdMuxError::Io)?;
-    let api_key = api_key_input.trim().to_string();
-
-    if api_key.is_empty() {
-        return Err(ClawdMuxError::Internal(
-            "API key must not be empty".to_string(),
-        ));
+        other => Err(ClawdMuxError::Internal(format!(
+            "invalid backend choice: {}",
+            other
+        ))),
     }
-
-    let provider_config = ProviderConfig {
-        api_key,
-        default_model: model,
-    };
-
-    config.provider = ProviderSection {
-        default: provider_name.to_string(),
-        anthropic: if provider_name == "anthropic" {
-            Some(provider_config.clone())
-        } else {
-            None
-        },
-        openai: if provider_name == "openai" {
-            Some(provider_config.clone())
-        } else {
-            None
-        },
-        google: if provider_name == "google" {
-            Some(provider_config.clone())
-        } else {
-            None
-        },
-        openrouter: if provider_name == "openrouter" {
-            Some(provider_config)
-        } else {
-            None
-        },
-    };
-
-    config.save(global_config_path)?;
-    tracing::info!(path = %global_config_path.display(), "global config saved");
-    Ok(())
 }
 
 /// Writes built-in agent definition files to `.opencode/agents/clawdmux/`.
@@ -386,7 +322,17 @@ pub fn run_update_agents(project_root: &Path, _args: &UpdateAgentsArgs) -> Resul
 ///
 /// All paths are created only if absent, except agent definition files which
 /// are also overwritten when `args.reset_agents` is `true`.
-pub(crate) fn scaffold_project(project_root: &Path, args: &InitArgs) -> Result<()> {
+///
+/// # Arguments
+/// * `backend` – the agent backend to record in `.clawdmux/config.toml`.
+/// * `kiro_binary` – optional explicit path to the kiro binary; written to the
+///   config only when `backend` is [`BackendKind::Kiro`] and a path is given.
+pub(crate) fn scaffold_project(
+    project_root: &Path,
+    args: &InitArgs,
+    backend: &BackendKind,
+    kiro_binary: Option<&str>,
+) -> Result<()> {
     tracing::info!("scaffolding project");
 
     // .clawdmux/config.toml
@@ -394,7 +340,8 @@ pub(crate) fn scaffold_project(project_root: &Path, args: &InitArgs) -> Result<(
     let project_config_path = clawdmux_dir.join("config.toml");
     if !project_config_path.exists() {
         std::fs::create_dir_all(&clawdmux_dir).map_err(ClawdMuxError::Io)?;
-        std::fs::write(&project_config_path, DEFAULT_PROJECT_CONFIG).map_err(ClawdMuxError::Io)?;
+        let config_content = make_project_config_content(backend, kiro_binary);
+        std::fs::write(&project_config_path, config_content).map_err(ClawdMuxError::Io)?;
         tracing::info!(path = %project_config_path.display(), "created project config");
     }
 
@@ -435,7 +382,102 @@ pub(crate) fn scaffold_project(project_root: &Path, args: &InitArgs) -> Result<(
         }
     }
 
+    // .kiro/agents/ — scaffold kiro agent JSON configs (does not overwrite existing).
+    scaffold_kiro_agents(project_root, args.reset_agents)?;
+
     Ok(())
+}
+
+/// Scaffolds kiro agent JSON config files in `.kiro/agents/`.
+///
+/// Creates one JSON config file per pipeline agent using the agent's
+/// embedded system prompt (stripped of YAML frontmatter).  Existing files
+/// are not overwritten unless `reset` is `true`.
+///
+/// Returns the number of agent config files written.
+///
+/// # Errors
+///
+/// Returns [`ClawdMuxError::Io`] if the directory cannot be created or a
+/// file cannot be written.
+pub fn scaffold_kiro_agents(project_root: &Path, reset: bool) -> Result<usize> {
+    let agents_dir = project_root.join(".kiro").join("agents");
+    std::fs::create_dir_all(&agents_dir).map_err(ClawdMuxError::Io)?;
+
+    let mut count = 0usize;
+    for agent in AgentKind::all() {
+        let agent_name = agent.kiro_agent_name();
+        let file_name = format!("{}.json", agent_name);
+        let file_path = agents_dir.join(&file_name);
+        if file_path.exists() && !reset {
+            continue;
+        }
+        let json = build_kiro_agent_json(agent);
+        std::fs::write(&file_path, json).map_err(ClawdMuxError::Io)?;
+        tracing::info!(path = %file_path.display(), "wrote kiro agent config");
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Builds the JSON config string for a single kiro agent.
+fn build_kiro_agent_json(agent: &AgentKind) -> String {
+    let name = agent.kiro_agent_name();
+    let description = format!("ClawdMux {} Agent", agent.display_name());
+
+    // Extract system prompt by stripping YAML frontmatter from the embedded .md.
+    let prompt = agent_definition_content(agent)
+        .map(strip_frontmatter)
+        .unwrap_or_default();
+
+    // Escape the prompt for JSON embedding.
+    let prompt_json = serde_json::to_string(&prompt).unwrap_or_else(|_| "\"\"".to_string());
+
+    // Determine tool set and model based on agent role.
+    // `tools` declares which tools are available; `allowed_tools` are auto-approved without user
+    // prompting. When kiro runs headlessly it does not send session/request_permission for tools
+    // outside allowedTools -- it silently auto-runs them. To ensure agents use the native write
+    // tool (rather than falling back to `cat > file` via shell), write is auto-approved.
+    // shell is kept available but not auto-approved; kiro will prompt or auto-run it depending
+    // on its own headless-mode behaviour.
+    //
+    // Tool names here are kiro-cli built-in names (write, shell, glob, grep, thinking),
+    // NOT the ACP protocol-level tool kind names (edit, execute, search, think).
+    let (tools_json, allowed_tools_json, model) = match agent {
+        AgentKind::Implementation => (
+            r#"["read","write","glob","grep","shell","thinking"]"#,
+            r#"["read","write","glob","grep","thinking"]"#,
+            "claude-sonnet-4-6",
+        ),
+        AgentKind::Planning | AgentKind::CodeQuality | AgentKind::CodeReview => (
+            r#"["read","write","glob","grep","shell","thinking"]"#,
+            r#"["read","write","glob","grep","thinking"]"#,
+            "claude-sonnet-4-6",
+        ),
+        _ => (
+            r#"["read","glob","grep","thinking"]"#,
+            r#"["read","glob","grep","thinking"]"#,
+            "claude-sonnet-4-6",
+        ),
+    };
+
+    format!(
+        "{{\n  \"name\": \"{name}\",\n  \"description\": \"{description}\",\n  \"prompt\": {prompt_json},\n  \"model\": \"{model}\",\n  \"tools\": {tools_json},\n  \"allowedTools\": {allowed_tools_json},\n  \"resources\": [\"file://CLAUDE.md\"]\n}}\n"
+    )
+}
+
+/// Strips the YAML frontmatter block (`---` ... `---`) from an agent definition.
+///
+/// Returns the body text after the closing `---`, trimmed of leading whitespace.
+/// If no frontmatter is present, the full content is returned unchanged.
+fn strip_frontmatter(content: &str) -> &str {
+    let Some(after_open) = content.strip_prefix("---") else {
+        return content;
+    };
+    let Some(close_pos) = after_open.find("\n---") else {
+        return content;
+    };
+    after_open[close_pos + 4..].trim_start()
 }
 
 /// Returns the filename (e.g. `"code-quality.md"`) for an agent definition,
@@ -468,12 +510,35 @@ fn agent_definition_content(agent: &AgentKind) -> Option<&'static str> {
     }
 }
 
-/// Default content written to `.clawdmux/config.toml` during scaffold.
-const DEFAULT_PROJECT_CONFIG: &str = r#"[opencode]
-mode = "auto"
-hostname = "127.0.0.1"
-port = 4096
-"#;
+/// Generates the content for `.clawdmux/config.toml` based on the chosen backend.
+///
+/// The OpenCode section is always included (used for task-fix requests regardless
+/// of backend). The `backend` key is omitted when it equals the default (`opencode`)
+/// to keep the config minimal.
+fn make_project_config_content(backend: &BackendKind, kiro_binary: Option<&str>) -> String {
+    let mut out = String::new();
+
+    if matches!(backend, BackendKind::Kiro) {
+        out.push_str("backend = \"kiro\"\n\n");
+        out.push_str("[kiro]\n");
+        match kiro_binary {
+            Some(path) => {
+                out.push_str(&format!("binary = \"{}\"\n", path));
+            }
+            None => {
+                out.push_str("# binary = \"/path/to/kiro\"  # uncomment to set an explicit path\n");
+            }
+        }
+        out.push('\n');
+    }
+
+    out.push_str("[opencode]\n");
+    out.push_str("mode = \"auto\"\n");
+    out.push_str("hostname = \"127.0.0.1\"\n");
+    out.push_str("port = 4096\n");
+
+    out
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -484,7 +549,6 @@ mod tests {
     use std::io;
 
     use super::*;
-    use crate::config::providers::{ProviderConfig, ProviderSection};
     use tempfile::TempDir;
 
     // --- extract_model_from_frontmatter tests ---
@@ -545,150 +609,19 @@ mod tests {
         }
     }
 
-    /// Write a minimal pre-configured global config to `path` so that
-    /// `configure_provider_from_reader` returns immediately (no prompts).
-    fn write_global_config(path: &Path) {
-        let dir = path.parent().unwrap();
-        std::fs::create_dir_all(dir).unwrap();
-        let config = GlobalConfig {
-            provider: ProviderSection {
-                default: "anthropic".to_string(),
-                anthropic: Some(ProviderConfig {
-                    api_key: "sk-ant-test".to_string(),
-                    default_model: "claude-sonnet-4-5".to_string(),
-                }),
-                openai: None,
-                google: None,
-                openrouter: None,
-            },
-            opencode_password: None,
-        };
-        config.save(path).unwrap();
-    }
-
-    // --- configure_provider_from_reader tests ---
-
-    #[test]
-    fn test_configure_provider_invalid_choice() {
-        let dir = TempDir::new().unwrap();
-        let global_path = dir.path().join("config.toml");
-        // No existing config; provider.default is empty.
-        let mut reader = io::Cursor::new(b"5\n".as_ref());
-        let mut writer = io::Cursor::new(Vec::new());
-
-        let result = configure_provider_from_reader(&global_path, &mut reader, &mut writer);
-        assert!(
-            matches!(result, Err(ClawdMuxError::Internal(_))),
-            "expected Internal error for invalid choice, got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_configure_provider_empty_api_key() {
-        let dir = TempDir::new().unwrap();
-        let global_path = dir.path().join("config.toml");
-        // provider=1 (anthropic), model=empty (accept default), api_key=empty
-        let mut reader = io::Cursor::new(b"1\n\n\n".as_ref());
-        let mut writer = io::Cursor::new(Vec::new());
-
-        let result = configure_provider_from_reader(&global_path, &mut reader, &mut writer);
-        assert!(
-            matches!(result, Err(ClawdMuxError::Internal(_))),
-            "expected Internal error for empty API key, got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_configure_provider_happy_path_anthropic() {
-        let dir = TempDir::new().unwrap();
-        let global_path = dir.path().join("config.toml");
-        // provider=1, model override, api_key set
-        let mut reader = io::Cursor::new(b"1\nclaude-opus-4-6\nsk-ant-test-key\n".as_ref());
-        let mut writer = io::Cursor::new(Vec::new());
-
-        configure_provider_from_reader(&global_path, &mut reader, &mut writer).unwrap();
-
-        let config = GlobalConfig::load(&global_path).unwrap();
-        assert_eq!(config.provider.default, "anthropic");
-        let ant = config.provider.anthropic.unwrap();
-        assert_eq!(ant.api_key, "sk-ant-test-key");
-        assert_eq!(ant.default_model, "claude-opus-4-6");
-        assert!(config.provider.openai.is_none());
-        assert!(config.provider.google.is_none());
-    }
-
-    #[test]
-    fn test_configure_provider_happy_path_uses_default_model() {
-        let dir = TempDir::new().unwrap();
-        let global_path = dir.path().join("config.toml");
-        // provider=2 (openai), empty model line -> should use "gpt-4o"
-        let mut reader = io::Cursor::new(b"2\n\nsk-openai-key\n".as_ref());
-        let mut writer = io::Cursor::new(Vec::new());
-
-        configure_provider_from_reader(&global_path, &mut reader, &mut writer).unwrap();
-
-        let config = GlobalConfig::load(&global_path).unwrap();
-        assert_eq!(config.provider.default, "openai");
-        let oai = config.provider.openai.unwrap();
-        assert_eq!(oai.default_model, "gpt-4o");
-        assert_eq!(oai.api_key, "sk-openai-key");
-    }
-
-    #[test]
-    fn test_configure_provider_happy_path_openrouter() {
-        let dir = TempDir::new().unwrap();
-        let global_path = dir.path().join("config.toml");
-        // provider=4 (openrouter), empty model line -> should use default, api_key set
-        let mut reader =
-            io::Cursor::new(b"4\nopenrouter/openrouter/auto\nsk-or-test-key\n".as_ref());
-        let mut writer = io::Cursor::new(Vec::new());
-
-        configure_provider_from_reader(&global_path, &mut reader, &mut writer).unwrap();
-
-        let config = GlobalConfig::load(&global_path).unwrap();
-        assert_eq!(config.provider.default, "openrouter");
-        let or_cfg = config.provider.openrouter.unwrap();
-        assert_eq!(or_cfg.api_key, "sk-or-test-key");
-        assert_eq!(or_cfg.default_model, "openrouter/openrouter/auto");
-        assert!(config.provider.anthropic.is_none());
-        assert!(config.provider.openai.is_none());
-        assert!(config.provider.google.is_none());
-    }
-
-    #[test]
-    fn test_configure_provider_already_configured() {
-        let dir = TempDir::new().unwrap();
-        let global_path = dir.path().join("config.toml");
-        write_global_config(&global_path);
-
-        // Empty reader: the function must return without reading anything.
-        let mut reader = io::Cursor::new(b"".as_ref());
-        let mut writer = io::Cursor::new(Vec::new());
-
-        configure_provider_from_reader(&global_path, &mut reader, &mut writer).unwrap();
-
-        // Config must be unchanged.
-        let config = GlobalConfig::load(&global_path).unwrap();
-        assert_eq!(config.provider.default, "anthropic");
-    }
-
     // --- scaffold tests ---
 
     #[test]
     fn test_scaffold_creates_config() {
-        let global_dir = TempDir::new().unwrap();
         let project_dir = TempDir::new().unwrap();
-        let global_path = global_dir.path().join("config.toml");
-        write_global_config(&global_path);
 
         run_init_with_paths(
-            &global_path,
             project_dir.path(),
             &InitArgs {
                 reset_agents: false,
             },
+            BackendKind::OpenCode,
+            None,
         )
         .unwrap();
 
@@ -700,17 +633,15 @@ mod tests {
 
     #[test]
     fn test_scaffold_creates_tasks_dir() {
-        let global_dir = TempDir::new().unwrap();
         let project_dir = TempDir::new().unwrap();
-        let global_path = global_dir.path().join("config.toml");
-        write_global_config(&global_path);
 
         run_init_with_paths(
-            &global_path,
             project_dir.path(),
             &InitArgs {
                 reset_agents: false,
             },
+            BackendKind::OpenCode,
+            None,
         )
         .unwrap();
 
@@ -735,10 +666,7 @@ mod tests {
 
     #[test]
     fn test_scaffold_does_not_overwrite_existing_task_files() {
-        let global_dir = TempDir::new().unwrap();
         let project_dir = TempDir::new().unwrap();
-        let global_path = global_dir.path().join("config.toml");
-        write_global_config(&global_path);
 
         // Pre-create tasks/ and write custom content into one seed file.
         let tasks_dir = project_dir.path().join("tasks");
@@ -747,11 +675,12 @@ mod tests {
         std::fs::write(&existing_path, "custom content").unwrap();
 
         run_init_with_paths(
-            &global_path,
             project_dir.path(),
             &InitArgs {
                 reset_agents: false,
             },
+            BackendKind::OpenCode,
+            None,
         )
         .unwrap();
 
@@ -764,17 +693,15 @@ mod tests {
 
     #[test]
     fn test_scaffold_creates_all_agent_files() {
-        let global_dir = TempDir::new().unwrap();
         let project_dir = TempDir::new().unwrap();
-        let global_path = global_dir.path().join("config.toml");
-        write_global_config(&global_path);
 
         run_init_with_paths(
-            &global_path,
             project_dir.path(),
             &InitArgs {
                 reset_agents: false,
             },
+            BackendKind::OpenCode,
+            None,
         )
         .unwrap();
 
@@ -798,16 +725,13 @@ mod tests {
 
     #[test]
     fn test_scaffold_idempotent() {
-        let global_dir = TempDir::new().unwrap();
         let project_dir = TempDir::new().unwrap();
-        let global_path = global_dir.path().join("config.toml");
-        write_global_config(&global_path);
 
         let args = InitArgs {
             reset_agents: false,
         };
-        run_init_with_paths(&global_path, project_dir.path(), &args).unwrap();
-        run_init_with_paths(&global_path, project_dir.path(), &args).unwrap();
+        run_init_with_paths(project_dir.path(), &args, BackendKind::OpenCode, None).unwrap();
+        run_init_with_paths(project_dir.path(), &args, BackendKind::OpenCode, None).unwrap();
 
         let agents_dir = project_dir.path().join(".opencode/agents/clawdmux");
         for agent in AgentKind::all() {
@@ -822,17 +746,15 @@ mod tests {
 
     #[test]
     fn test_reset_agents_overwrites() {
-        let global_dir = TempDir::new().unwrap();
         let project_dir = TempDir::new().unwrap();
-        let global_path = global_dir.path().join("config.toml");
-        write_global_config(&global_path);
 
         run_init_with_paths(
-            &global_path,
             project_dir.path(),
             &InitArgs {
                 reset_agents: false,
             },
+            BackendKind::OpenCode,
+            None,
         )
         .unwrap();
 
@@ -846,9 +768,10 @@ mod tests {
         );
 
         run_init_with_paths(
-            &global_path,
             project_dir.path(),
             &InitArgs { reset_agents: true },
+            BackendKind::OpenCode,
+            None,
         )
         .unwrap();
 
@@ -915,6 +838,247 @@ mod tests {
                 file_path.exists(),
                 "agent file {} should exist after run_update_agents",
                 file_path.display()
+            );
+        }
+    }
+
+    // --- scaffold_kiro_agents tests ---
+
+    #[test]
+    fn test_scaffold_kiro_agents_creates_all_files() {
+        let project_dir = TempDir::new().unwrap();
+
+        let count = scaffold_kiro_agents(project_dir.path(), false).unwrap();
+        assert_eq!(count, 7, "should write exactly 7 kiro agent config files");
+
+        let agents_dir = project_dir.path().join(".kiro/agents");
+        for agent in AgentKind::all() {
+            let file_name = format!("{}.json", agent.kiro_agent_name());
+            let file_path = agents_dir.join(&file_name);
+            assert!(
+                file_path.exists(),
+                "kiro agent file {} should exist",
+                file_path.display()
+            );
+            let content = std::fs::read_to_string(&file_path).unwrap();
+            // Verify it is valid JSON and contains the agent name.
+            let parsed: serde_json::Value =
+                serde_json::from_str(&content).expect("kiro agent config should be valid JSON");
+            assert_eq!(
+                parsed["name"].as_str(),
+                Some(agent.kiro_agent_name()),
+                "name field should match kiro_agent_name"
+            );
+            assert!(
+                parsed["model"].as_str().is_some(),
+                "model field should be present"
+            );
+            assert!(parsed["tools"].is_array(), "tools field should be an array");
+        }
+    }
+
+    #[test]
+    fn test_scaffold_kiro_agents_does_not_overwrite_without_reset() {
+        let project_dir = TempDir::new().unwrap();
+
+        scaffold_kiro_agents(project_dir.path(), false).unwrap();
+
+        let intake_path = project_dir.path().join(".kiro/agents/clawdmux-intake.json");
+        std::fs::write(&intake_path, "custom content").unwrap();
+
+        // Second call without reset should NOT overwrite.
+        let count = scaffold_kiro_agents(project_dir.path(), false).unwrap();
+        assert_eq!(count, 0, "no files should be written when all exist");
+
+        let content = std::fs::read_to_string(&intake_path).unwrap();
+        assert_eq!(
+            content, "custom content",
+            "existing file should not be overwritten"
+        );
+    }
+
+    #[test]
+    fn test_scaffold_kiro_agents_reset_overwrites() {
+        let project_dir = TempDir::new().unwrap();
+
+        scaffold_kiro_agents(project_dir.path(), false).unwrap();
+
+        let intake_path = project_dir.path().join(".kiro/agents/clawdmux-intake.json");
+        std::fs::write(&intake_path, "corrupted content").unwrap();
+
+        // Call with reset=true should overwrite.
+        scaffold_kiro_agents(project_dir.path(), true).unwrap();
+
+        let content = std::fs::read_to_string(&intake_path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("restored file should be valid JSON");
+        assert_eq!(
+            parsed["name"].as_str(),
+            Some(AgentKind::Intake.kiro_agent_name()),
+            "restored file should have correct name"
+        );
+    }
+
+    #[test]
+    fn test_strip_frontmatter_with_frontmatter() {
+        let content = "---\nmodel: claude-sonnet-4-6\n---\n\nBody text.";
+        let body = strip_frontmatter(content);
+        assert_eq!(body, "Body text.");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_without_frontmatter() {
+        let content = "No frontmatter here.";
+        let body = strip_frontmatter(content);
+        assert_eq!(body, "No frontmatter here.");
+    }
+
+    // --- select_backend_from_reader tests ---
+
+    #[test]
+    fn test_select_backend_opencode_explicit() {
+        let mut reader = io::Cursor::new(b"1\n".as_ref());
+        let mut writer = io::Cursor::new(Vec::new());
+        let (backend, binary) = select_backend_from_reader(&mut reader, &mut writer).unwrap();
+        assert!(matches!(backend, BackendKind::OpenCode));
+        assert!(binary.is_none());
+    }
+
+    #[test]
+    fn test_select_backend_opencode_default_empty_input() {
+        let mut reader = io::Cursor::new(b"\n".as_ref());
+        let mut writer = io::Cursor::new(Vec::new());
+        let (backend, binary) = select_backend_from_reader(&mut reader, &mut writer).unwrap();
+        assert!(matches!(backend, BackendKind::OpenCode));
+        assert!(binary.is_none());
+    }
+
+    #[test]
+    fn test_select_backend_kiro_no_binary_path() {
+        // Simulate kiro NOT on PATH by using the binary prompt path.
+        // We feed "2\n" for the backend, then "\n" for the binary path (blank = use PATH).
+        // Note: in test environments kiro may or may not be on PATH, so we test the
+        // full input: if kiro is on PATH the binary prompt is skipped; if not, blank = None.
+        let mut reader = io::Cursor::new(b"2\n\n".as_ref());
+        let mut writer = io::Cursor::new(Vec::new());
+        let (backend, _binary) = select_backend_from_reader(&mut reader, &mut writer).unwrap();
+        assert!(matches!(backend, BackendKind::Kiro));
+        // binary may be None (kiro on PATH) or None (blank input) -- both are acceptable.
+    }
+
+    #[test]
+    fn test_select_backend_kiro_explicit_binary_path() {
+        // Feed "2\n" for backend, then a path for the binary.
+        // This only exercises the explicit-path branch when kiro is not on PATH.
+        // Since the test environment may have kiro on PATH we check the result:
+        // if kiro is on PATH, no binary prompt appears (binary = None);
+        // if not, the provided path is returned.
+        let mut reader = io::Cursor::new(b"2\n/usr/local/bin/kiro\n".as_ref());
+        let mut writer = io::Cursor::new(Vec::new());
+        let (backend, _binary) = select_backend_from_reader(&mut reader, &mut writer).unwrap();
+        assert!(matches!(backend, BackendKind::Kiro));
+    }
+
+    #[test]
+    fn test_select_backend_invalid_choice() {
+        let mut reader = io::Cursor::new(b"5\n".as_ref());
+        let mut writer = io::Cursor::new(Vec::new());
+        let result = select_backend_from_reader(&mut reader, &mut writer);
+        assert!(
+            matches!(result, Err(ClawdMuxError::Internal(_))),
+            "expected Internal error for invalid choice, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_select_backend_prompts_contain_expected_text() {
+        let mut reader = io::Cursor::new(b"1\n".as_ref());
+        let mut writer = io::Cursor::new(Vec::new());
+        select_backend_from_reader(&mut reader, &mut writer).unwrap();
+        let output = String::from_utf8(writer.into_inner()).unwrap();
+        assert!(
+            output.contains("OpenCode"),
+            "prompt should mention OpenCode, got: {:?}",
+            output
+        );
+        assert!(
+            output.contains("Kiro"),
+            "prompt should mention Kiro, got: {:?}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_make_project_config_opencode_omits_backend_key() {
+        let content = make_project_config_content(&BackendKind::OpenCode, None);
+        assert!(
+            !content.contains("backend ="),
+            "OpenCode config should omit backend key, got: {:?}",
+            content
+        );
+        assert!(
+            content.contains("[opencode]"),
+            "OpenCode config should include [opencode] section"
+        );
+    }
+
+    #[test]
+    fn test_make_project_config_kiro_with_binary() {
+        let content = make_project_config_content(&BackendKind::Kiro, Some("/usr/local/bin/kiro"));
+        assert!(
+            content.contains("backend = \"kiro\""),
+            "Kiro config should set backend key"
+        );
+        assert!(
+            content.contains("binary = \"/usr/local/bin/kiro\""),
+            "Kiro config should set binary path"
+        );
+        assert!(
+            content.contains("[opencode]"),
+            "Kiro config should still include [opencode] section"
+        );
+    }
+
+    #[test]
+    fn test_make_project_config_kiro_without_binary() {
+        let content = make_project_config_content(&BackendKind::Kiro, None);
+        assert!(
+            content.contains("backend = \"kiro\""),
+            "Kiro config should set backend key"
+        );
+        assert!(
+            content.contains("# binary ="),
+            "Kiro config should include commented binary hint"
+        );
+    }
+
+    #[test]
+    fn test_scaffold_kiro_included_in_init() {
+        let project_dir = TempDir::new().unwrap();
+
+        run_init_with_paths(
+            project_dir.path(),
+            &InitArgs {
+                reset_agents: false,
+            },
+            BackendKind::OpenCode,
+            None,
+        )
+        .unwrap();
+
+        // Kiro agents should be created alongside opencode agents.
+        let kiro_agents_dir = project_dir.path().join(".kiro/agents");
+        assert!(
+            kiro_agents_dir.is_dir(),
+            ".kiro/agents/ should be created by init"
+        );
+        for agent in AgentKind::all() {
+            let file_name = format!("{}.json", agent.kiro_agent_name());
+            assert!(
+                kiro_agents_dir.join(&file_name).exists(),
+                "kiro agent file {} should be created by init",
+                file_name
             );
         }
     }

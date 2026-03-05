@@ -215,6 +215,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_pretty_printed_json() {
+        let text = "Some preamble text.\n\n{\n  \"action\": \"complete\",\n  \"summary\": \"Done\",\n  \"updates\": {\n    \"implementation_plan\": \"Step 1\"\n  }\n}";
+        let resp = parse_response(text).expect("should parse pretty-printed JSON");
+        if let AgentResponse::Complete {
+            ref summary,
+            updates: Some(ref u),
+            ..
+        } = resp
+        {
+            assert_eq!(summary, "Done");
+            assert_eq!(u.implementation_plan.as_deref(), Some("Step 1"));
+        } else {
+            panic!("expected Complete with updates, got {resp:?}");
+        }
+    }
+
+    #[test]
     fn test_parse_no_json() {
         let text = "I could not complete the task.";
         let result = parse_response(text);
@@ -235,20 +252,17 @@ mod tests {
         assert!(result.is_err(), "unknown action should fail to parse");
     }
 
+    /// Verifies that a false `"action"` match in prose after the real JSON is skipped.
+    ///
+    /// The parser scans occurrences of `"action"` from last to first, so even though
+    /// the last occurrence is in prose (not in a valid JSON object), it must fall back
+    /// to the earlier occurrence that is the genuine agent response.
     #[test]
-    fn test_parse_pretty_printed_json() {
-        let text = "Some preamble text.\n\n{\n  \"action\": \"complete\",\n  \"summary\": \"Done\",\n  \"updates\": {\n    \"implementation_plan\": \"Step 1\"\n  }\n}";
-        let resp = parse_response(text).expect("should parse pretty-printed JSON");
-        if let AgentResponse::Complete {
-            ref summary,
-            updates: Some(ref u),
-            ..
-        } = resp
-        {
-            assert_eq!(summary, "Done");
-            assert_eq!(u.implementation_plan.as_deref(), Some("Step 1"));
-        } else {
-            panic!("expected Complete with updates, got {resp:?}");
-        }
+    fn test_parse_action_in_prose_after_json() {
+        let text =
+            r#"{"action":"complete","summary":"done"} The action described above is finished."#;
+        let resp = parse_response(text).expect("should parse despite prose action");
+        assert!(matches!(resp, AgentResponse::Complete { ref summary, .. } if summary == "done"));
     }
+
 }

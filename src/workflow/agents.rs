@@ -59,6 +59,23 @@ impl AgentKind {
         }
     }
 
+    /// Returns the kiro-cli agent name string for this variant.
+    ///
+    /// Kiro agents are named `"clawdmux-<stage>"` and correspond to JSON config
+    /// files in `.kiro/agents/` scaffolded by `clawdmux init`.
+    pub fn kiro_agent_name(&self) -> &str {
+        match self {
+            AgentKind::Intake => "clawdmux-intake",
+            AgentKind::Design => "clawdmux-design",
+            AgentKind::Planning => "clawdmux-planning",
+            AgentKind::Implementation => "clawdmux-implementation",
+            AgentKind::CodeQuality => "clawdmux-code-quality",
+            AgentKind::SecurityReview => "clawdmux-security-review",
+            AgentKind::CodeReview => "clawdmux-code-review",
+            AgentKind::Human => "human",
+        }
+    }
+
     /// Returns the zero-based index of this agent in the pipeline.
     ///
     /// `Intake` is 0, `CodeReview` is 6. `Human` returns 7 (outside the pipeline).
@@ -434,5 +451,29 @@ mod tests {
     #[test]
     fn test_human_from_str() {
         assert_eq!("human".parse::<AgentKind>().unwrap(), AgentKind::Human);
+    }
+
+    #[test]
+    fn test_kiro_agent_name() {
+        assert_eq!(AgentKind::Intake.kiro_agent_name(), "clawdmux-intake");
+        assert_eq!(AgentKind::Design.kiro_agent_name(), "clawdmux-design");
+        assert_eq!(AgentKind::Planning.kiro_agent_name(), "clawdmux-planning");
+        assert_eq!(
+            AgentKind::Implementation.kiro_agent_name(),
+            "clawdmux-implementation"
+        );
+        assert_eq!(
+            AgentKind::CodeQuality.kiro_agent_name(),
+            "clawdmux-code-quality"
+        );
+        assert_eq!(
+            AgentKind::SecurityReview.kiro_agent_name(),
+            "clawdmux-security-review"
+        );
+        assert_eq!(
+            AgentKind::CodeReview.kiro_agent_name(),
+            "clawdmux-code-review"
+        );
+        assert_eq!(AgentKind::Human.kiro_agent_name(), "human");
     }
 }
