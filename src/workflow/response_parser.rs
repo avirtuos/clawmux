@@ -95,7 +95,7 @@ fn extract_balanced_json(s: &str) -> Option<&str> {
 /// The function first tries to parse `text` directly as an [`AgentResponse`].
 /// If that fails, it scans backwards through all occurrences of `"action"`,
 /// backtracks to the nearest enclosing `{`, and tries to extract and parse
-/// the balanced-brace JSON object starting there.  Scanning all occurrences
+/// the balanced-brace JSON object starting there. Scanning all occurrences
 /// (last to first) handles both compact JSON (`{"action":`) and pretty-printed
 /// JSON, and correctly skips false matches where `"action"` appears in
 /// ordinary prose after the real JSON object.
@@ -264,4 +264,5 @@ mod tests {
         let resp = parse_response(text).expect("should parse despite prose action");
         assert!(matches!(resp, AgentResponse::Complete { ref summary, .. } if summary == "done"));
     }
+
 }

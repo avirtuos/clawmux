@@ -688,6 +688,17 @@ impl App {
                 self.tab2_state
                     .push_banner(&task_id, format!("[Commit] Committing: {}", first_line));
 
+                // Set the task status to Completed and persist it to disk BEFORE staging.
+                // This ensures the committed file already has the final status so that
+                // CommitCompleted's set_status call is a no-op, avoiding a spurious
+                // post-commit modification that would show up as an unstaged change.
+                if let Some(task) = self.task_store.get_mut(&task_id) {
+                    task.set_status(TaskStatus::Completed, AgentKind::Human);
+                }
+                if let Err(e) = self.task_store.persist(&task_id) {
+                    tracing::warn!("Failed to persist task before commit staging: {}", e);
+                }
+
                 // Include the task's own markdown file so status/work-log changes are committed.
                 if let Some(task) = self.task_store.get(&task_id) {
                     let task_path = task.file_path.to_string_lossy().to_string();
@@ -1119,15 +1130,30 @@ impl App {
                 session_id,
                 error,
             } => {
-                // Guard: only act if the workflow engine still has this exact session
-                // in the Running phase. If the session already completed or moved on,
-                // this is a stale verification and should be ignored.
-                let is_active = self.workflow_engine.state(&task_id).is_some_and(|s| {
-                    s.session_id.as_deref() == Some(&session_id)
-                        && s.phase == WorkflowPhase::Running
-                });
-                if is_active {
+                let wf_session = self
+                    .workflow_engine
+                    .state(&task_id)
+                    .and_then(|s| s.session_id.clone());
+                let session_matches = wf_session.as_deref() == Some(&session_id);
+
+                // Always clear the awaiting spinner when the session ID matches,
+                // even if the phase is no longer Running (e.g. already Errored).
+                // This prevents stale prompt_sent_at entries from causing indefinite
+                // liveness polls after a session fails silently.
+                // Do NOT clear when the session ID differs: the task may have been
+                // restarted and a new session is now actively awaiting.
+                if session_matches {
                     self.tab2_state.clear_awaiting(&task_id);
+                }
+
+                // Only escalate to SessionError if the workflow is still expecting
+                // a response from this exact session (Running phase).
+                let is_active = session_matches
+                    && self
+                        .workflow_engine
+                        .state(&task_id)
+                        .is_some_and(|s| s.phase == WorkflowPhase::Running);
+                if is_active {
                     vec![AppMessage::SessionError {
                         task_id,
                         session_id,
@@ -1167,9 +1193,16 @@ impl App {
                 task_id,
                 input_tokens,
                 output_tokens,
+                is_cumulative,
+                step_id,
             } => {
-                self.tab2_state
-                    .update_tokens(&task_id, input_tokens, output_tokens);
+                self.tab2_state.update_tokens(
+                    &task_id,
+                    input_tokens,
+                    output_tokens,
+                    is_cumulative,
+                    step_id.as_deref(),
+                );
                 vec![]
             }
 

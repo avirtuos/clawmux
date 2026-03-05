@@ -37,12 +37,14 @@ pub struct EventStreamConsumer {
     session_map: SessionMap,
     /// Accumulated assistant text per session ID, drained on session completion.
     accumulated_text: HashMap<String, String>,
-    /// Longest non-empty text seen per session.
+    /// Last text seen per session that contains the `"action"` key.
     ///
     /// Unlike `accumulated_text` (which reflects the latest snapshot for streaming
-    /// display and can be overwritten by empty user-message events), this preserves
-    /// the longest text seen so that the structured JSON response is available when
-    /// `SessionCompleted` fires.
+    /// display and can be overwritten by empty user-message events), this is only
+    /// updated when the text looks like an agent response (contains `"action"`).
+    /// This prevents large user-message context prompts -- which arrive before the
+    /// agent replies and can be far longer than the short JSON response -- from
+    /// polluting the response captured at `SessionCompleted`.
     best_response_text: HashMap<String, String>,
     /// Per-(session, message) accumulated delta text for streaming display.
     ///
@@ -121,7 +123,7 @@ impl EventStreamConsumer {
                     Ok(Event::Message(msg)) => {
                         // opencode wraps all events in {"payload":{"type":"<name>","properties":{...}}}.
                         // The SSE event: field is always "message" and carries no type info.
-                        tracing::debug!(
+                        tracing::trace!(
                             "SSE raw: event='{}', data_len={}",
                             msg.event,
                             msg.data.len()
@@ -247,14 +249,12 @@ impl EventStreamConsumer {
                     }) {
                         self.accumulated_text
                             .insert(session_id.clone(), text.clone());
-                        // Preserve the longest text seen so empty user-message events
-                        // cannot overwrite the structured JSON response.
-                        if text.len()
-                            > self
-                                .best_response_text
-                                .get(&session_id)
-                                .map_or(0, |t| t.len())
-                        {
+                        // Only track in best_response_text when the text looks like an
+                        // agent response. User-message context prompts can be much longer
+                        // than the agent's short JSON reply, so a length-based heuristic
+                        // would pick the wrong text. Checking for "action" ensures we
+                        // only store genuine agent responses here.
+                        if text.contains("\"action\"") {
                             self.best_response_text.insert(session_id.clone(), text);
                         }
                     }
@@ -291,12 +291,7 @@ impl EventStreamConsumer {
                         };
                         self.accumulated_text
                             .insert(session_id.clone(), full_text.clone());
-                        if full_text.len()
-                            > self
-                                .best_response_text
-                                .get(&session_id)
-                                .map_or(0, |t| t.len())
-                        {
+                        if full_text.contains("\"action\"") {
                             self.best_response_text
                                 .insert(session_id.clone(), full_text.clone());
                         }
@@ -488,6 +483,8 @@ impl EventStreamConsumer {
                 session_id,
                 input_tokens,
                 output_tokens,
+                is_cumulative,
+                step_id,
             } => {
                 let task_id = {
                     let map = self.session_map.read().await;
@@ -498,6 +495,8 @@ impl EventStreamConsumer {
                         task_id,
                         input_tokens,
                         output_tokens,
+                        is_cumulative,
+                        step_id,
                     })
                     .await?;
                 } else {
@@ -830,10 +829,13 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
                     let output = part["tokens"]["output"].as_u64();
                     if let (Some(sid), Some(inp), Some(out)) = (session_id, input, output) {
                         if inp > 0 || out > 0 {
+                            let step_id = part["id"].as_str().map(str::to_string);
                             return OpenCodeEvent::TokensUpdated {
                                 session_id: sid.to_string(),
                                 input_tokens: inp,
                                 output_tokens: out,
+                                is_cumulative: false,
+                                step_id,
                             };
                         }
                     }
@@ -918,6 +920,8 @@ fn parse_wire_event(json_data: &str) -> OpenCodeEvent {
                         session_id: sid.to_string(),
                         input_tokens: inp,
                         output_tokens: out,
+                        is_cumulative: true,
+                        step_id: None,
                     };
                 }
             }
@@ -1548,6 +1552,62 @@ mod tests {
         assert!(consumer.best_response_text.is_empty());
     }
 
+    /// Verifies that a large user-message context prompt does not overwrite the agent's
+    /// short JSON response in `best_response_text`.
+    ///
+    /// The user-message text is longer than the agent response but does not contain
+    /// `"action"`, so it must not be preferred over the agent's JSON.
+    #[tokio::test]
+    async fn test_large_user_context_does_not_pollute_response_text() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("tasks/1.1.md");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-ctx".to_string(),
+                (task_id.clone(), AgentKind::CodeReview),
+            );
+        }
+
+        // Simulate a large user-message context arriving first (no "action").
+        let user_context = "## Task Context\n- Story: 6\n- Task: 6.2\n".repeat(200);
+        assert!(user_context.len() > 5000, "user context should be large");
+        consumer
+            .handle_event(OpenCodeEvent::MessageUpdated {
+                session_id: "sess-ctx".to_string(),
+                message_id: "msg-user".to_string(),
+                parts: make_text_parts(&user_context),
+            })
+            .await
+            .expect("handle_event");
+        let _ = rx.try_recv().expect("drain StreamingUpdate");
+
+        // Agent then responds with a short JSON (contains "action").
+        consumer
+            .handle_event(OpenCodeEvent::MessageUpdated {
+                session_id: "sess-ctx".to_string(),
+                message_id: "msg-agent".to_string(),
+                parts: make_text_parts(r#"{"action":"complete","summary":"done"}"#),
+            })
+            .await
+            .expect("handle_event");
+        let _ = rx.try_recv().expect("drain StreamingUpdate");
+
+        // SessionCompleted must carry the agent JSON, not the user context.
+        consumer
+            .handle_event(OpenCodeEvent::SessionCompleted {
+                session_id: "sess-ctx".to_string(),
+            })
+            .await
+            .expect("handle_event");
+        let msg = rx.try_recv().expect("SessionCompleted message");
+        assert!(
+            matches!(&msg, AppMessage::SessionCompleted { response_text, .. }
+                if response_text == r#"{"action":"complete","summary":"done"}"#),
+            "expected agent JSON response, got: {msg:?}"
+        );
+    }
+
     /// Verifies that parse_wire_event correctly extracts the session ID from the nested
     /// info object in a session.created payload.
     #[test]
@@ -1680,6 +1740,8 @@ mod tests {
                     ref session_id,
                     input_tokens: 1234,
                     output_tokens: 567,
+                    is_cumulative: true,
+                    step_id: None,
                 } if session_id == "ses_abc"
             ),
             "expected TokensUpdated from info.tokens path, got: {event:?}"
@@ -1698,6 +1760,8 @@ mod tests {
                     ref session_id,
                     input_tokens: 2000,
                     output_tokens: 800,
+                    is_cumulative: true,
+                    step_id: None,
                 } if session_id == "ses_abc"
             ),
             "expected TokensUpdated from info.summary.tokens path, got: {event:?}"
@@ -2343,7 +2407,9 @@ mod tests {
                     ref session_id,
                     input_tokens,
                     output_tokens,
-                } if session_id == "ses_xyz" && input_tokens == 7873 && output_tokens == 212
+                    is_cumulative: false,
+                    ref step_id,
+                } if session_id == "ses_xyz" && input_tokens == 7873 && output_tokens == 212 && step_id.as_deref() == Some("prt_abc")
             ),
             "expected TokensUpdated from step-finish part, got: {event:?}"
         );
