@@ -1436,8 +1436,15 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                 if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
                     return submit_research_prompt(app);
                 }
-                app.research_state.prompt_input.input(Input::from(key));
-                return None;
+                // Tab cycles to the next tab and unfocuses the prompt.
+                if key.code == KeyCode::Tab {
+                    app.research_state.prompt_focused = false;
+                    app.research_state.set_prompt_unfocused_style();
+                    // Fall through to the tab-cycling handler below.
+                } else {
+                    app.research_state.prompt_input.input(Input::from(key));
+                    return None;
+                }
             }
             match key.code {
                 KeyCode::Char('p') if key.modifiers == KeyModifiers::NONE => {
@@ -1495,7 +1502,18 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                 }
             }
             KeyCode::Tab => {
+                let prev_tab = app.active_tab;
                 app.active_tab = (app.active_tab + 1) % 9;
+                // Auto-focus the prompt when entering the Research tab.
+                if app.active_tab == 8 && prev_tab != 8 {
+                    app.research_state.prompt_focused = true;
+                    app.research_state.set_prompt_focused_style();
+                }
+                // Unfocus the research prompt when leaving the Research tab.
+                if prev_tab == 8 && app.active_tab != 8 {
+                    app.research_state.prompt_focused = false;
+                    app.research_state.set_prompt_unfocused_style();
+                }
             }
             _ => {}
         }
