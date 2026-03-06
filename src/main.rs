@@ -239,7 +239,10 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             None
         };
-        Arc::new(OpenCodeClient::new(base_url, auth))
+        Arc::new(
+            OpenCodeClient::new(base_url, auth)
+                .with_project_root(project_root.to_string_lossy().into_owned()),
+        )
     });
     let backend: Box<dyn crate::backend::AgentBackend> = match config.backend {
         BackendKind::Kiro => {
@@ -337,6 +340,7 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
                     &config,
                     async_tx.clone(),
                     app.default_model.clone(),
+                    &project_root,
                 );
             }
             queue.extend(app.handle_message(msg));
@@ -429,6 +433,7 @@ fn spawn_fix_request(
     config: &AppConfig,
     async_tx: tokio::sync::mpsc::Sender<AppMessage>,
     default_model: Option<ModelId>,
+    project_root: &std::path::Path,
 ) {
     let base_url = match server {
         Some(s) => s.base_url().to_string(),
@@ -460,9 +465,11 @@ fn spawn_fix_request(
     } else {
         None
     };
+    let project_root_str = project_root.to_string_lossy().into_owned();
 
     tokio::spawn(async move {
-        let client = OpenCodeClient::new(base_url.clone(), auth);
+        let client =
+            OpenCodeClient::new(base_url.clone(), auth).with_project_root(project_root_str);
 
         let session = match client.create_session().await {
             Ok(s) => s,
