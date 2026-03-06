@@ -375,7 +375,7 @@ impl AgentBackend for KiroBackend {
         async_tx: mpsc::Sender<AppMessage>,
     ) {
         tokio::spawn(async move {
-            match run_git_commit(&commit_message).await {
+            match super::run_git_commit(&commit_message).await {
                 Ok(()) => {
                     let _ = async_tx.send(AppMessage::CommitCompleted { task_id }).await;
                 }
@@ -514,40 +514,6 @@ fn parse_hunk_header(line: &str) -> (u32, u32) {
         .and_then(|n| n.parse().ok())
         .unwrap_or(1);
     (old_start, new_start)
-}
-
-/// Perform a git add + commit directly (no agent required).
-///
-/// Stages all working-tree changes via `git add -A`. We assume only one task
-/// is worked on at a time in this workspace, so all pending changes belong to
-/// the current task.
-async fn run_git_commit(commit_message: &str) -> crate::error::Result<()> {
-    // Stage all working-tree changes.
-    let status = tokio::process::Command::new("git")
-        .args(["add", "-A"])
-        .status()
-        .await
-        .map_err(crate::error::ClawMuxError::Io)?;
-    if !status.success() {
-        return Err(crate::error::ClawMuxError::Kiro(
-            "git add -A failed".to_string(),
-        ));
-    }
-
-    // Commit
-    let status = tokio::process::Command::new("git")
-        .args(["commit", "-m", commit_message])
-        .status()
-        .await
-        .map_err(crate::error::ClawMuxError::Io)?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(crate::error::ClawMuxError::Kiro(
-            "git commit failed".to_string(),
-        ))
-    }
 }
 
 #[cfg(test)]

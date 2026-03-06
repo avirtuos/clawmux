@@ -380,73 +380,24 @@ impl AgentBackend for OpenCodeBackend {
         task_id: TaskId,
         commit_message: String,
         _file_paths: Vec<String>,
-        model: Option<ModelId>,
-        session_map: SessionMap,
+        _model: Option<ModelId>,
+        _session_map: SessionMap,
         async_tx: mpsc::Sender<AppMessage>,
     ) {
-        let client = match self.client.clone() {
-            Some(c) => c,
-            None => {
-                tokio::spawn(async move {
-                    let _ = async_tx
-                        .send(AppMessage::CommitFailed {
-                            task_id,
-                            error: "OpenCode client unavailable".to_string(),
-                        })
-                        .await;
-                });
-                return;
-            }
-        };
         tokio::spawn(async move {
-            let session = match client.create_session().await {
-                Ok(s) => s,
+            match super::run_git_commit(&commit_message).await {
+                Ok(()) => {
+                    let _ = async_tx.send(AppMessage::CommitCompleted { task_id }).await;
+                }
                 Err(e) => {
+                    tracing::error!("opencode commit failed for task {task_id}: {e}");
                     let _ = async_tx
                         .send(AppMessage::CommitFailed {
                             task_id,
-                            error: format!("Failed to create commit session: {}", e),
+                            error: e.to_string(),
                         })
                         .await;
-                    return;
                 }
-            };
-            // Register in session_map so EventStreamConsumer routes SSE events.
-            {
-                let mut map = session_map.write().await;
-                map.insert(session.id.clone(), (task_id.clone(), AgentKind::Human));
-            }
-            // Register in pending_commit_sessions via message so the main loop
-            // routes SessionCompleted to CommitCompleted.
-            let _ = async_tx
-                .send(AppMessage::RegisterCommitSession {
-                    task_id: task_id.clone(),
-                    session_id: session.id.clone(),
-                })
-                .await;
-
-            // Stage all working-tree changes. We assume only one task is being
-            // worked on at a time in this workspace, so all pending changes belong
-            // to this task.
-            let git_add_cmd = "git add -A";
-
-            // Build the commit prompt. Using single quotes around the message
-            // ensures the agent passes it verbatim to git.
-            let escaped = commit_message.replace('\'', "'\\''");
-            let prompt = format!(
-                "Run the following git commands exactly: {} && git commit -m '{}'. Report only whether the commit succeeded or failed.",
-                git_add_cmd, escaped
-            );
-            if let Err(e) = client
-                .send_prompt_async(&session.id, None, model.as_ref(), &prompt)
-                .await
-            {
-                let _ = async_tx
-                    .send(AppMessage::CommitFailed {
-                        task_id,
-                        error: format!("Failed to send commit prompt: {}", e),
-                    })
-                    .await;
             }
         });
     }
