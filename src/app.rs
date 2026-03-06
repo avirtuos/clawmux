@@ -109,6 +109,56 @@ pub struct App {
     notifier: Notifier,
 }
 
+/// Parses `git status --porcelain` output into `(path, DiffStatus)` pairs.
+///
+/// Handles the common porcelain v1 status codes:
+/// - `??` / `A ` → [`DiffStatus::Added`]
+/// - `D ` / ` D` → [`DiffStatus::Deleted`]
+/// - `R ` (rename) → [`DiffStatus::Modified`] using the new path
+/// - All other non-empty codes → [`DiffStatus::Modified`]
+fn parse_git_status_porcelain(output: &str) -> Vec<(String, DiffStatus)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            if line.len() < 3 {
+                return None;
+            }
+            let xy = &line[..2];
+            let path_part = &line[3..];
+            // Renames are formatted as "R  old -> new"; use the new path.
+            let path = if xy.starts_with('R') {
+                path_part.split(" -> ").last().unwrap_or(path_part)
+            } else {
+                path_part
+            };
+            let status = match xy {
+                "??" | "A " | "AD" => DiffStatus::Added,
+                "D " | " D" | "DD" => DiffStatus::Deleted,
+                _ => DiffStatus::Modified,
+            };
+            Some((path.to_string(), status))
+        })
+        .collect()
+}
+
+/// Runs `git status --porcelain` and returns all working-tree changes.
+///
+/// Returns an empty list if the command fails or the output cannot be parsed.
+/// This is intentionally synchronous: `git status` is fast and is only called
+/// when the user opens the commit dialog.
+fn git_status_files() -> Vec<(String, DiffStatus)> {
+    match std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+    {
+        Ok(out) => parse_git_status_porcelain(&String::from_utf8_lossy(&out.stdout)),
+        Err(e) => {
+            tracing::warn!("Failed to run git status --porcelain: {}", e);
+            Vec::new()
+        }
+    }
+}
+
 impl App {
     /// Creates a new `App` with the given task store and default UI state.
     ///
@@ -213,12 +263,7 @@ impl App {
             })
             .unwrap_or_else(|| format!("Complete task {}", task_id));
 
-        let mut file_summary: Vec<(String, DiffStatus)> = self
-            .tab4_state
-            .diffs_for(task_id)
-            .iter()
-            .map(|d| (d.path.clone(), d.status.clone()))
-            .collect();
+        let mut file_summary = git_status_files();
 
         // Include the task's own markdown file so the user can see it will be committed.
         if let Some(task) = self.task_store.get(task_id) {
@@ -4296,5 +4341,42 @@ mod tests {
             "phase must stay AwaitingApproval after dropped completion, got {:?}",
             state.phase
         );
+    }
+
+    /// Verifies that `parse_git_status_porcelain` correctly maps porcelain v1 status codes
+    /// to `DiffStatus` values and extracts paths (including the new path for renames).
+    #[test]
+    fn test_git_status_files_parses_porcelain() {
+        use crate::opencode::types::DiffStatus;
+
+        let input = "\
+M  src/modified.rs
+ M src/unstaged_modified.rs
+MM src/both_modified.rs
+A  src/added.rs
+?? src/untracked.rs
+D  src/deleted.rs
+ D src/unstaged_deleted.rs
+R  old_name.rs -> new_name.rs
+";
+        let result = parse_git_status_porcelain(input);
+
+        let find = |path: &str| {
+            result
+                .iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, s)| s.clone())
+        };
+
+        assert_eq!(find("src/modified.rs"), Some(DiffStatus::Modified));
+        assert_eq!(find("src/unstaged_modified.rs"), Some(DiffStatus::Modified));
+        assert_eq!(find("src/both_modified.rs"), Some(DiffStatus::Modified));
+        assert_eq!(find("src/added.rs"), Some(DiffStatus::Added));
+        assert_eq!(find("src/untracked.rs"), Some(DiffStatus::Added));
+        assert_eq!(find("src/deleted.rs"), Some(DiffStatus::Deleted));
+        assert_eq!(find("src/unstaged_deleted.rs"), Some(DiffStatus::Deleted));
+        // Rename: only the new path should appear
+        assert_eq!(find("new_name.rs"), Some(DiffStatus::Modified));
+        assert_eq!(find("old_name.rs"), None);
     }
 }

@@ -369,13 +369,13 @@ impl AgentBackend for KiroBackend {
         &self,
         task_id: TaskId,
         commit_message: String,
-        file_paths: Vec<String>,
+        _file_paths: Vec<String>,
         _model: Option<ModelId>,
         _session_map: SessionMap,
         async_tx: mpsc::Sender<AppMessage>,
     ) {
         tokio::spawn(async move {
-            match run_git_commit(&commit_message, &file_paths).await {
+            match run_git_commit(&commit_message).await {
                 Ok(()) => {
                     let _ = async_tx.send(AppMessage::CommitCompleted { task_id }).await;
                 }
@@ -517,32 +517,21 @@ fn parse_hunk_header(line: &str) -> (u32, u32) {
 }
 
 /// Perform a git add + commit directly (no agent required).
-async fn run_git_commit(commit_message: &str, file_paths: &[String]) -> crate::error::Result<()> {
-    // Stage files
-    if file_paths.is_empty() {
-        // Stage all tracked modifications
-        let status = tokio::process::Command::new("git")
-            .args(["add", "-A"])
-            .status()
-            .await
-            .map_err(crate::error::ClawMuxError::Io)?;
-        if !status.success() {
-            return Err(crate::error::ClawMuxError::Kiro(
-                "git add -A failed".to_string(),
-            ));
-        }
-    } else {
-        let mut cmd = tokio::process::Command::new("git");
-        cmd.arg("add");
-        for path in file_paths {
-            cmd.arg(path);
-        }
-        let status = cmd.status().await.map_err(crate::error::ClawMuxError::Io)?;
-        if !status.success() {
-            return Err(crate::error::ClawMuxError::Kiro(
-                "git add failed".to_string(),
-            ));
-        }
+///
+/// Stages all working-tree changes via `git add -A`. We assume only one task
+/// is worked on at a time in this workspace, so all pending changes belong to
+/// the current task.
+async fn run_git_commit(commit_message: &str) -> crate::error::Result<()> {
+    // Stage all working-tree changes.
+    let status = tokio::process::Command::new("git")
+        .args(["add", "-A"])
+        .status()
+        .await
+        .map_err(crate::error::ClawMuxError::Io)?;
+    if !status.success() {
+        return Err(crate::error::ClawMuxError::Kiro(
+            "git add -A failed".to_string(),
+        ));
     }
 
     // Commit
