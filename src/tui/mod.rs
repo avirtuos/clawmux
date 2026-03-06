@@ -1,7 +1,7 @@
 //! Top-level TUI draw and input handling.
 //!
 //! Coordinates ratatui rendering across the layout, task list widget, and the
-//! 7-tab right pane. Dispatches keyboard events to the focused widget.
+//! 9-tab right pane. Dispatches keyboard events to the focused widget.
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -118,6 +118,8 @@ pub enum FocusedInput {
     RejectionResponse,
     /// The general review comment textarea on Tab 6 or Tab 7 is focused.
     ReviewComment,
+    /// The prompt textarea on the Research tab (Tab 8) is focused.
+    ResearchPrompt,
 }
 
 /// Returns the footer hint string based on the current application state.
@@ -164,6 +166,8 @@ pub fn footer_hint_text(
         "[Esc] exit | [Enter] send | Editing steering prompt"
     } else if matches!(focused_input, FocusedInput::RejectionResponse) {
         "[Enter] submit | [Esc] cancel | Editing rejection response"
+    } else if matches!(focused_input, FocusedInput::ResearchPrompt) {
+        "[Esc] exit | [Enter] send | Editing research prompt"
     } else if active_tab == 0 && is_malformed_task {
         "[f] request fix | [Enter] apply fix | [PgUp/PgDn] switch tasks | [Tab] next tab | [q] quit"
     } else if active_tab == 0 && is_startable_task {
@@ -188,6 +192,8 @@ pub fn footer_hint_text(
         "[a] approve | [p] comment | [R] revisions | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 7 {
         "[r] review | [a] approve | [p] comment | [R] revisions | [Up/Down] scroll | [Tab] next tab | [q] quit"
+    } else if active_tab == 8 {
+        "[p] prompt | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else {
         "[Tab] next tab | [q] quit"
     }
@@ -255,6 +261,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         FocusedInput::RejectionResponse
     } else if app.tab2_state.steering_focused {
         FocusedInput::Steering
+    } else if app.research_state.prompt_focused {
+        FocusedInput::ResearchPrompt
     } else {
         FocusedInput::None
     };
@@ -680,6 +688,19 @@ fn submit_steering_prompt(app: &mut App) -> Option<AppMessage> {
         .push_banner(&task_id, format!("[You - queued] {}", text));
     app.tab2_state.queue_prompt(task_id, text);
     None
+}
+
+/// Extracts the text from the Research tab prompt textarea, clears it, and returns
+/// a [`AppMessage::ResearchPromptSubmitted`] if non-empty.
+fn submit_research_prompt(app: &mut App) -> Option<AppMessage> {
+    let text: String = app.research_state.prompt_input.lines().join("\n");
+    if text.trim().is_empty() {
+        return None;
+    }
+    app.research_state.prompt_input = tui_textarea::TextArea::default();
+    app.research_state.set_prompt_unfocused_style();
+    app.research_state.prompt_focused = false;
+    Some(AppMessage::ResearchPromptSubmitted { prompt: text })
 }
 
 /// Maps an `answer_inputs` index to the corresponding `task.questions` index.
@@ -1404,6 +1425,38 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             }
         }
 
+        // Tab 8 (Research): prompt focus, send, and scroll.
+        if app.active_tab == 8 {
+            if app.research_state.prompt_focused {
+                if key.code == KeyCode::Esc {
+                    app.research_state.prompt_focused = false;
+                    app.research_state.set_prompt_unfocused_style();
+                    return None;
+                }
+                if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
+                    return submit_research_prompt(app);
+                }
+                app.research_state.prompt_input.input(Input::from(key));
+                return None;
+            }
+            match key.code {
+                KeyCode::Char('p') if key.modifiers == KeyModifiers::NONE => {
+                    app.research_state.prompt_focused = true;
+                    app.research_state.set_prompt_focused_style();
+                    return None;
+                }
+                KeyCode::Up => {
+                    app.research_state.scroll_up();
+                    return None;
+                }
+                KeyCode::Down => {
+                    app.research_state.scroll_down();
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Char('q') if key.modifiers == KeyModifiers::NONE => {
                 return Some(AppMessage::Shutdown);
@@ -1438,7 +1491,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                 }
             }
             KeyCode::Tab => {
-                app.active_tab = (app.active_tab + 1) % 8;
+                app.active_tab = (app.active_tab + 1) % 9;
             }
             _ => {}
         }
@@ -1627,6 +1680,9 @@ mod tests {
 
         handle_input(tab.clone(), &mut app);
         assert_eq!(app.active_tab, 7);
+
+        handle_input(tab.clone(), &mut app);
+        assert_eq!(app.active_tab, 8);
 
         handle_input(tab.clone(), &mut app);
         assert_eq!(app.active_tab, 0);

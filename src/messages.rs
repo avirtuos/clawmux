@@ -216,6 +216,14 @@ pub enum AppMessage {
     /// Applies the pending fix suggestion for a malformed task.
     ApplyTaskFix { task_id: TaskId },
 
+    // --- Research tab ---
+    /// The user submitted a prompt in the Research tab.
+    ResearchPromptSubmitted { prompt: String },
+    /// The research session produced a complete response.
+    ResearchResponseCompleted,
+    /// The research session encountered an error.
+    ResearchResponseError { error: String },
+
     // --- Application lifecycle ---
     /// Initiates a graceful application shutdown.
     Shutdown,

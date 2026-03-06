@@ -762,12 +762,16 @@ This is far more reliable than parsing terminal output for text markers. opencod
 ```
 
 - Left pane (25%): Story/task tree with collapsible stories
-- Right pane (75%): 4 tabs
+- Right pane (75%): 9 tabs
 - Tab 0 (Details): Task markdown (top), supplemental prompt input (bottom); questions moved to Tab 1
 - Tab 1 (Questions): One question at a time with answer textarea; tab title shows `*` when unanswered questions exist
-- Tab 2 (Agent Activity): Streaming text/markdown of agent work, tool execution activity, agent reasoning
-- Tab 3 (Team Status): Agent pipeline progress bar + scrollable work log
-- Tab 4 (Review): Unified diff view with colored +/-/space prefixed lines (green/red/dim). Press `r` to enter review mode: Up/Down move the cursor line; PageUp/PageDown navigate between files; Space marks a line-range selection (git diff hunk coordinates); Enter in comment-input mode attaches an inline comment after the selected range; Esc cancels and exits review mode. `a` approves, `R` (Shift+R) emits HumanRequestedRevisions with all accumulated inline comments formatted as `path:start-end: text`.
+- Tab 2 (Design): Scrollable design document for the selected task
+- Tab 3 (Plan): Scrollable implementation plan for the selected task
+- Tab 4 (Agent Activity): Streaming text/markdown of agent work, tool execution activity, agent reasoning
+- Tab 5 (Team Status): Agent pipeline progress bar + scrollable work log
+- Tab 6 (Review): Review discussion timeline; `a` approves, `p` adds a general comment, `R` requests revisions
+- Tab 7 (Code Diff): Unified diff view with colored +/-/space prefixed lines (green/red/dim). Press `r` to enter review mode: Up/Down move the cursor line; PageUp/PageDown navigate between files; Space marks a line-range selection (git diff hunk coordinates); Enter in comment-input mode attaches an inline comment after the selected range; Esc cancels and exits review mode. `a` approves, `R` (Shift+R) emits HumanRequestedRevisions with all accumulated inline comments.
+- Tab 8 (Research): Global AI chat scratchpad independent of the task pipeline. Press `p` to focus the prompt, Enter to send, Esc to exit. The backend session is created lazily on first prompt and reused for all follow-up messages. Chat history persists across task navigation. Sentinel task ID `"__research__"` routes messages without touching the workflow engine.
 
 **Tab 2** shows streaming content from SSE message events rather than an embedded terminal, eliminating VT emulation complexity while providing more structured visibility into agent activity.
 
