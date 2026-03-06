@@ -25,7 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::App;
 use crate::backend::kiro::KiroBackend;
-use crate::config::init::build_agent_model_map;
+use crate::config::init::{build_agent_model_map, ensure_agent_files};
 use crate::config::{AppConfig, BackendKind};
 use crate::messages::AppMessage;
 use crate::opencode::events::EventStreamConsumer;
@@ -267,6 +267,17 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::warn!("EventStreamConsumer exited: {}", e);
             }
         });
+    }
+
+    // 8. Deploy any missing agent definition files (idempotent; never overwrites existing files).
+    //    This ensures agent files added in later versions (e.g. research-plan.md) are always
+    //    present without requiring the user to re-run `clawmux init`.
+    if matches!(config.backend, BackendKind::OpenCode) {
+        match ensure_agent_files(&project_root) {
+            Ok(0) => tracing::debug!("all agent definition files already present"),
+            Ok(n) => tracing::info!(count = n, "deployed missing agent definition files"),
+            Err(e) => tracing::warn!("could not deploy agent files: {}", e),
+        }
     }
 
     tracing::info!(

@@ -279,6 +279,41 @@ pub(crate) fn select_backend_from_reader<R: BufRead, W: Write>(
     }
 }
 
+/// Writes any missing built-in agent definition files to `.opencode/agents/clawmux/`.
+///
+/// Unlike [`update_agent_files`], existing files are never overwritten.  This is
+/// safe to call at startup: it ensures new agent variants added in later versions
+/// (e.g. `research-plan.md`, `research-act.md`) are deployed without clobbering
+/// user-customised pipeline agent files.
+///
+/// Returns the number of agent files written.
+pub fn ensure_agent_files(project_root: &Path) -> Result<usize> {
+    let agents_dir = project_root
+        .join(".opencode")
+        .join("agents")
+        .join("clawmux");
+    std::fs::create_dir_all(&agents_dir).map_err(ClawMuxError::Io)?;
+
+    let mut count = 0usize;
+    let all_agents = AgentKind::all()
+        .iter()
+        .chain(AgentKind::research_agents().iter());
+    for agent in all_agents {
+        let (Some(file_name), Some(content)) =
+            (agent_file_name(agent), agent_definition_content(agent))
+        else {
+            continue;
+        };
+        let file_path = agents_dir.join(file_name);
+        if !file_path.exists() {
+            std::fs::write(&file_path, content).map_err(ClawMuxError::Io)?;
+            tracing::info!(path = %file_path.display(), "deployed missing agent definition");
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 /// Writes built-in agent definition files to `.opencode/agents/clawmux/`.
 ///
 /// Always overwrites existing files. Creates the directory if it does not exist.
