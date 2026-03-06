@@ -379,7 +379,7 @@ impl AgentBackend for OpenCodeBackend {
         &self,
         task_id: TaskId,
         commit_message: String,
-        file_paths: Vec<String>,
+        _file_paths: Vec<String>,
         model: Option<ModelId>,
         session_map: SessionMap,
         async_tx: mpsc::Sender<AppMessage>,
@@ -425,20 +425,10 @@ impl AgentBackend for OpenCodeBackend {
                 })
                 .await;
 
-            // Build a targeted `git add` from the known changed files so that
-            // unrelated working-tree files (e.g. .env, editor temp files) are
-            // not staged. Fall back to `git add -A` only when the diff snapshot
-            // was unavailable (file_paths is empty).
-            let git_add_cmd = if file_paths.is_empty() {
-                tracing::warn!("No file paths in commit dialog; falling back to git add -A");
-                "git add -A".to_string()
-            } else {
-                let quoted: Vec<String> = file_paths
-                    .iter()
-                    .map(|p| format!("'{}'", p.replace('\'', "'\\''")))
-                    .collect();
-                format!("git add -- {}", quoted.join(" "))
-            };
+            // Stage all working-tree changes. We assume only one task is being
+            // worked on at a time in this workspace, so all pending changes belong
+            // to this task.
+            let git_add_cmd = "git add -A";
 
             // Build the commit prompt. Using single quotes around the message
             // ensures the agent passes it verbatim to git.
