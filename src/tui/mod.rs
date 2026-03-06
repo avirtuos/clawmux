@@ -1,7 +1,7 @@
 //! Top-level TUI draw and input handling.
 //!
 //! Coordinates ratatui rendering across the layout, task list widget, and the
-//! 7-tab right pane. Dispatches keyboard events to the focused widget.
+//! 9-tab right pane. Dispatches keyboard events to the focused widget.
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -698,6 +698,7 @@ fn submit_research_prompt(app: &mut App) -> Option<AppMessage> {
         return None;
     }
     app.research_state.prompt_input = tui_textarea::TextArea::default();
+    app.research_state.set_prompt_unfocused_style();
     app.research_state.prompt_focused = false;
     Some(AppMessage::ResearchPromptSubmitted { prompt: text })
 }
@@ -1429,6 +1430,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             if app.research_state.prompt_focused {
                 if key.code == KeyCode::Esc {
                     app.research_state.prompt_focused = false;
+                    app.research_state.set_prompt_unfocused_style();
                     return None;
                 }
                 if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
@@ -1440,6 +1442,7 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             match key.code {
                 KeyCode::Char('p') if key.modifiers == KeyModifiers::NONE => {
                     app.research_state.prompt_focused = true;
+                    app.research_state.set_prompt_focused_style();
                     return None;
                 }
                 KeyCode::Up => {

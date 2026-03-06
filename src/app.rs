@@ -449,8 +449,14 @@ impl App {
                 status,
                 detail,
             } => {
-                // Silently ignore tool activity for the research session.
+                // Show tool activity in the research chat so the user can follow agent progress.
                 if task_id == App::research_task_id() {
+                    let msg = if let Some(d) = detail {
+                        format!("[Tool: {}] {} -- {}", tool, status, d)
+                    } else {
+                        format!("[Tool: {}] {}", tool, status)
+                    };
+                    self.research_state.push_system_message(msg);
                     return vec![];
                 }
                 self.tab2_state.push_tool(&task_id, tool, status, detail);
@@ -913,7 +919,7 @@ impl App {
 
                 // Intercept completions for the research session (session persists; do not remove).
                 if self.research_state.session_id.as_deref() == Some(&session_id) {
-                    return vec![AppMessage::ResearchResponseCompleted { response_text }];
+                    return vec![AppMessage::ResearchResponseCompleted];
                 }
 
                 // Guard: only advance the workflow when the current phase is Running.
@@ -1234,8 +1240,21 @@ impl App {
             } => {
                 // Intercept PromptSent for the research session to store the session_id.
                 if task_id == App::research_task_id() {
-                    self.research_state.session_id = Some(session_id);
+                    self.research_state.session_id = Some(session_id.clone());
                     self.research_state.session_creating = false;
+                    // Drain any prompt queued while the session was being created.
+                    if let Some(queued) = self.research_state.pending_prompt.take() {
+                        let research_id = App::research_task_id();
+                        let model = self.default_model.clone();
+                        self.backend.send_prompt(
+                            research_id,
+                            session_id,
+                            AgentKind::Research,
+                            queued,
+                            model,
+                            self.async_tx.clone(),
+                        );
+                    }
                     return vec![];
                 }
                 let agent_name = self
@@ -1486,7 +1505,13 @@ impl App {
                         model,
                         self.async_tx.clone(),
                     );
-                } else if !self.research_state.session_creating {
+                } else if self.research_state.session_creating {
+                    // Session creation in flight: queue the prompt and notify the user.
+                    self.research_state.pending_prompt = Some(prompt);
+                    self.research_state.push_system_message(
+                        "Queued -- will send after session is ready.".to_string(),
+                    );
+                } else {
                     // First prompt: create a new session.
                     self.research_state.session_creating = true;
                     self.research_state
@@ -1503,7 +1528,7 @@ impl App {
                 vec![]
             }
 
-            AppMessage::ResearchResponseCompleted { .. } => {
+            AppMessage::ResearchResponseCompleted => {
                 self.research_state.finalize_response();
                 vec![]
             }
@@ -4548,10 +4573,7 @@ R  old_name.rs -> new_name.rs
         });
 
         assert_eq!(msgs.len(), 1);
-        assert!(matches!(
-            msgs[0],
-            AppMessage::ResearchResponseCompleted { .. }
-        ));
+        assert!(matches!(msgs[0], AppMessage::ResearchResponseCompleted));
         // Session ID preserved for follow-up prompts.
         assert_eq!(app.research_state.session_id, Some("sess-1".to_string()));
     }
@@ -4580,9 +4602,7 @@ R  old_name.rs -> new_name.rs
         let mut app = App::test_default();
         app.research_state.awaiting_response = true;
 
-        app.handle_message(AppMessage::ResearchResponseCompleted {
-            response_text: "Done".to_string(),
-        });
+        app.handle_message(AppMessage::ResearchResponseCompleted);
 
         assert!(!app.research_state.awaiting_response);
     }
@@ -4602,5 +4622,79 @@ R  old_name.rs -> new_name.rs
             app.research_state.messages[0].role,
             crate::tui::tabs::research::ChatRole::System
         );
+    }
+
+    #[test]
+    fn test_research_prompt_queued_during_session_creation() {
+        let mut app = App::test_default();
+        // Simulate a session being created (first prompt already in flight).
+        app.research_state.session_creating = true;
+
+        let msgs = app.handle_message(AppMessage::ResearchPromptSubmitted {
+            prompt: "second question".to_string(),
+        });
+
+        assert!(msgs.is_empty());
+        // Prompt was queued, not sent.
+        assert_eq!(
+            app.research_state.pending_prompt.as_deref(),
+            Some("second question")
+        );
+        // A queued banner was pushed alongside the user message.
+        assert_eq!(app.research_state.messages.len(), 2);
+        assert_eq!(
+            app.research_state.messages[0].role,
+            crate::tui::tabs::research::ChatRole::User
+        );
+        assert_eq!(
+            app.research_state.messages[1].role,
+            crate::tui::tabs::research::ChatRole::System
+        );
+        assert!(app.research_state.messages[1].content.contains("Queued"));
+    }
+
+    #[test]
+    fn test_queued_prompt_sent_on_prompt_sent() {
+        let mut app = App::test_default();
+        // A prompt was queued while the session was being created.
+        app.research_state.session_creating = true;
+        app.research_state.pending_prompt = Some("queued".to_string());
+
+        // PromptSent arrives (session_id now known).
+        let msgs = app.handle_message(AppMessage::PromptSent {
+            task_id: App::research_task_id(),
+            session_id: "sess-new".to_string(),
+        });
+
+        assert!(msgs.is_empty());
+        // session_id stored and session_creating cleared.
+        assert_eq!(app.research_state.session_id, Some("sess-new".to_string()));
+        assert!(!app.research_state.session_creating);
+        // pending_prompt drained.
+        assert!(app.research_state.pending_prompt.is_none());
+    }
+
+    #[test]
+    fn test_tool_activity_shown_in_research_chat() {
+        let mut app = App::test_default();
+        app.research_state.session_id = Some("sess-1".to_string());
+
+        app.handle_message(AppMessage::ToolActivity {
+            task_id: App::research_task_id(),
+            session_id: "sess-1".to_string(),
+            tool: "read_file".to_string(),
+            status: "running".to_string(),
+            detail: Some("src/main.rs".to_string()),
+        });
+
+        assert_eq!(app.research_state.messages.len(), 1);
+        assert_eq!(
+            app.research_state.messages[0].role,
+            crate::tui::tabs::research::ChatRole::System
+        );
+        assert!(app.research_state.messages[0].content.contains("read_file"));
+        assert!(app.research_state.messages[0]
+            .content
+            .contains("src/main.rs"));
     }
 }

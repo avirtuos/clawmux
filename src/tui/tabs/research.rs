@@ -50,6 +50,8 @@ pub struct ResearchTabState {
     pub session_creating: bool,
     /// `true` while waiting for a streaming response; drives the "Thinking..." indicator.
     pub awaiting_response: bool,
+    /// A prompt submitted while `session_creating` is `true`, held until the session is ready.
+    pub pending_prompt: Option<String>,
     /// Prompt input textarea (unfocused by default).
     pub prompt_input: TextArea<'static>,
     /// Whether the prompt input has keyboard focus.
@@ -63,16 +65,44 @@ pub struct ResearchTabState {
 impl ResearchTabState {
     /// Creates a new empty `ResearchTabState`.
     pub fn new() -> Self {
+        let mut prompt_input = TextArea::default();
+        prompt_input.set_block(Self::unfocused_block());
         Self {
             messages: Vec::new(),
             session_id: None,
             session_creating: false,
             awaiting_response: false,
-            prompt_input: TextArea::default(),
+            pending_prompt: None,
+            prompt_input,
             prompt_focused: false,
             scroll_offset: 0,
             follow_tail: true,
         }
+    }
+
+    /// Returns a [`Block`] with a yellow border for the focused prompt input.
+    fn focused_block() -> Block<'static> {
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Prompt (Enter to send, Esc to exit) ")
+            .border_style(Style::default().fg(Color::Yellow))
+    }
+
+    /// Returns a [`Block`] with the default border style for the unfocused prompt input.
+    fn unfocused_block() -> Block<'static> {
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Prompt [p to focus] ")
+    }
+
+    /// Sets the prompt textarea to the focused (yellow border) style.
+    pub fn set_prompt_focused_style(&mut self) {
+        self.prompt_input.set_block(Self::focused_block());
+    }
+
+    /// Sets the prompt textarea to the unfocused (default border) style.
+    pub fn set_prompt_unfocused_style(&mut self) {
+        self.prompt_input.set_block(Self::unfocused_block());
     }
 
     /// Appends a user message to the chat history.
@@ -245,7 +275,7 @@ pub fn render(frame: &mut Frame, area: ratatui::layout::Rect, state: &ResearchTa
     let scroll = if state.follow_tail {
         max_scroll
     } else {
-        max_scroll.saturating_sub(state.scroll_offset as u16)
+        max_scroll.saturating_sub(u16::try_from(state.scroll_offset).unwrap_or(u16::MAX))
     };
 
     let chat_block = Block::default()
@@ -254,25 +284,8 @@ pub fn render(frame: &mut Frame, area: ratatui::layout::Rect, state: &ResearchTa
     let chat_para = Paragraph::new(lines).block(chat_block).scroll((scroll, 0));
     frame.render_widget(chat_para, chat_area);
 
-    // Render prompt input.
-    let prompt_title = if state.prompt_focused {
-        " Prompt (Enter to send, Esc to exit) "
-    } else {
-        " Prompt [p to focus] "
-    };
-    let border_style = if state.prompt_focused {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
-    };
-    let mut prompt_input = state.prompt_input.clone();
-    prompt_input.set_block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(prompt_title)
-            .border_style(border_style),
-    );
-    frame.render_widget(&prompt_input, input_area);
+    // Render prompt input (block style is set on focus/unfocus transitions in tui/mod.rs).
+    frame.render_widget(&state.prompt_input, input_area);
 }
 
 #[cfg(test)]
@@ -286,6 +299,7 @@ mod tests {
         assert!(state.session_id.is_none());
         assert!(!state.session_creating);
         assert!(!state.awaiting_response);
+        assert!(state.pending_prompt.is_none());
         assert!(!state.prompt_focused);
         assert_eq!(state.scroll_offset, 0);
         assert!(state.follow_tail);
@@ -364,5 +378,32 @@ mod tests {
         state.scroll_down();
         assert_eq!(state.scroll_offset, 0);
         assert!(state.follow_tail);
+    }
+
+    #[test]
+    fn test_research_prompt_queued_during_session_creation() {
+        let mut state = ResearchTabState::new();
+        state.session_creating = true;
+        // Simulate the app queuing a prompt while session_creating is true.
+        state.pending_prompt = Some("queued question".to_string());
+        state.push_system_message("Queued -- will send after session is ready.".to_string());
+        // pending_prompt stored and a system banner was pushed.
+        assert_eq!(state.pending_prompt.as_deref(), Some("queued question"));
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].role, ChatRole::System);
+        assert!(state.messages[0].content.contains("Queued"));
+    }
+
+    #[test]
+    fn test_queued_prompt_sent_on_prompt_sent() {
+        // Verify that draining pending_prompt produces the correct text.
+        let mut state = ResearchTabState::new();
+        state.session_creating = true;
+        state.pending_prompt = Some("follow-up".to_string());
+        // Simulate PromptSent clearing session_creating and draining the queue.
+        state.session_creating = false;
+        let drained = state.pending_prompt.take();
+        assert_eq!(drained.as_deref(), Some("follow-up"));
+        assert!(state.pending_prompt.is_none());
     }
 }

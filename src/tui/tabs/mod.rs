@@ -20,7 +20,7 @@ pub mod review;
 pub mod task_details;
 pub mod team_status;
 
-/// Returns tab titles for the eight right-pane tabs.
+/// Returns tab titles for the nine right-pane tabs.
 ///
 /// Appends `*` to "Questions" when the selected task has any unanswered questions,
 /// so the user can see at a glance that input is needed.

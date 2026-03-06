@@ -220,7 +220,7 @@ pub enum AppMessage {
     /// The user submitted a prompt in the Research tab.
     ResearchPromptSubmitted { prompt: String },
     /// The research session produced a complete response.
-    ResearchResponseCompleted { response_text: String },
+    ResearchResponseCompleted,
     /// The research session encountered an error.
     ResearchResponseError { error: String },
 
