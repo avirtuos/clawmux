@@ -193,6 +193,47 @@ pub trait AgentBackend: Send + Sync {
     fn name(&self) -> &str;
 }
 
+/// Perform a git add + commit directly, capturing stdout/stderr to avoid
+/// corrupting the TUI.
+///
+/// Stages all working-tree changes via `git add -A`. We assume only one task
+/// is worked on at a time in this workspace, so all pending changes belong to
+/// the current task.
+pub(crate) async fn run_git_commit(commit_message: &str) -> crate::error::Result<()> {
+    use std::process::Stdio;
+
+    let output = tokio::process::Command::new("git")
+        .args(["add", "-A"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(crate::error::ClawMuxError::Io)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(crate::error::ClawMuxError::Internal(format!(
+            "git add -A failed: {stderr}"
+        )));
+    }
+
+    let output = tokio::process::Command::new("git")
+        .args(["commit", "-m", commit_message])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(crate::error::ClawMuxError::Io)?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(crate::error::ClawMuxError::Internal(format!(
+            "git commit failed: {stderr}"
+        )))
+    }
+}
+
 /// A no-op backend used in tests and when no backend is configured.
 ///
 /// All session operations that require communication immediately send an error
