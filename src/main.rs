@@ -155,10 +155,14 @@ fn check_project_init(project_root: &std::path::Path) -> Result<(), Box<dyn std:
 async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Init terminal first so we can draw a loading screen during startup.
     let mut terminal = ratatui::init();
+    // Enable bracketed paste so multi-line pastes arrive as Event::Paste rather
+    // than individual keystrokes (which would trigger premature prompt submission).
+    crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste).ok();
 
     // 2. Install panic hook AFTER ratatui::init() so it wraps ratatui's hook.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         ratatui::restore();
         original_hook(info);
     }));
@@ -362,6 +366,7 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     ratatui::restore();
 
     if let Some(ref mut s) = server {

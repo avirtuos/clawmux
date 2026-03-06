@@ -698,8 +698,7 @@ fn submit_research_prompt(app: &mut App) -> Option<AppMessage> {
         return None;
     }
     app.research_state.prompt_input = tui_textarea::TextArea::default();
-    app.research_state.set_prompt_unfocused_style();
-    app.research_state.prompt_focused = false;
+    app.research_state.set_prompt_focused_style();
     Some(AppMessage::ResearchPromptSubmitted { prompt: text })
 }
 
@@ -745,6 +744,22 @@ fn find_answer_idx_for_selected(app: &App) -> Option<usize> {
     )
 }
 
+// Inserts pasted text into a TextArea, treating \n as newlines and
+// discarding \r to normalise Windows-style line endings.
+fn insert_paste(ta: &mut tui_textarea::TextArea<'_>, text: &str) {
+    for c in text.chars() {
+        match c {
+            '\n' => {
+                ta.insert_newline();
+            }
+            '\r' => {}
+            c => {
+                ta.insert_char(c);
+            }
+        }
+    }
+}
+
 /// Converts a crossterm event into an optional [`AppMessage`], mutating `app` for navigation.
 ///
 /// - `PgUp` / `k` -> move task list selection up
@@ -756,6 +771,23 @@ fn find_answer_idx_for_selected(app: &App) -> Option<usize> {
 /// - `Ctrl-C` -> [`AppMessage::Shutdown`]
 /// - Any other key -> `None`
 pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
+    // Bracketed-paste events arrive as Event::Paste when bracketed paste mode is
+    // enabled.  Route the text to whichever prompt textarea currently has focus so
+    // that multi-line pastes don't trigger premature submission.
+    if let Event::Paste(ref text) = event {
+        let text = text.clone();
+        if app.research_state.prompt_focused {
+            insert_paste(&mut app.research_state.prompt_input, &text);
+        } else if app.tab1_state.prompt_focused {
+            insert_paste(&mut app.tab1_state.prompt_input, &text);
+        } else if app.tab2_state.rejection_response_focused {
+            insert_paste(&mut app.tab2_state.rejection_response, &text);
+        } else if let Some(ref mut dialog) = app.commit_dialog {
+            insert_paste(&mut dialog.editor, &text);
+        }
+        return None;
+    }
+
     if let Event::Key(key) = event {
         // When the quit confirmation dialog is visible, intercept all input.
         if app.show_quit_confirm {
@@ -800,14 +832,15 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
         }
 
         // When a permission dialog is visible, intercept y/a/n/r regardless of active tab.
+        // Research permissions use the synthetic research task_id and are always active;
+        // pipeline-task permissions are active when the matching task is selected.
+        let research_id = App::research_task_id();
         let has_pending = app
-            .selected_task()
-            .map(|id| {
-                app.tab2_state
-                    .pending_permissions
-                    .front()
-                    .map(|(tid, _)| tid == id)
-                    .unwrap_or(false)
+            .tab2_state
+            .pending_permissions
+            .front()
+            .map(|(tid, _)| {
+                *tid == research_id || app.selected_task().map(|id| tid == id).unwrap_or(false)
             })
             .unwrap_or(false);
         if has_pending {
