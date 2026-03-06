@@ -12,6 +12,45 @@ use ratatui::Frame;
 use tui_textarea::TextArea;
 
 use crate::tui::markdown::markdown_to_lines;
+use crate::workflow::agents::AgentKind;
+
+/// The mode of the Research tab.
+///
+/// `Plan` uses a read-only agent focused on analysis; `Act` uses a full-tool
+/// agent that can read, write, and execute code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResearchMode {
+    /// Read-only mode focused on analysis and research.
+    Plan,
+    /// Full-tool mode capable of reading, writing, and executing.
+    Act,
+}
+
+impl ResearchMode {
+    /// Returns the `AgentKind` that backs this mode.
+    pub fn agent_kind(self) -> AgentKind {
+        match self {
+            ResearchMode::Plan => AgentKind::ResearchPlan,
+            ResearchMode::Act => AgentKind::ResearchAct,
+        }
+    }
+
+    /// Returns the short label shown in the chat block title.
+    pub fn label(self) -> &'static str {
+        match self {
+            ResearchMode::Plan => "PLAN",
+            ResearchMode::Act => "ACT",
+        }
+    }
+
+    /// Toggles between `Plan` and `Act`.
+    pub fn toggle(self) -> Self {
+        match self {
+            ResearchMode::Plan => ResearchMode::Act,
+            ResearchMode::Act => ResearchMode::Plan,
+        }
+    }
+}
 
 /// The role of a chat message in the research conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +99,8 @@ pub struct ResearchTabState {
     pub scroll_offset: usize,
     /// When `true`, the view auto-scrolls to the latest message.
     pub follow_tail: bool,
+    /// The current plan/act mode.  Determines which agent backs the session.
+    pub mode: ResearchMode,
 }
 
 impl ResearchTabState {
@@ -77,7 +118,19 @@ impl ResearchTabState {
             prompt_focused: false,
             scroll_offset: 0,
             follow_tail: true,
+            mode: ResearchMode::Plan,
         }
+    }
+
+    /// Toggles the mode between `Plan` and `Act`.
+    ///
+    /// Clears the current session, `session_creating` flag, and any `pending_prompt`
+    /// so that the next prompt will create a fresh session with the new agent.
+    pub fn toggle_mode(&mut self) {
+        self.mode = self.mode.toggle();
+        self.session_id = None;
+        self.session_creating = false;
+        self.pending_prompt = None;
     }
 
     /// Returns a [`Block`] with a yellow border for the focused prompt input.
@@ -278,9 +331,8 @@ pub fn render(frame: &mut Frame, area: ratatui::layout::Rect, state: &ResearchTa
         max_scroll.saturating_sub(u16::try_from(state.scroll_offset).unwrap_or(u16::MAX))
     };
 
-    let chat_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Research Chat ");
+    let chat_title = format!(" Research Chat [{}] ", state.mode.label());
+    let chat_block = Block::default().borders(Borders::ALL).title(chat_title);
     let chat_para = Paragraph::new(lines).block(chat_block).scroll((scroll, 0));
     frame.render_widget(chat_para, chat_area);
 
@@ -303,6 +355,51 @@ mod tests {
         assert!(!state.prompt_focused);
         assert_eq!(state.scroll_offset, 0);
         assert!(state.follow_tail);
+        assert_eq!(state.mode, ResearchMode::Plan);
+    }
+
+    #[test]
+    fn test_research_mode_toggle() {
+        assert_eq!(ResearchMode::Plan.toggle(), ResearchMode::Act);
+        assert_eq!(ResearchMode::Act.toggle(), ResearchMode::Plan);
+    }
+
+    #[test]
+    fn test_research_mode_agent_kind() {
+        assert_eq!(
+            ResearchMode::Plan.agent_kind(),
+            crate::workflow::agents::AgentKind::ResearchPlan
+        );
+        assert_eq!(
+            ResearchMode::Act.agent_kind(),
+            crate::workflow::agents::AgentKind::ResearchAct
+        );
+    }
+
+    #[test]
+    fn test_research_mode_label() {
+        assert_eq!(ResearchMode::Plan.label(), "PLAN");
+        assert_eq!(ResearchMode::Act.label(), "ACT");
+    }
+
+    #[test]
+    fn test_toggle_mode_clears_session() {
+        let mut state = ResearchTabState::new();
+        state.session_id = Some("sess-123".to_string());
+        state.session_creating = true;
+        state.pending_prompt = Some("pending".to_string());
+        assert_eq!(state.mode, ResearchMode::Plan);
+
+        state.toggle_mode();
+
+        assert_eq!(state.mode, ResearchMode::Act);
+        assert!(state.session_id.is_none());
+        assert!(!state.session_creating);
+        assert!(state.pending_prompt.is_none());
+
+        // Toggle back.
+        state.toggle_mode();
+        assert_eq!(state.mode, ResearchMode::Plan);
     }
 
     #[test]

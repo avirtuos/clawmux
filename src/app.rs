@@ -609,7 +609,9 @@ impl App {
                 }
 
                 // Intercept errors for the research session.
-                if self.research_state.session_id.as_deref() == Some(&session_id) {
+                // Use task_id comparison so that child sessions (OpenCode >= 1.2 conductor/child
+                // architecture) are handled correctly even when session_id differs.
+                if task_id == App::research_task_id() {
                     self.research_state.session_id = None;
                     self.research_state.session_creating = false;
                     return vec![AppMessage::ResearchResponseError { error }];
@@ -918,7 +920,9 @@ impl App {
                 }
 
                 // Intercept completions for the research session (session persists; do not remove).
-                if self.research_state.session_id.as_deref() == Some(&session_id) {
+                // Use task_id comparison so that child sessions (OpenCode >= 1.2 conductor/child
+                // architecture) are handled correctly even when session_id differs.
+                if task_id == App::research_task_id() {
                     return vec![AppMessage::ResearchResponseCompleted];
                 }
 
@@ -1246,10 +1250,11 @@ impl App {
                     if let Some(queued) = self.research_state.pending_prompt.take() {
                         let research_id = App::research_task_id();
                         let model = self.default_model.clone();
+                        let agent_kind = self.research_state.mode.agent_kind();
                         self.backend.send_prompt(
                             research_id,
                             session_id,
-                            AgentKind::Research,
+                            agent_kind,
                             queued,
                             model,
                             self.async_tx.clone(),
@@ -1495,12 +1500,13 @@ impl App {
                 self.research_state.awaiting_response = true;
                 let research_id = App::research_task_id();
                 let model = self.default_model.clone();
+                let agent_kind = self.research_state.mode.agent_kind();
                 if let Some(ref session_id) = self.research_state.session_id.clone() {
                     // Session already exists: send a follow-up prompt.
                     self.backend.send_prompt(
                         research_id,
                         session_id.clone(),
-                        AgentKind::Research,
+                        agent_kind,
                         prompt,
                         model,
                         self.async_tx.clone(),
@@ -1518,7 +1524,7 @@ impl App {
                         .push_system_message("Creating session...".to_string());
                     self.backend.create_session(
                         research_id,
-                        AgentKind::Research,
+                        agent_kind,
                         prompt,
                         model,
                         self.session_map.clone(),
@@ -4563,30 +4569,53 @@ R  old_name.rs -> new_name.rs
     #[test]
     fn test_session_completed_routes_to_research() {
         let mut app = App::test_default();
-        app.research_state.session_id = Some("sess-1".to_string());
+        // Stored parent session_id differs from the child session_id in the event.
+        app.research_state.session_id = Some("sess-parent".to_string());
         app.research_state.awaiting_response = true;
 
         let msgs = app.handle_message(AppMessage::SessionCompleted {
             task_id: App::research_task_id(),
-            session_id: "sess-1".to_string(),
+            session_id: "sess-child".to_string(),
             response_text: "Done".to_string(),
         });
 
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0], AppMessage::ResearchResponseCompleted));
         // Session ID preserved for follow-up prompts.
-        assert_eq!(app.research_state.session_id, Some("sess-1".to_string()));
+        assert_eq!(
+            app.research_state.session_id,
+            Some("sess-parent".to_string())
+        );
+    }
+
+    #[test]
+    fn test_session_completed_routes_research_child_session() {
+        // Proves that task_id routing works when OpenCode uses conductor/child sessions:
+        // the child session_id is completely different from the stored parent session_id.
+        let mut app = App::test_default();
+        app.research_state.session_id = Some("conductor-abc".to_string());
+        app.research_state.awaiting_response = true;
+
+        let msgs = app.handle_message(AppMessage::SessionCompleted {
+            task_id: App::research_task_id(),
+            session_id: "child-xyz".to_string(),
+            response_text: "Research result".to_string(),
+        });
+
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0], AppMessage::ResearchResponseCompleted));
     }
 
     #[test]
     fn test_session_error_clears_research_session() {
         let mut app = App::test_default();
-        app.research_state.session_id = Some("sess-1".to_string());
+        // Stored parent session_id differs from the child session_id in the event.
+        app.research_state.session_id = Some("sess-parent".to_string());
         app.research_state.awaiting_response = true;
 
         let msgs = app.handle_message(AppMessage::SessionError {
             task_id: App::research_task_id(),
-            session_id: "sess-1".to_string(),
+            session_id: "sess-child".to_string(),
             error: "connection lost".to_string(),
         });
 

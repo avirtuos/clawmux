@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use crate::error::ClawMuxError;
 
-/// The 7 pipeline agents plus special `Human` and `Research` markers.
+/// The 7 pipeline agents plus special `Human`, `ResearchPlan`, and `ResearchAct` markers.
 ///
 /// Pipeline agents are applied sequentially:
 /// `Intake` -> `Design` -> `Planning` -> `Implementation`
@@ -22,8 +22,10 @@ use crate::error::ClawMuxError;
 /// `Human` is not part of the automated pipeline; it represents assignment to a
 /// human reviewer and is used only in task file metadata.
 ///
-/// `Research` is a special out-of-pipeline agent backing the Research tab scratchpad.
-/// It has its own session lifecycle independent of the task pipeline.
+/// `ResearchPlan` and `ResearchAct` are special out-of-pipeline agents backing the
+/// Research tab scratchpad. They share the same task_id but differ in tool permissions
+/// and system prompt. `ResearchPlan` is read-only and focuses on analysis; `ResearchAct`
+/// has full tool access for execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     /// Gathers initial context and clarifies requirements.
@@ -42,8 +44,10 @@ pub enum AgentKind {
     CodeReview,
     /// Represents assignment to a human reviewer (not part of the automated pipeline).
     Human,
-    /// Backs the Research tab scratchpad; not part of the task pipeline.
-    Research,
+    /// Backs the Research tab in read-only Plan mode; not part of the task pipeline.
+    ResearchPlan,
+    /// Backs the Research tab in full-tool Act mode; not part of the task pipeline.
+    ResearchAct,
 }
 
 #[allow(dead_code)]
@@ -61,7 +65,8 @@ impl AgentKind {
             AgentKind::SecurityReview => "clawmux/security-review",
             AgentKind::CodeReview => "clawmux/code-review",
             AgentKind::Human => "human",
-            AgentKind::Research => "clawmux/research",
+            AgentKind::ResearchPlan => "clawmux/research-plan",
+            AgentKind::ResearchAct => "clawmux/research-act",
         }
     }
 
@@ -79,14 +84,15 @@ impl AgentKind {
             AgentKind::SecurityReview => "clawmux-security-review",
             AgentKind::CodeReview => "clawmux-code-review",
             AgentKind::Human => "human",
-            AgentKind::Research => "clawmux-research",
+            AgentKind::ResearchPlan => "clawmux-research-plan",
+            AgentKind::ResearchAct => "clawmux-research-act",
         }
     }
 
     /// Returns the zero-based index of this agent in the pipeline.
     ///
     /// `Intake` is 0, `CodeReview` is 6. `Human` returns 7 (outside the pipeline).
-    /// `Research` returns 8 (out-of-pipeline scratchpad).
+    /// `ResearchPlan` and `ResearchAct` both return 8 (out-of-pipeline scratchpad).
     pub fn pipeline_index(&self) -> usize {
         match self {
             AgentKind::Intake => 0,
@@ -97,7 +103,7 @@ impl AgentKind {
             AgentKind::SecurityReview => 5,
             AgentKind::CodeReview => 6,
             AgentKind::Human => 7,
-            AgentKind::Research => 8,
+            AgentKind::ResearchPlan | AgentKind::ResearchAct => 8,
         }
     }
 
@@ -106,7 +112,8 @@ impl AgentKind {
     /// The pipeline order is:
     /// `Intake` -> `Design` -> `Planning` -> `Implementation`
     /// -> `CodeQuality` -> `SecurityReview` -> `CodeReview` -> (end).
-    /// `Human` is not part of the pipeline and always returns `None`.
+    /// `Human`, `ResearchPlan`, and `ResearchAct` are not part of the pipeline
+    /// and always return `None`.
     pub fn next(&self) -> Option<AgentKind> {
         match self {
             AgentKind::Intake => Some(AgentKind::Design),
@@ -115,17 +122,24 @@ impl AgentKind {
             AgentKind::Implementation => Some(AgentKind::CodeQuality),
             AgentKind::CodeQuality => Some(AgentKind::SecurityReview),
             AgentKind::SecurityReview => Some(AgentKind::CodeReview),
-            AgentKind::CodeReview | AgentKind::Human | AgentKind::Research => None,
+            AgentKind::CodeReview
+            | AgentKind::Human
+            | AgentKind::ResearchPlan
+            | AgentKind::ResearchAct => None,
         }
     }
 
     /// Returns the previous agent in the pipeline, or `None` if this is the first.
     ///
     /// Inverse of [`next`][AgentKind::next].
-    /// `Human` is not part of the pipeline and always returns `None`.
+    /// `Human`, `ResearchPlan`, and `ResearchAct` are not part of the pipeline
+    /// and always return `None`.
     pub fn prev(&self) -> Option<AgentKind> {
         match self {
-            AgentKind::Intake | AgentKind::Human | AgentKind::Research => None,
+            AgentKind::Intake
+            | AgentKind::Human
+            | AgentKind::ResearchPlan
+            | AgentKind::ResearchAct => None,
             AgentKind::Design => Some(AgentKind::Intake),
             AgentKind::Planning => Some(AgentKind::Design),
             AgentKind::Implementation => Some(AgentKind::Planning),
@@ -141,7 +155,7 @@ impl AgentKind {
     /// - `CodeQuality` may kick back to `Implementation`.
     /// - `SecurityReview` may kick back to `Implementation` or `Design`.
     /// - `CodeReview` may kick back to `Implementation`, `Design`, or `Planning`.
-    /// - All other agents (including `Human`) return an empty slice.
+    /// - All other agents (including `Human`, `ResearchPlan`, `ResearchAct`) return an empty slice.
     pub fn valid_kickback_targets(&self) -> &'static [AgentKind] {
         match self {
             AgentKind::CodeQuality => &[AgentKind::Implementation],
@@ -160,7 +174,8 @@ impl AgentKind {
     /// The order is: `Intake`, `Design`, `Planning`, `Implementation`,
     /// `CodeQuality`, `SecurityReview`, `CodeReview`.
     ///
-    /// Note: `Human` is intentionally excluded as it is not a pipeline agent.
+    /// Note: `Human`, `ResearchPlan`, and `ResearchAct` are intentionally excluded
+    /// as they are not pipeline agents.
     pub fn all() -> &'static [AgentKind] {
         &[
             AgentKind::Intake,
@@ -171,6 +186,13 @@ impl AgentKind {
             AgentKind::SecurityReview,
             AgentKind::CodeReview,
         ]
+    }
+
+    /// Returns a static slice of the two research agent variants.
+    ///
+    /// Used when deploying research agent definition files during `clawmux init`.
+    pub fn research_agents() -> &'static [AgentKind] {
+        &[AgentKind::ResearchPlan, AgentKind::ResearchAct]
     }
 
     /// Returns the human-friendly display name for this agent.
@@ -187,7 +209,8 @@ impl AgentKind {
     /// | SecurityReview  | "Security Review Agent" |
     /// | CodeReview      | "Code Review Agent"     |
     /// | Human           | "Human"                 |
-    /// | Research        | "Research"              |
+    /// | ResearchPlan    | "Research (Plan)"       |
+    /// | ResearchAct     | "Research (Act)"        |
     pub fn display_name(&self) -> &'static str {
         match self {
             AgentKind::Intake => "Intake Agent",
@@ -198,7 +221,8 @@ impl AgentKind {
             AgentKind::SecurityReview => "Security Review Agent",
             AgentKind::CodeReview => "Code Review Agent",
             AgentKind::Human => "Human",
-            AgentKind::Research => "Research",
+            AgentKind::ResearchPlan => "Research (Plan)",
+            AgentKind::ResearchAct => "Research (Act)",
         }
     }
 
@@ -206,6 +230,7 @@ impl AgentKind {
     ///
     /// Accepts the full form (`"Planning Agent"`) or the short form without the
     /// `" Agent"` suffix (`"Planning"`). `"Human"` is also accepted.
+    /// `"research"` maps to `ResearchPlan` for backwards compatibility.
     ///
     /// # Errors
     ///
@@ -226,7 +251,9 @@ impl AgentKind {
             "security review" => Ok(AgentKind::SecurityReview),
             "code review" => Ok(AgentKind::CodeReview),
             "human" => Ok(AgentKind::Human),
-            "research" => Ok(AgentKind::Research),
+            // "research" kept for backwards compat; maps to Plan mode.
+            "research" | "research (plan)" => Ok(AgentKind::ResearchPlan),
+            "research (act)" => Ok(AgentKind::ResearchAct),
             other => Err(ClawMuxError::Parse {
                 file: "<agent kind>".to_string(),
                 message: format!("unknown agent display name: '{other}'"),
@@ -247,6 +274,7 @@ impl FromStr for AgentKind {
     /// Parses an opencode agent name string into an `AgentKind`.
     ///
     /// Parsing is case-insensitive. The expected format is `"clawmux/<stage>"`.
+    /// `"clawmux/research"` maps to `ResearchPlan` for backwards compatibility.
     ///
     /// # Errors
     ///
@@ -261,7 +289,9 @@ impl FromStr for AgentKind {
             "clawmux/security-review" => Ok(AgentKind::SecurityReview),
             "clawmux/code-review" => Ok(AgentKind::CodeReview),
             "human" => Ok(AgentKind::Human),
-            "clawmux/research" => Ok(AgentKind::Research),
+            // "clawmux/research" kept for backwards compat; maps to Plan mode.
+            "clawmux/research" | "clawmux/research-plan" => Ok(AgentKind::ResearchPlan),
+            "clawmux/research-act" => Ok(AgentKind::ResearchAct),
             other => Err(ClawMuxError::Parse {
                 file: "<agent kind>".to_string(),
                 message: format!("unknown agent name: '{other}'"),
@@ -283,7 +313,8 @@ mod tests {
         assert_eq!(AgentKind::CodeQuality.pipeline_index(), 4);
         assert_eq!(AgentKind::SecurityReview.pipeline_index(), 5);
         assert_eq!(AgentKind::CodeReview.pipeline_index(), 6);
-        assert_eq!(AgentKind::Research.pipeline_index(), 8);
+        assert_eq!(AgentKind::ResearchPlan.pipeline_index(), 8);
+        assert_eq!(AgentKind::ResearchAct.pipeline_index(), 8);
     }
 
     #[test]
@@ -468,27 +499,75 @@ mod tests {
     }
 
     #[test]
-    fn test_research_variant() {
-        assert_eq!(AgentKind::Research.pipeline_index(), 8);
+    fn test_research_plan_variant() {
+        assert_eq!(AgentKind::ResearchPlan.pipeline_index(), 8);
         assert_eq!(
-            AgentKind::Research.opencode_agent_name(),
-            "clawmux/research"
+            AgentKind::ResearchPlan.opencode_agent_name(),
+            "clawmux/research-plan"
         );
-        assert_eq!(AgentKind::Research.kiro_agent_name(), "clawmux-research");
-        assert_eq!(AgentKind::Research.display_name(), "Research");
-        assert_eq!(AgentKind::Research.next(), None);
-        assert_eq!(AgentKind::Research.prev(), None);
-        assert!(AgentKind::Research.valid_kickback_targets().is_empty());
-        assert!(!AgentKind::all().contains(&AgentKind::Research));
         assert_eq!(
-            "clawmux/research".parse::<AgentKind>().unwrap(),
-            AgentKind::Research
+            AgentKind::ResearchPlan.kiro_agent_name(),
+            "clawmux-research-plan"
+        );
+        assert_eq!(AgentKind::ResearchPlan.display_name(), "Research (Plan)");
+        assert_eq!(AgentKind::ResearchPlan.next(), None);
+        assert_eq!(AgentKind::ResearchPlan.prev(), None);
+        assert!(AgentKind::ResearchPlan.valid_kickback_targets().is_empty());
+        assert!(!AgentKind::all().contains(&AgentKind::ResearchPlan));
+        assert_eq!(
+            "clawmux/research-plan".parse::<AgentKind>().unwrap(),
+            AgentKind::ResearchPlan
         );
         assert_eq!(
             AgentKind::from_display_name("research").unwrap(),
-            AgentKind::Research
+            AgentKind::ResearchPlan,
+            "backwards compat: 'research' maps to ResearchPlan"
         );
-        assert_eq!(AgentKind::Research.to_string(), "clawmux/research");
+        assert_eq!(
+            AgentKind::from_display_name("research (plan)").unwrap(),
+            AgentKind::ResearchPlan
+        );
+        assert_eq!(AgentKind::ResearchPlan.to_string(), "clawmux/research-plan");
+        // Backwards compat: old "clawmux/research" string parses to ResearchPlan.
+        assert_eq!(
+            "clawmux/research".parse::<AgentKind>().unwrap(),
+            AgentKind::ResearchPlan
+        );
+    }
+
+    #[test]
+    fn test_research_act_variant() {
+        assert_eq!(AgentKind::ResearchAct.pipeline_index(), 8);
+        assert_eq!(
+            AgentKind::ResearchAct.opencode_agent_name(),
+            "clawmux/research-act"
+        );
+        assert_eq!(
+            AgentKind::ResearchAct.kiro_agent_name(),
+            "clawmux-research-act"
+        );
+        assert_eq!(AgentKind::ResearchAct.display_name(), "Research (Act)");
+        assert_eq!(AgentKind::ResearchAct.next(), None);
+        assert_eq!(AgentKind::ResearchAct.prev(), None);
+        assert!(AgentKind::ResearchAct.valid_kickback_targets().is_empty());
+        assert!(!AgentKind::all().contains(&AgentKind::ResearchAct));
+        assert_eq!(
+            "clawmux/research-act".parse::<AgentKind>().unwrap(),
+            AgentKind::ResearchAct
+        );
+        assert_eq!(
+            AgentKind::from_display_name("research (act)").unwrap(),
+            AgentKind::ResearchAct
+        );
+        assert_eq!(AgentKind::ResearchAct.to_string(), "clawmux/research-act");
+    }
+
+    #[test]
+    fn test_research_agents_slice() {
+        let agents = AgentKind::research_agents();
+        assert_eq!(agents.len(), 2);
+        assert!(agents.contains(&AgentKind::ResearchPlan));
+        assert!(agents.contains(&AgentKind::ResearchAct));
     }
 
     #[test]

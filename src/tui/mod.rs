@@ -193,7 +193,7 @@ pub fn footer_hint_text(
     } else if active_tab == 7 {
         "[r] review | [a] approve | [p] comment | [R] revisions | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else if active_tab == 8 {
-        "[p] prompt | [Up/Down] scroll | [Tab] next tab | [q] quit"
+        "[p] prompt | [Shift+Tab] toggle mode | [Up/Down] scroll | [Tab] next tab | [q] quit"
     } else {
         "[Tab] next tab | [q] quit"
     }
@@ -1443,6 +1443,10 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
                 KeyCode::Char('p') if key.modifiers == KeyModifiers::NONE => {
                     app.research_state.prompt_focused = true;
                     app.research_state.set_prompt_focused_style();
+                    return None;
+                }
+                KeyCode::BackTab => {
+                    app.research_state.toggle_mode();
                     return None;
                 }
                 KeyCode::Up => {
