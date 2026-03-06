@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use crate::error::ClawMuxError;
 
-/// The 7 pipeline agents plus a special `Human` marker used in task assignment.
+/// The 7 pipeline agents plus special `Human` and `Research` markers.
 ///
 /// Pipeline agents are applied sequentially:
 /// `Intake` -> `Design` -> `Planning` -> `Implementation`
@@ -21,6 +21,9 @@ use crate::error::ClawMuxError;
 ///
 /// `Human` is not part of the automated pipeline; it represents assignment to a
 /// human reviewer and is used only in task file metadata.
+///
+/// `Research` is a special out-of-pipeline agent backing the Research tab scratchpad.
+/// It has its own session lifecycle independent of the task pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     /// Gathers initial context and clarifies requirements.
@@ -39,6 +42,8 @@ pub enum AgentKind {
     CodeReview,
     /// Represents assignment to a human reviewer (not part of the automated pipeline).
     Human,
+    /// Backs the Research tab scratchpad; not part of the task pipeline.
+    Research,
 }
 
 #[allow(dead_code)]
@@ -56,6 +61,7 @@ impl AgentKind {
             AgentKind::SecurityReview => "clawmux/security-review",
             AgentKind::CodeReview => "clawmux/code-review",
             AgentKind::Human => "human",
+            AgentKind::Research => "clawmux/research",
         }
     }
 
@@ -73,12 +79,14 @@ impl AgentKind {
             AgentKind::SecurityReview => "clawmux-security-review",
             AgentKind::CodeReview => "clawmux-code-review",
             AgentKind::Human => "human",
+            AgentKind::Research => "clawmux-research",
         }
     }
 
     /// Returns the zero-based index of this agent in the pipeline.
     ///
     /// `Intake` is 0, `CodeReview` is 6. `Human` returns 7 (outside the pipeline).
+    /// `Research` returns 8 (out-of-pipeline scratchpad).
     pub fn pipeline_index(&self) -> usize {
         match self {
             AgentKind::Intake => 0,
@@ -89,6 +97,7 @@ impl AgentKind {
             AgentKind::SecurityReview => 5,
             AgentKind::CodeReview => 6,
             AgentKind::Human => 7,
+            AgentKind::Research => 8,
         }
     }
 
@@ -106,7 +115,7 @@ impl AgentKind {
             AgentKind::Implementation => Some(AgentKind::CodeQuality),
             AgentKind::CodeQuality => Some(AgentKind::SecurityReview),
             AgentKind::SecurityReview => Some(AgentKind::CodeReview),
-            AgentKind::CodeReview | AgentKind::Human => None,
+            AgentKind::CodeReview | AgentKind::Human | AgentKind::Research => None,
         }
     }
 
@@ -116,7 +125,7 @@ impl AgentKind {
     /// `Human` is not part of the pipeline and always returns `None`.
     pub fn prev(&self) -> Option<AgentKind> {
         match self {
-            AgentKind::Intake | AgentKind::Human => None,
+            AgentKind::Intake | AgentKind::Human | AgentKind::Research => None,
             AgentKind::Design => Some(AgentKind::Intake),
             AgentKind::Planning => Some(AgentKind::Design),
             AgentKind::Implementation => Some(AgentKind::Planning),
@@ -178,6 +187,7 @@ impl AgentKind {
     /// | SecurityReview  | "Security Review Agent" |
     /// | CodeReview      | "Code Review Agent"     |
     /// | Human           | "Human"                 |
+    /// | Research        | "Research"              |
     pub fn display_name(&self) -> &'static str {
         match self {
             AgentKind::Intake => "Intake Agent",
@@ -188,6 +198,7 @@ impl AgentKind {
             AgentKind::SecurityReview => "Security Review Agent",
             AgentKind::CodeReview => "Code Review Agent",
             AgentKind::Human => "Human",
+            AgentKind::Research => "Research",
         }
     }
 
@@ -215,6 +226,7 @@ impl AgentKind {
             "security review" => Ok(AgentKind::SecurityReview),
             "code review" => Ok(AgentKind::CodeReview),
             "human" => Ok(AgentKind::Human),
+            "research" => Ok(AgentKind::Research),
             other => Err(ClawMuxError::Parse {
                 file: "<agent kind>".to_string(),
                 message: format!("unknown agent display name: '{other}'"),
@@ -249,6 +261,7 @@ impl FromStr for AgentKind {
             "clawmux/security-review" => Ok(AgentKind::SecurityReview),
             "clawmux/code-review" => Ok(AgentKind::CodeReview),
             "human" => Ok(AgentKind::Human),
+            "clawmux/research" => Ok(AgentKind::Research),
             other => Err(ClawMuxError::Parse {
                 file: "<agent kind>".to_string(),
                 message: format!("unknown agent name: '{other}'"),
@@ -270,6 +283,7 @@ mod tests {
         assert_eq!(AgentKind::CodeQuality.pipeline_index(), 4);
         assert_eq!(AgentKind::SecurityReview.pipeline_index(), 5);
         assert_eq!(AgentKind::CodeReview.pipeline_index(), 6);
+        assert_eq!(AgentKind::Research.pipeline_index(), 8);
     }
 
     #[test]
@@ -451,6 +465,30 @@ mod tests {
     #[test]
     fn test_human_from_str() {
         assert_eq!("human".parse::<AgentKind>().unwrap(), AgentKind::Human);
+    }
+
+    #[test]
+    fn test_research_variant() {
+        assert_eq!(AgentKind::Research.pipeline_index(), 8);
+        assert_eq!(
+            AgentKind::Research.opencode_agent_name(),
+            "clawmux/research"
+        );
+        assert_eq!(AgentKind::Research.kiro_agent_name(), "clawmux-research");
+        assert_eq!(AgentKind::Research.display_name(), "Research");
+        assert_eq!(AgentKind::Research.next(), None);
+        assert_eq!(AgentKind::Research.prev(), None);
+        assert!(AgentKind::Research.valid_kickback_targets().is_empty());
+        assert!(!AgentKind::all().contains(&AgentKind::Research));
+        assert_eq!(
+            "clawmux/research".parse::<AgentKind>().unwrap(),
+            AgentKind::Research
+        );
+        assert_eq!(
+            AgentKind::from_display_name("research").unwrap(),
+            AgentKind::Research
+        );
+        assert_eq!(AgentKind::Research.to_string(), "clawmux/research");
     }
 
     #[test]

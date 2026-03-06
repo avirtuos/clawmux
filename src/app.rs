@@ -20,6 +20,7 @@ use crate::tui::tabs::code_review::Tab4State;
 use crate::tui::tabs::design::DesignTabState;
 use crate::tui::tabs::plan::PlanTabState;
 use crate::tui::tabs::questions::QuestionsTabState;
+use crate::tui::tabs::research::ResearchTabState;
 use crate::tui::tabs::review::ReviewTabState;
 use crate::tui::tabs::task_details::Tab1State;
 use crate::tui::tabs::team_status::Tab3State;
@@ -81,6 +82,8 @@ pub struct App {
     pub tab4_state: Tab4State,
     /// UI state for Tab 6 (Review Discussion): per-task review timeline.
     pub review_state: ReviewTabState,
+    /// UI state for Tab 8 (Research): global AI chat scratchpad.
+    pub research_state: ResearchTabState,
     /// Agent backend for all session lifecycle operations.
     pub backend: Box<dyn AgentBackend>,
     /// Shared map from session ID to (TaskId, AgentKind), used by EventStreamConsumer.
@@ -203,6 +206,7 @@ impl App {
             tab3_state: Tab3State::new(),
             tab4_state: Tab4State::new(),
             review_state: ReviewTabState::new(),
+            research_state: ResearchTabState::new(),
             backend,
             session_map,
             async_tx,
@@ -280,6 +284,13 @@ impl App {
             editor,
             file_summary,
         });
+    }
+
+    /// Returns the synthetic [`TaskId`] sentinel used for the Research tab session.
+    ///
+    /// All real task IDs start with `"tasks/"`, so this synthetic value cannot collide.
+    pub fn research_task_id() -> TaskId {
+        TaskId::from_path("__research__")
     }
 
     /// Returns the [`TaskId`] of the currently selected task, or `None` if on a story.
@@ -410,6 +421,22 @@ impl App {
                 message_id,
                 parts,
             } => {
+                // Intercept streaming for the research tab before the pipeline handler.
+                if task_id == App::research_task_id() {
+                    let text: String = parts
+                        .iter()
+                        .filter_map(|p| {
+                            if let crate::opencode::types::MessagePart::Text { text } = p {
+                                Some(text.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    self.research_state.push_streaming(&message_id, text);
+                    return vec![];
+                }
                 self.tab2_state.clear_awaiting(&task_id);
                 self.tab2_state
                     .push_streaming(&task_id, &message_id, &parts);
@@ -422,6 +449,10 @@ impl App {
                 status,
                 detail,
             } => {
+                // Silently ignore tool activity for the research session.
+                if task_id == App::research_task_id() {
+                    return vec![];
+                }
                 self.tab2_state.push_tool(&task_id, tool, status, detail);
                 vec![]
             }
@@ -569,6 +600,13 @@ impl App {
                         task_id: commit_task_id,
                         error,
                     }];
+                }
+
+                // Intercept errors for the research session.
+                if self.research_state.session_id.as_deref() == Some(&session_id) {
+                    self.research_state.session_id = None;
+                    self.research_state.session_creating = false;
+                    return vec![AppMessage::ResearchResponseError { error }];
                 }
 
                 // Guard: ignore errors from child sessions.  When the engine
@@ -871,6 +909,11 @@ impl App {
                     return vec![AppMessage::CommitCompleted {
                         task_id: commit_task_id,
                     }];
+                }
+
+                // Intercept completions for the research session (session persists; do not remove).
+                if self.research_state.session_id.as_deref() == Some(&session_id) {
+                    return vec![AppMessage::ResearchResponseCompleted { response_text }];
                 }
 
                 // Guard: only advance the workflow when the current phase is Running.
@@ -1185,7 +1228,16 @@ impl App {
                 vec![]
             }
 
-            AppMessage::PromptSent { task_id, .. } => {
+            AppMessage::PromptSent {
+                task_id,
+                session_id,
+            } => {
+                // Intercept PromptSent for the research session to store the session_id.
+                if task_id == App::research_task_id() {
+                    self.research_state.session_id = Some(session_id);
+                    self.research_state.session_creating = false;
+                    return vec![];
+                }
                 let agent_name = self
                     .workflow_engine
                     .state(&task_id)
@@ -1415,6 +1467,49 @@ impl App {
                 self.tab4_state.set_diffs(&task_id, diffs);
                 self.tab4_state.set_displayed_task(Some(&task_id));
                 self.tab4_state.reset_for_diffs();
+                vec![]
+            }
+
+            // --- Research tab ---
+            AppMessage::ResearchPromptSubmitted { prompt } => {
+                self.research_state.push_user_message(prompt.clone());
+                self.research_state.awaiting_response = true;
+                let research_id = App::research_task_id();
+                let model = self.default_model.clone();
+                if let Some(ref session_id) = self.research_state.session_id.clone() {
+                    // Session already exists: send a follow-up prompt.
+                    self.backend.send_prompt(
+                        research_id,
+                        session_id.clone(),
+                        AgentKind::Research,
+                        prompt,
+                        model,
+                        self.async_tx.clone(),
+                    );
+                } else if !self.research_state.session_creating {
+                    // First prompt: create a new session.
+                    self.research_state.session_creating = true;
+                    self.research_state
+                        .push_system_message("Creating session...".to_string());
+                    self.backend.create_session(
+                        research_id,
+                        AgentKind::Research,
+                        prompt,
+                        model,
+                        self.session_map.clone(),
+                        self.async_tx.clone(),
+                    );
+                }
+                vec![]
+            }
+
+            AppMessage::ResearchResponseCompleted { .. } => {
+                self.research_state.finalize_response();
+                vec![]
+            }
+
+            AppMessage::ResearchResponseError { error } => {
+                self.research_state.push_error(error);
                 vec![]
             }
         }
@@ -4378,5 +4473,134 @@ R  old_name.rs -> new_name.rs
         // Rename: only the new path should appear
         assert_eq!(find("new_name.rs"), Some(DiffStatus::Modified));
         assert_eq!(find("old_name.rs"), None);
+    }
+
+    #[test]
+    fn test_research_prompt_creates_session_on_first_prompt() {
+        let mut app = App::test_default();
+        assert!(app.research_state.session_id.is_none());
+        assert!(!app.research_state.session_creating);
+
+        let msgs = app.handle_message(AppMessage::ResearchPromptSubmitted {
+            prompt: "What is Rust?".to_string(),
+        });
+
+        assert!(msgs.is_empty());
+        assert!(app.research_state.awaiting_response);
+        assert!(app.research_state.session_creating);
+        // User message pushed.
+        assert_eq!(app.research_state.messages.len(), 2); // user + "Creating session..."
+        assert_eq!(
+            app.research_state.messages[0].role,
+            crate::tui::tabs::research::ChatRole::User
+        );
+    }
+
+    #[test]
+    fn test_research_prompt_reuses_session() {
+        let mut app = App::test_default();
+        // Simulate a session already existing.
+        app.research_state.session_id = Some("sess-abc".to_string());
+
+        let msgs = app.handle_message(AppMessage::ResearchPromptSubmitted {
+            prompt: "Follow-up question".to_string(),
+        });
+
+        assert!(msgs.is_empty());
+        assert!(app.research_state.awaiting_response);
+        // No "Creating session..." system banner.
+        assert_eq!(app.research_state.messages.len(), 1);
+        assert_eq!(
+            app.research_state.messages[0].role,
+            crate::tui::tabs::research::ChatRole::User
+        );
+    }
+
+    #[test]
+    fn test_streaming_update_routes_to_research() {
+        let mut app = App::test_default();
+        let research_id = App::research_task_id();
+
+        let msgs = app.handle_message(AppMessage::StreamingUpdate {
+            task_id: research_id,
+            session_id: "sess-1".to_string(),
+            message_id: "msg-1".to_string(),
+            parts: vec![crate::opencode::types::MessagePart::Text {
+                text: "Hello there".to_string(),
+            }],
+        });
+
+        assert!(msgs.is_empty());
+        assert_eq!(app.research_state.messages.len(), 1);
+        assert_eq!(app.research_state.messages[0].content, "Hello there");
+    }
+
+    #[test]
+    fn test_session_completed_routes_to_research() {
+        let mut app = App::test_default();
+        app.research_state.session_id = Some("sess-1".to_string());
+        app.research_state.awaiting_response = true;
+
+        let msgs = app.handle_message(AppMessage::SessionCompleted {
+            task_id: App::research_task_id(),
+            session_id: "sess-1".to_string(),
+            response_text: "Done".to_string(),
+        });
+
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(
+            msgs[0],
+            AppMessage::ResearchResponseCompleted { .. }
+        ));
+        // Session ID preserved for follow-up prompts.
+        assert_eq!(app.research_state.session_id, Some("sess-1".to_string()));
+    }
+
+    #[test]
+    fn test_session_error_clears_research_session() {
+        let mut app = App::test_default();
+        app.research_state.session_id = Some("sess-1".to_string());
+        app.research_state.awaiting_response = true;
+
+        let msgs = app.handle_message(AppMessage::SessionError {
+            task_id: App::research_task_id(),
+            session_id: "sess-1".to_string(),
+            error: "connection lost".to_string(),
+        });
+
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0], AppMessage::ResearchResponseError { .. }));
+        // Session cleared so the next prompt creates a new one.
+        assert!(app.research_state.session_id.is_none());
+        assert!(!app.research_state.session_creating);
+    }
+
+    #[test]
+    fn test_research_response_completed_finalizes() {
+        let mut app = App::test_default();
+        app.research_state.awaiting_response = true;
+
+        app.handle_message(AppMessage::ResearchResponseCompleted {
+            response_text: "Done".to_string(),
+        });
+
+        assert!(!app.research_state.awaiting_response);
+    }
+
+    #[test]
+    fn test_research_response_error_pushes_error() {
+        let mut app = App::test_default();
+        app.research_state.awaiting_response = true;
+
+        app.handle_message(AppMessage::ResearchResponseError {
+            error: "timeout".to_string(),
+        });
+
+        assert!(!app.research_state.awaiting_response);
+        assert_eq!(app.research_state.messages.len(), 1);
+        assert_eq!(
+            app.research_state.messages[0].role,
+            crate::tui::tabs::research::ChatRole::System
+        );
     }
 }

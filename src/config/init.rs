@@ -491,7 +491,7 @@ fn agent_file_name(agent: &AgentKind) -> Option<&'static str> {
         AgentKind::CodeQuality => Some("code-quality.md"),
         AgentKind::SecurityReview => Some("security-review.md"),
         AgentKind::CodeReview => Some("code-review.md"),
-        AgentKind::Human => None,
+        AgentKind::Human | AgentKind::Research => None,
     }
 }
 
@@ -506,7 +506,7 @@ fn agent_definition_content(agent: &AgentKind) -> Option<&'static str> {
         AgentKind::CodeQuality => Some(CODE_QUALITY_AGENT),
         AgentKind::SecurityReview => Some(SECURITY_REVIEW_AGENT),
         AgentKind::CodeReview => Some(CODE_REVIEW_AGENT),
-        AgentKind::Human => None,
+        AgentKind::Human | AgentKind::Research => None,
     }
 }
 
