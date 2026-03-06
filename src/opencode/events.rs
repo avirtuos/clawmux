@@ -391,15 +391,19 @@ impl EventStreamConsumer {
                         .retain(|(sid, _), _| *sid != session_id);
                     // Clone before move into message so we can remove from the map after send.
                     let sid_for_cleanup = session_id.clone();
+                    let is_research = task_id == TaskId::from_path("__research__");
                     self.send(AppMessage::SessionCompleted {
                         task_id,
                         session_id,
                         response_text,
                     })
                     .await?;
-                    // Remove the session so child-session completions that arrive later
-                    // are not mistaken for the primary session.
-                    self.session_map.write().await.remove(&sid_for_cleanup);
+                    // Keep the research session in the map so follow-up prompts in the
+                    // same session continue to route correctly. For all other sessions,
+                    // remove so stale child-session events are dropped after completion.
+                    if !is_research {
+                        self.session_map.write().await.remove(&sid_for_cleanup);
+                    }
                 } else {
                     debug!("SessionCompleted for unknown session_id: {}", session_id);
                 }
@@ -423,7 +427,8 @@ impl EventStreamConsumer {
                         error,
                     })
                     .await?;
-                    // Remove the session so stale events after the error are dropped.
+                    // Always remove on error -- the SessionError handler in app.rs clears
+                    // research_state.session_id so the next prompt creates a fresh session.
                     self.session_map.write().await.remove(&sid_for_cleanup);
                 } else {
                     debug!("SessionError for unknown session_id: {}", session_id);
@@ -1178,6 +1183,37 @@ mod tests {
         assert!(
             !map.contains_key("sess-err"),
             "session should be removed from session_map after SessionError"
+        );
+    }
+
+    /// Verifies that `SessionCompleted` for a research session does NOT remove it
+    /// from the session map, allowing follow-up prompts to continue routing.
+    #[tokio::test]
+    async fn test_session_map_kept_on_research_completed() {
+        let (mut consumer, mut rx, session_map) = make_consumer();
+        let task_id = TaskId::from_path("__research__");
+        {
+            let mut map = session_map.write().await;
+            map.insert(
+                "sess-research".to_string(),
+                (task_id.clone(), AgentKind::ResearchPlan),
+            );
+        }
+
+        consumer
+            .handle_event(OpenCodeEvent::SessionCompleted {
+                session_id: "sess-research".to_string(),
+            })
+            .await
+            .expect("handle_event");
+        // Drain the SessionCompleted message.
+        let _ = rx.try_recv().expect("SessionCompleted message");
+
+        // Research session must NOT be removed so follow-up prompts route correctly.
+        let map = session_map.read().await;
+        assert!(
+            map.contains_key("sess-research"),
+            "research session should remain in session_map after SessionCompleted"
         );
     }
 
