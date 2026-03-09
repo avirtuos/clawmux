@@ -1,4 +1,5 @@
 .opencode/
+.clawmux/
 target/
 .clawdmux/
 *.log
