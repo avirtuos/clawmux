@@ -25,7 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::App;
 use crate::backend::kiro::KiroBackend;
-use crate::config::init::build_agent_model_map;
+use crate::config::init::{build_agent_model_map, ensure_agent_files};
 use crate::config::{AppConfig, BackendKind};
 use crate::messages::AppMessage;
 use crate::opencode::events::EventStreamConsumer;
@@ -155,10 +155,14 @@ fn check_project_init(project_root: &std::path::Path) -> Result<(), Box<dyn std:
 async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Init terminal first so we can draw a loading screen during startup.
     let mut terminal = ratatui::init();
+    // Enable bracketed paste so multi-line pastes arrive as Event::Paste rather
+    // than individual keystrokes (which would trigger premature prompt submission).
+    crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste).ok();
 
     // 2. Install panic hook AFTER ratatui::init() so it wraps ratatui's hook.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         ratatui::restore();
         original_hook(info);
     }));
@@ -239,7 +243,10 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             None
         };
-        Arc::new(OpenCodeClient::new(base_url, auth))
+        Arc::new(
+            OpenCodeClient::new(base_url, auth)
+                .with_project_root(project_root.to_string_lossy().into_owned()),
+        )
     });
     let backend: Box<dyn crate::backend::AgentBackend> = match config.backend {
         BackendKind::Kiro => {
@@ -264,6 +271,17 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::warn!("EventStreamConsumer exited: {}", e);
             }
         });
+    }
+
+    // 8. Deploy any missing agent definition files (idempotent; never overwrites existing files).
+    //    This ensures agent files added in later versions (e.g. research-plan.md) are always
+    //    present without requiring the user to re-run `clawmux init`.
+    if matches!(config.backend, BackendKind::OpenCode) {
+        match ensure_agent_files(&project_root) {
+            Ok(0) => tracing::debug!("all agent definition files already present"),
+            Ok(n) => tracing::info!(count = n, "deployed missing agent definition files"),
+            Err(e) => tracing::warn!("could not deploy agent files: {}", e),
+        }
     }
 
     tracing::info!(
@@ -337,6 +355,7 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
                     &config,
                     async_tx.clone(),
                     app.default_model.clone(),
+                    &project_root,
                 );
             }
             queue.extend(app.handle_message(msg));
@@ -347,6 +366,7 @@ async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     ratatui::restore();
 
     if let Some(ref mut s) = server {
@@ -429,6 +449,7 @@ fn spawn_fix_request(
     config: &AppConfig,
     async_tx: tokio::sync::mpsc::Sender<AppMessage>,
     default_model: Option<ModelId>,
+    project_root: &std::path::Path,
 ) {
     let base_url = match server {
         Some(s) => s.base_url().to_string(),
@@ -460,9 +481,11 @@ fn spawn_fix_request(
     } else {
         None
     };
+    let project_root_str = project_root.to_string_lossy().into_owned();
 
     tokio::spawn(async move {
-        let client = OpenCodeClient::new(base_url.clone(), auth);
+        let client =
+            OpenCodeClient::new(base_url.clone(), auth).with_project_root(project_root_str);
 
         let session = match client.create_session().await {
             Ok(s) => s,

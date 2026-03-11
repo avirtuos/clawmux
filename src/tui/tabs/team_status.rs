@@ -75,7 +75,8 @@ fn pipeline_label(agent: &AgentKind) -> &'static str {
         AgentKind::SecurityReview => "Security Review",
         AgentKind::CodeReview => "Code Review",
         AgentKind::Human => "Human",
-        AgentKind::Research => "Research",
+        AgentKind::ResearchPlan => "Research (Plan)",
+        AgentKind::ResearchAct => "Research (Act)",
     }
 }
 

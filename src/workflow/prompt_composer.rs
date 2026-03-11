@@ -71,8 +71,13 @@ fn role_description(agent: &AgentKind) -> &'static str {
         AgentKind::Human => {
             "You are a human reviewer. Review the completed task and approve or request revisions."
         }
-        AgentKind::Research => {
-            "You are a general-purpose research assistant. Answer questions and help explore ideas."
+        AgentKind::ResearchPlan => {
+            "You are a read-only research assistant in Plan mode. Read and analyze the codebase \
+             to answer questions. Do not make any changes."
+        }
+        AgentKind::ResearchAct => {
+            "You are a full-tool research assistant in Act mode. You can read, write, edit, and \
+             execute code to help the user investigate and prototype."
         }
     }
 }

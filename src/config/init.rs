@@ -28,6 +28,8 @@ const IMPLEMENTATION_AGENT: &str = include_str!("agents/implementation.md");
 const CODE_QUALITY_AGENT: &str = include_str!("agents/code-quality.md");
 const SECURITY_REVIEW_AGENT: &str = include_str!("agents/security-review.md");
 const CODE_REVIEW_AGENT: &str = include_str!("agents/code-review.md");
+const RESEARCH_PLAN_AGENT: &str = include_str!("agents/research-plan.md");
+const RESEARCH_ACT_AGENT: &str = include_str!("agents/research-act.md");
 
 // ---------------------------------------------------------------------------
 // Task template file content (embedded at compile time from `src/config/tasks/`)
@@ -277,6 +279,41 @@ pub(crate) fn select_backend_from_reader<R: BufRead, W: Write>(
     }
 }
 
+/// Writes any missing built-in agent definition files to `.opencode/agents/clawmux/`.
+///
+/// Unlike [`update_agent_files`], existing files are never overwritten.  This is
+/// safe to call at startup: it ensures new agent variants added in later versions
+/// (e.g. `research-plan.md`, `research-act.md`) are deployed without clobbering
+/// user-customised pipeline agent files.
+///
+/// Returns the number of agent files written.
+pub fn ensure_agent_files(project_root: &Path) -> Result<usize> {
+    let agents_dir = project_root
+        .join(".opencode")
+        .join("agents")
+        .join("clawmux");
+    std::fs::create_dir_all(&agents_dir).map_err(ClawMuxError::Io)?;
+
+    let mut count = 0usize;
+    let all_agents = AgentKind::all()
+        .iter()
+        .chain(AgentKind::research_agents().iter());
+    for agent in all_agents {
+        let (Some(file_name), Some(content)) =
+            (agent_file_name(agent), agent_definition_content(agent))
+        else {
+            continue;
+        };
+        let file_path = agents_dir.join(file_name);
+        if !file_path.exists() {
+            std::fs::write(&file_path, content).map_err(ClawMuxError::Io)?;
+            tracing::info!(path = %file_path.display(), "deployed missing agent definition");
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 /// Writes built-in agent definition files to `.opencode/agents/clawmux/`.
 ///
 /// Always overwrites existing files. Creates the directory if it does not exist.
@@ -290,7 +327,20 @@ pub fn update_agent_files(project_root: &Path) -> Result<usize> {
     std::fs::create_dir_all(&agents_dir).map_err(ClawMuxError::Io)?;
 
     let mut count = 0usize;
+    // Pipeline agents.
     for agent in AgentKind::all() {
+        let (Some(file_name), Some(content)) =
+            (agent_file_name(agent), agent_definition_content(agent))
+        else {
+            continue;
+        };
+        let file_path = agents_dir.join(file_name);
+        std::fs::write(&file_path, content).map_err(ClawMuxError::Io)?;
+        tracing::info!(path = %file_path.display(), "wrote agent definition");
+        count += 1;
+    }
+    // Research agents.
+    for agent in AgentKind::research_agents() {
         let (Some(file_name), Some(content)) =
             (agent_file_name(agent), agent_definition_content(agent))
         else {
@@ -368,7 +418,10 @@ pub(crate) fn scaffold_project(
             .join("clawmux");
         std::fs::create_dir_all(&agents_dir).map_err(ClawMuxError::Io)?;
 
-        for agent in AgentKind::all() {
+        let all_agents = AgentKind::all()
+            .iter()
+            .chain(AgentKind::research_agents().iter());
+        for agent in all_agents {
             let (Some(file_name), Some(content)) =
                 (agent_file_name(agent), agent_definition_content(agent))
             else {
@@ -405,7 +458,10 @@ pub fn scaffold_kiro_agents(project_root: &Path, reset: bool) -> Result<usize> {
     std::fs::create_dir_all(&agents_dir).map_err(ClawMuxError::Io)?;
 
     let mut count = 0usize;
-    for agent in AgentKind::all() {
+    let all_agents = AgentKind::all()
+        .iter()
+        .chain(AgentKind::research_agents().iter());
+    for agent in all_agents {
         let agent_name = agent.kiro_agent_name();
         let file_name = format!("{}.json", agent_name);
         let file_path = agents_dir.join(&file_name);
@@ -491,7 +547,9 @@ fn agent_file_name(agent: &AgentKind) -> Option<&'static str> {
         AgentKind::CodeQuality => Some("code-quality.md"),
         AgentKind::SecurityReview => Some("security-review.md"),
         AgentKind::CodeReview => Some("code-review.md"),
-        AgentKind::Human | AgentKind::Research => None,
+        AgentKind::ResearchPlan => Some("research-plan.md"),
+        AgentKind::ResearchAct => Some("research-act.md"),
+        AgentKind::Human => None,
     }
 }
 
@@ -506,7 +564,9 @@ fn agent_definition_content(agent: &AgentKind) -> Option<&'static str> {
         AgentKind::CodeQuality => Some(CODE_QUALITY_AGENT),
         AgentKind::SecurityReview => Some(SECURITY_REVIEW_AGENT),
         AgentKind::CodeReview => Some(CODE_REVIEW_AGENT),
-        AgentKind::Human | AgentKind::Research => None,
+        AgentKind::ResearchPlan => Some(RESEARCH_PLAN_AGENT),
+        AgentKind::ResearchAct => Some(RESEARCH_ACT_AGENT),
+        AgentKind::Human => None,
     }
 }
 
@@ -588,6 +648,7 @@ mod tests {
                 agent
             );
         }
+        // build_agent_model_map only iterates AgentKind::all() (7 pipeline agents).
         assert_eq!(map.len(), 7, "Should have exactly 7 entries");
     }
 
@@ -789,11 +850,18 @@ mod tests {
         let project_dir = TempDir::new().unwrap();
 
         let count = update_agent_files(project_dir.path()).unwrap();
-        assert_eq!(count, 7, "should write exactly 7 agent files");
+        assert_eq!(
+            count, 9,
+            "should write exactly 9 agent files (7 pipeline + 2 research)"
+        );
 
         let agents_dir = project_dir.path().join(".opencode/agents/clawmux");
-        for agent in AgentKind::all() {
-            let file_name = agent_file_name(agent).expect("all() never yields Human");
+        for agent in AgentKind::all()
+            .iter()
+            .chain(AgentKind::research_agents().iter())
+        {
+            let file_name =
+                agent_file_name(agent).expect("all() and research_agents() never yield Human");
             let file_path = agents_dir.join(file_name);
             assert!(file_path.exists(), "{} should exist", file_path.display());
             let content = std::fs::read_to_string(&file_path).unwrap();
@@ -849,7 +917,10 @@ mod tests {
         let project_dir = TempDir::new().unwrap();
 
         let count = scaffold_kiro_agents(project_dir.path(), false).unwrap();
-        assert_eq!(count, 7, "should write exactly 7 kiro agent config files");
+        assert_eq!(
+            count, 9,
+            "should write exactly 9 kiro agent config files (7 pipeline + 2 research)"
+        );
 
         let agents_dir = project_dir.path().join(".kiro/agents");
         for agent in AgentKind::all() {

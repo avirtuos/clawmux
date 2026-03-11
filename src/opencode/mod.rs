@@ -24,6 +24,9 @@ pub struct OpenCodeClient {
     base_url: String,
     /// Optional Basic Auth credentials as `(username, password)`.
     auth: Option<(String, String)>,
+    /// Project root directory passed to `POST /session` so OpenCode creates the
+    /// session in the correct project, not whatever it considers "current".
+    project_root: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -39,7 +42,18 @@ impl OpenCodeClient {
             http: reqwest::Client::new(),
             base_url,
             auth,
+            project_root: None,
         }
+    }
+
+    /// Sets the project root directory included in `POST /session` requests.
+    ///
+    /// When set, `create_session` passes `{"directory": "<project_root>"}` in the
+    /// request body so OpenCode initialises the session inside the correct project
+    /// instead of defaulting to its own current working directory.
+    pub fn with_project_root(mut self, project_root: String) -> Self {
+        self.project_root = Some(project_root);
+        self
     }
 
     /// Builds a `RequestBuilder` for the given HTTP method and path.

@@ -26,9 +26,13 @@ impl OpenCodeClient {
     /// Returns [`ClawMuxError::Http`] on transport failure or [`ClawMuxError::Api`]
     /// on a non-2xx response.
     pub async fn create_session(&self) -> Result<OpenCodeSession> {
+        let body = match self.project_root.as_deref() {
+            Some(dir) => serde_json::json!({ "directory": dir }),
+            None => serde_json::json!({}),
+        };
         let resp = self
             .request(Method::POST, "/session")
-            .json(&serde_json::json!({}))
+            .json(&body)
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
