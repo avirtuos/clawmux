@@ -1493,6 +1493,9 @@ pub fn handle_input(event: Event, app: &mut App) -> Option<AppMessage> {
             KeyCode::Tab => {
                 app.active_tab = (app.active_tab + 1) % 9;
             }
+            KeyCode::BackTab => {
+                app.active_tab = (app.active_tab + 8) % 9;
+            }
             _ => {}
         }
     }
@@ -1686,6 +1689,29 @@ mod tests {
 
         handle_input(tab.clone(), &mut app);
         assert_eq!(app.active_tab, 0);
+    }
+
+    #[test]
+    fn test_backtab_cycles_tabs_backward() {
+        let mut app = App::test_default();
+        app.active_tab = 2;
+
+        let backtab = key_event(KeyCode::BackTab, KeyModifiers::SHIFT);
+        handle_input(backtab.clone(), &mut app);
+        assert_eq!(app.active_tab, 1);
+
+        handle_input(backtab.clone(), &mut app);
+        assert_eq!(app.active_tab, 0);
+    }
+
+    #[test]
+    fn test_backtab_wraps_from_first_to_last() {
+        let mut app = App::test_default();
+        assert_eq!(app.active_tab, 0);
+
+        let backtab = key_event(KeyCode::BackTab, KeyModifiers::SHIFT);
+        handle_input(backtab, &mut app);
+        assert_eq!(app.active_tab, 8);
     }
 
     /// Builds a minimal App with one story containing one task that has one unanswered question.
